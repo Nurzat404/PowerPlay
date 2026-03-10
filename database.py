@@ -1,16 +1,15 @@
 import sqlite3
 import time
-import os
 from pathlib import Path
 
 # Определяем папку для базы данных
-# На BotHost будет /app/data, локально - текущая папка
-if os.getenv('BOTHOST'):
-    DATA_DIR = Path('/app/data')
-else:
+# На BotHost есть папка /app/data, она автоматически создаётся хостингом
+DATA_DIR = Path('/app/data')
+if not DATA_DIR.exists():
+    # Если папки нет, значит мы не на хостинге — используем текущую папку
     DATA_DIR = Path('.')
 
-# Создаем папку, если её нет (особенно важно для /app/data)
+# Создаём папку, если её нет (на всякий случай)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = DATA_DIR / 'powerplay.db'
@@ -24,6 +23,8 @@ def get_connection():
     except sqlite3.OperationalError:
         pass
     return conn
+
+# ... остальная часть файла (init_db и т.д.) без изменений
 
 
 def init_db():
