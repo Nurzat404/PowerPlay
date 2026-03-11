@@ -3,15 +3,10 @@ import time
 from pathlib import Path
 
 # Определяем папку для базы данных
-# На BotHost есть папка /app/data, она автоматически создаётся хостингом
 DATA_DIR = Path('/app/data')
 if not DATA_DIR.exists():
-    # Если папки нет, значит мы не на хостинге — используем текущую папку
     DATA_DIR = Path('.')
-
-# Создаём папку, если её нет (на всякий случай)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-
 DB_PATH = DATA_DIR / 'powerplay.db'
 
 
@@ -23,8 +18,6 @@ def get_connection():
     except sqlite3.OperationalError:
         pass
     return conn
-
-# ... остальная часть файла (init_db и т.д.) без изменений
 
 
 def init_db():
@@ -60,6 +53,8 @@ def init_db():
                         sport TEXT NOT NULL,
                         city TEXT,
                         captain_id INTEGER NOT NULL REFERENCES users(id),
+                        is_open_for_requests INTEGER DEFAULT 1,
+                        notify_on_requests INTEGER DEFAULT 1,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
@@ -74,13 +69,14 @@ def init_db():
                     )
                 """)
 
-                # Приглашения в команду
+                # Приглашения в команду (теперь с полем type)
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS team_invites (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         team_id INTEGER REFERENCES teams(id),
                         user_id INTEGER REFERENCES users(id),
                         status TEXT DEFAULT 'pending',  -- pending, accepted, rejected
+                        type TEXT DEFAULT 'invite',     -- invite, request
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         UNIQUE(team_id, user_id)
                     )
@@ -96,7 +92,7 @@ def init_db():
                         start_date TEXT,
                         end_date TEXT,
                         max_teams INTEGER,
-                        description TEXT,  -- новое поле
+                        description TEXT,
                         status TEXT DEFAULT 'registration',
                         created_by INTEGER REFERENCES users(id),
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -176,12 +172,21 @@ def init_db():
                     cur.execute(
                         "INSERT OR IGNORE INTO sports (name, display_name) VALUES (?, ?)", (name, display))
 
-                # Проверяем наличие поля description в таблице tournaments (для старых баз)
-                cur.execute("PRAGMA table_info(tournaments)")
+                # Проверяем наличие полей в старых таблицах (для совместимости)
+                cur.execute("PRAGMA table_info(teams)")
                 columns = [col[1] for col in cur.fetchall()]
-                if 'description' not in columns:
+                if 'is_open_for_requests' not in columns:
                     cur.execute(
-                        "ALTER TABLE tournaments ADD COLUMN description TEXT")
+                        "ALTER TABLE teams ADD COLUMN is_open_for_requests INTEGER DEFAULT 1")
+                if 'notify_on_requests' not in columns:
+                    cur.execute(
+                        "ALTER TABLE teams ADD COLUMN notify_on_requests INTEGER DEFAULT 1")
+
+                cur.execute("PRAGMA table_info(team_invites)")
+                columns = [col[1] for col in cur.fetchall()]
+                if 'type' not in columns:
+                    cur.execute(
+                        "ALTER TABLE team_invites ADD COLUMN type TEXT DEFAULT 'invite'")
 
             conn.close()
             print("База данных успешно инициализирована.")

@@ -5,6 +5,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 def main_menu_keyboard():
     kb = [
         [InlineKeyboardButton(text="🏀 Мои команды", callback_data="my_teams")],
+        [InlineKeyboardButton(text="👥 Команды", callback_data="teams_menu")],
         [InlineKeyboardButton(text="🏆 Турниры", callback_data="tournaments")],
         [InlineKeyboardButton(text="📊 Рейтинги", callback_data="ratings")],
         [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
@@ -18,10 +19,6 @@ def back_to_main_keyboard():
 
 
 def sports_choice_keyboard(sports_list, selected=None):
-    """
-    sports_list: список кортежей (name, display_name)
-    selected: список выбранных технических имён (для отметки галочкой)
-    """
     builder = InlineKeyboardBuilder()
     for name, display in sports_list:
         text = f"✅ {display}" if selected and name in selected else display
@@ -50,7 +47,7 @@ def teams_list_keyboard(teams, show_create=True):
     return builder.as_markup()
 
 
-def team_management_keyboard(team_id, is_captain=False):
+def team_management_extended_keyboard(team_id, is_captain, is_open, notify_enabled):
     builder = InlineKeyboardBuilder()
     if is_captain:
         builder.button(text="✏️ Изменить название",
@@ -59,6 +56,14 @@ def team_management_keyboard(team_id, is_captain=False):
                        callback_data=f"add_player_{team_id}")
         builder.button(text="🗑 Удалить команду",
                        callback_data=f"delete_team_{team_id}")
+        builder.button(text="📋 Заявки в команду",
+                       callback_data=f"team_requests_{team_id}")
+        open_status = "🔓 Открыт" if is_open else "🔒 Закрыт"
+        builder.button(
+            text=f"Приём заявок: {open_status}", callback_data=f"toggle_open_{team_id}")
+        notify_status = "🔔 Вкл" if notify_enabled else "🔕 Выкл"
+        builder.button(
+            text=f"Уведомления: {notify_status}", callback_data=f"toggle_notify_{team_id}")
     builder.button(text="🔙 Назад", callback_data="my_teams")
     builder.adjust(1)
     return builder.as_markup()
@@ -141,6 +146,93 @@ def invite_keyboard(team_id):
     builder.adjust(2)
     return builder.as_markup()
 
+# ---------- КЛАВИАТУРЫ ДЛЯ РАЗДЕЛА "КОМАНДЫ" ----------
+
+
+def teams_main_keyboard():
+    kb = [
+        [InlineKeyboardButton(text="📋 Список всех команд",
+                              callback_data="teams_list_all")],
+        [InlineKeyboardButton(
+            text="🔓 Команды с открытым набором", callback_data="teams_list_open")],
+        [InlineKeyboardButton(text="🔍 Поиск команды",
+                              callback_data="teams_search")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def teams_list_pagination_keyboard(offset, total, callback_prefix):
+    """Универсальная пагинация для списков команд"""
+    builder = InlineKeyboardBuilder()
+    nav_buttons = []
+    if offset > 0:
+        nav_buttons.append(InlineKeyboardButton(
+            text="◀️", callback_data=f"{callback_prefix}_page_{offset-10}"))
+    if offset + 10 < total:
+        nav_buttons.append(InlineKeyboardButton(
+            text="▶️", callback_data=f"{callback_prefix}_page_{offset+10}"))
+    if nav_buttons:
+        builder.row(*nav_buttons)
+    builder.row(InlineKeyboardButton(
+        text="🔙 В меню команд", callback_data="teams_menu"))
+    return builder.as_markup()
+
+
+def teams_sports_filter_keyboard(sports_list, mode):
+    """Клавиатура с видами спорта для фильтрации (mode: 'all' или 'open')"""
+    builder = InlineKeyboardBuilder()
+    for name, display in sports_list:
+        builder.button(
+            text=display, callback_data=f"teams_filter_{mode}_{name}")
+    builder.button(text="🔙 Назад", callback_data="teams_menu")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+def team_view_only_keyboard(team_id, sport):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 Назад", callback_data=f"teams_filter_all_{sport}")
+    return builder.as_markup()
+
+
+def team_view_join_keyboard(team_id, can_apply, sport):
+    builder = InlineKeyboardBuilder()
+    if can_apply:
+        builder.button(text="📝 Подать заявку",
+                       callback_data=f"apply_team_{team_id}")
+    builder.button(text="🔙 Назад", callback_data=f"teams_filter_open_{sport}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def team_requests_keyboard(requests, offset, team_id, total):
+    builder = InlineKeyboardBuilder()
+    for req in requests:
+        text = f"{req['first_name']} (@{req['username']})"
+        builder.row(
+            InlineKeyboardButton(
+                text=text, callback_data=f"view_user_{req['user_id']}"),
+            InlineKeyboardButton(
+                text="✅", callback_data=f"accept_req_{req['id']}"),
+            InlineKeyboardButton(
+                text="❌", callback_data=f"reject_req_{req['id']}")
+        )
+    nav = []
+    if offset > 0:
+        nav.append(InlineKeyboardButton(
+            text="◀️", callback_data=f"team_reqs_page_{team_id}_{offset-10}"))
+    if offset + 10 < total:
+        nav.append(InlineKeyboardButton(
+            text="▶️", callback_data=f"team_reqs_page_{team_id}_{offset+10}"))
+    if nav:
+        builder.row(*nav)
+    builder.row(InlineKeyboardButton(
+        text="🔙 В управление", callback_data=f"team_{team_id}"))
+    return builder.as_markup()
+
+# Админские клавиатуры
+
 
 def admin_rating_menu_keyboard(sports_list):
     builder = InlineKeyboardBuilder()
@@ -193,4 +285,23 @@ def admin_rating_team_actions_keyboard(team_id, sport):
     builder.button(
         text="🔙 Назад", callback_data=f"admin_rating_list_teams_{sport}")
     builder.adjust(1)
+    return builder.as_markup()
+
+
+def team_view_search_keyboard(team_id, can_apply, query):
+    builder = InlineKeyboardBuilder()
+    if can_apply:
+        builder.button(text="📝 Подать заявку",
+                       callback_data=f"apply_team_{team_id}")
+    builder.button(text="🔙 К результатам поиска",
+                   callback_data=f"search_page_{query}_0")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def sports_choice_keyboard_no_done(sports_list):
+    builder = InlineKeyboardBuilder()
+    for name, display in sports_list:
+        builder.button(text=display, callback_data=f"create_team_sport_{name}")
+    builder.adjust(2)
     return builder.as_markup()

@@ -448,3 +448,235 @@ def get_teams_with_rating(sport):
     teams = cur.fetchall()
     conn.close()
     return teams
+# ---------- Настройки команды ----------
+
+
+def get_team_settings(team_id):
+    """Возвращает настройки команды: is_open_for_requests, notify_on_requests"""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT is_open_for_requests, notify_on_requests FROM teams WHERE id=?", (team_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return {'is_open': bool(row['is_open_for_requests']), 'notify': bool(row['notify_on_requests'])}
+    return {'is_open': False, 'notify': False}
+
+
+def set_team_open_status(team_id, is_open):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE teams SET is_open_for_requests=? WHERE id=?",
+                (1 if is_open else 0, team_id))
+    conn.commit()
+    conn.close()
+
+
+def set_team_notify_status(team_id, notify):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE teams SET notify_on_requests=? WHERE id=?",
+                (1 if notify else 0, team_id))
+    conn.commit()
+    conn.close()
+
+# ---------- Заявки на вступление (requests) ----------
+
+
+def create_team_request(team_id, user_id):
+    """Создаёт заявку на вступление (type='request')"""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO team_invites (team_id, user_id, status, type)
+        VALUES (?, ?, 'pending', 'request')
+    """, (team_id, user_id))
+    conn.commit()
+    conn.close()
+
+
+def get_team_requests(team_id, offset=0, limit=10):
+    """Возвращает список заявок (pending) для команды с пагинацией"""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT ti.id, ti.user_id, u.first_name, u.last_name, u.username, u.email, u.city, u.favorite_sports
+        FROM team_invites ti
+        JOIN users u ON ti.user_id = u.id
+        WHERE ti.team_id=? AND ti.status='pending' AND ti.type='request'
+        ORDER BY ti.created_at DESC
+        LIMIT ? OFFSET ?
+    """, (team_id, limit, offset))
+    requests = cur.fetchall()
+    conn.close()
+    return requests
+
+
+def get_team_requests_count(team_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT COUNT(*) FROM team_invites WHERE team_id=? AND status='pending' AND type='request'", (team_id,))
+    count = cur.fetchone()[0]
+    conn.close()
+    return count
+
+
+def accept_request(request_id):
+    """Принять заявку: добавить в team_members, обновить статус"""
+    conn = get_connection()
+    cur = conn.cursor()
+    # Получаем данные заявки
+    cur.execute(
+        "SELECT team_id, user_id FROM team_invites WHERE id=? AND type='request'", (request_id,))
+    req = cur.fetchone()
+    if not req:
+        conn.close()
+        return False
+    # Добавляем в команду
+    cur.execute("INSERT OR IGNORE INTO team_members (team_id, user_id) VALUES (?, ?)",
+                (req['team_id'], req['user_id']))
+    # Обновляем статус заявки
+    cur.execute(
+        "UPDATE team_invites SET status='accepted' WHERE id=?", (request_id,))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def reject_request(request_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE team_invites SET status='rejected' WHERE id=? AND type='request'", (request_id,))
+    conn.commit()
+    conn.close()
+
+
+def has_pending_request(user_id, team_id):
+    """Проверяет, есть ли активная заявка от пользователя в эту команду"""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM team_invites WHERE team_id=? AND user_id=? AND status='pending' AND type='request'", (team_id, user_id))
+    result = cur.fetchone() is not None
+    conn.close()
+    return result
+
+# ---------- Получение команд с пагинацией ----------
+
+
+def get_all_teams_paginated(offset=0, limit=10, only_open=False):
+    """Возвращает список команд. Если only_open=True, то только с is_open_for_requests=1"""
+    conn = get_connection()
+    cur = conn.cursor()
+    if only_open:
+        cur.execute("""
+            SELECT t.*, u.first_name as captain_first, u.username as captain_username
+            FROM teams t
+            JOIN users u ON t.captain_id = u.id
+            WHERE t.is_open_for_requests = 1
+            ORDER BY t.name
+            LIMIT ? OFFSET ?
+        """, (limit, offset))
+    else:
+        cur.execute("""
+            SELECT t.*, u.first_name as captain_first, u.username as captain_username
+            FROM teams t
+            JOIN users u ON t.captain_id = u.id
+            ORDER BY t.name
+            LIMIT ? OFFSET ?
+        """, (limit, offset))
+    teams = cur.fetchall()
+    conn.close()
+    return teams
+
+
+def get_teams_count(only_open=False):
+    conn = get_connection()
+    cur = conn.cursor()
+    if only_open:
+        cur.execute("SELECT COUNT(*) FROM teams WHERE is_open_for_requests=1")
+    else:
+        cur.execute("SELECT COUNT(*) FROM teams")
+    count = cur.fetchone()[0]
+    conn.close()
+    return count
+
+
+def search_teams_by_name(query, offset=0, limit=10):
+    """Поиск команд по названию (регистронезависимо) с пагинацией"""
+    conn = get_connection()
+    cur = conn.cursor()
+    pattern = f"%{query}%"
+    cur.execute("""
+        SELECT t.*, u.first_name as captain_first, u.username as captain_username
+        FROM teams t
+        JOIN users u ON t.captain_id = u.id
+        WHERE t.name LIKE ?
+        ORDER BY t.name
+        LIMIT ? OFFSET ?
+    """, (pattern, limit, offset))
+    teams = cur.fetchall()
+    conn.close()
+    return teams
+
+
+def search_teams_count(query):
+    conn = get_connection()
+    cur = conn.cursor()
+    pattern = f"%{query}%"
+    cur.execute("SELECT COUNT(*) FROM teams WHERE name LIKE ?", (pattern,))
+    count = cur.fetchone()[0]
+    conn.close()
+    return count
+
+
+def get_team_invite_status(team_id, user_id):
+    """Возвращает статус заявки (pending/accepted/rejected) или None, если записи нет."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT status FROM team_invites WHERE team_id=? AND user_id=?", (team_id, user_id))
+    row = cur.fetchone()
+    conn.close()
+    return row['status'] if row else None
+
+
+def get_teams_by_sport(sport, only_open=False, offset=0, limit=10):
+    conn = get_connection()
+    cur = conn.cursor()
+    if only_open:
+        cur.execute("""
+            SELECT t.*, u.first_name as captain_first, u.username as captain_username
+            FROM teams t
+            JOIN users u ON t.captain_id = u.id
+            WHERE t.sport=? AND t.is_open_for_requests=1
+            ORDER BY t.name
+            LIMIT ? OFFSET ?
+        """, (sport, limit, offset))
+    else:
+        cur.execute("""
+            SELECT t.*, u.first_name as captain_first, u.username as captain_username
+            FROM teams t
+            JOIN users u ON t.captain_id = u.id
+            WHERE t.sport=?
+            ORDER BY t.name
+            LIMIT ? OFFSET ?
+        """, (sport, limit, offset))
+    teams = cur.fetchall()
+    conn.close()
+    return teams
+
+
+def get_teams_count_by_sport(sport, only_open=False):
+    conn = get_connection()
+    cur = conn.cursor()
+    if only_open:
+        cur.execute(
+            "SELECT COUNT(*) FROM teams WHERE sport=? AND is_open_for_requests=1", (sport,))
+    else:
+        cur.execute("SELECT COUNT(*) FROM teams WHERE sport=?", (sport,))
+    count = cur.fetchone()[0]
+    conn.close()
+    return count

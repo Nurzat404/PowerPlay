@@ -4,15 +4,24 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import CallbackQuery, Message
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+import json
 from database import get_connection
 from utils import (
     get_user, get_user_teams, is_captain, get_team_by_id, get_team_members,
     get_user_by_username, is_team_member, has_pending_invite,
-    create_invite, accept_invite, reject_invite, get_user_by_id, get_all_sports
+    create_invite, accept_invite, reject_invite, get_user_by_id, get_all_sports,
+    get_team_settings, set_team_open_status, set_team_notify_status,
+    get_all_teams_paginated, get_teams_count, create_team_request,
+    get_team_requests, get_team_requests_count, has_pending_request,
+    accept_request, reject_request,
+    search_teams_by_name, search_teams_count, get_team_invite_status,
+    get_teams_by_sport, get_teams_count_by_sport
 )
 from keyboards import (
-    teams_list_keyboard, team_management_keyboard, main_menu_keyboard,
-    back_to_main_keyboard, confirm_keyboard, invite_keyboard, sports_choice_keyboard
+    teams_list_keyboard, team_management_extended_keyboard, main_menu_keyboard,
+    back_to_main_keyboard, confirm_keyboard, invite_keyboard, sports_choice_keyboard,
+    teams_main_keyboard, team_view_only_keyboard, team_view_join_keyboard,
+    team_requests_keyboard, teams_sports_filter_keyboard, sports_choice_keyboard_no_done, team_view_search_keyboard
 )
 
 router = Router()
@@ -29,6 +38,12 @@ class RenameTeam(StatesGroup):
 
 class AddPlayer(StatesGroup):
     username = State()
+
+
+class SearchTeam(StatesGroup):
+    query = State()
+
+# ---------- Существующие обработчики (без изменений) ----------
 
 
 @router.callback_query(F.data == "my_teams")
@@ -62,12 +77,12 @@ async def create_team_name(message: Message, state: FSMContext):
     await state.update_data(name=message.text)
     await state.set_state(CreateTeam.sport)
     sports = get_all_sports()
-    await message.answer("Выберите вид спорта:", reply_markup=sports_choice_keyboard(sports))
+    await message.answer("Выберите вид спорта:", reply_markup=sports_choice_keyboard_no_done(sports))
 
 
-@router.callback_query(CreateTeam.sport, F.data.startswith("sport_"))
+@router.callback_query(CreateTeam.sport, F.data.startswith("create_team_sport_"))
 async def create_team_sport_choice(callback: CallbackQuery, state: FSMContext):
-    sport_name = callback.data.replace("sport_", "")
+    sport_name = callback.data.replace("create_team_sport_", "")
     await state.update_data(sport=sport_name)
     data = await state.get_data()
     team_name = data['name']
@@ -93,9 +108,20 @@ async def create_team_sport_choice(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text(f"Команда '{team_name}' создана!")
     await callback.answer()
 
+# ВАЖНО: обработчик team_requests_ должен идти до общего team_
+
+
+@router.callback_query(F.data.startswith("team_requests_"))
+async def team_requests_menu(callback: CallbackQuery):
+    """Вход в меню заявок команды (показывает список с пагинацией)"""
+    team_id = int(callback.data.split("_")[2])
+    await show_team_requests_page(callback.message, team_id, 0, edit=True)
+    await callback.answer()
+
 
 @router.callback_query(F.data.startswith("team_"))
 async def view_team(callback: CallbackQuery):
+    """Просмотр своей команды (из раздела Мои команды)"""
     team_id = int(callback.data.split("_")[1])
     team = get_team_by_id(team_id)
     if not team:
@@ -107,20 +133,24 @@ async def view_team(callback: CallbackQuery):
         [f"- {m['first_name']} (@{m['username']})" for m in members])
     captain = get_user_by_id(team['captain_id'])
     captain_name = f"{captain['first_name']} (@{captain['username']})" if captain else "Неизвестно"
+    settings = get_team_settings(team_id)
+
     text = f"""
 Команда: {team['name']}
 Вид спорта: {team['sport']}
 Город: {team['city']}
 Капитан: {captain_name}
+Набор: {"🔓 Открыт" if settings['is_open'] else "🔒 Закрыт"}
 Состав:
 {members_list}
     """
     user = get_user(callback.from_user.id)
     is_capt = user and is_captain(user['id'], team_id)
-    await callback.message.edit_text(text, reply_markup=team_management_keyboard(team_id, is_capt))
+    await callback.message.edit_text(text, reply_markup=team_management_extended_keyboard(
+        team_id, is_capt, settings['is_open'], settings['notify']))
     await callback.answer()
 
-# ---------- Редактирование названия команды ----------
+# ---------- Управление командой (rename, delete, add_player, accept_invite, reject_invite) ----------
 
 
 @router.callback_query(F.data.startswith("rename_team_"))
@@ -156,8 +186,6 @@ async def rename_team_name(message: Message, state: FSMContext):
     teams = get_user_teams(user['id'])
     await message.answer(f"Название команды изменено на '{new_name}'.")
     await message.answer("Ваши команды:", reply_markup=teams_list_keyboard(teams, show_create=True))
-
-# ---------- Удаление команды ----------
 
 
 @router.callback_query(F.data.startswith("delete_team_"))
@@ -208,8 +236,6 @@ async def delete_team_execute(callback: CallbackQuery, state: FSMContext):
     teams = get_user_teams(user['id'])
     await callback.message.answer("Ваши команды:", reply_markup=teams_list_keyboard(teams, show_create=True))
     await callback.answer()
-
-# ---------- Добавление игроков ----------
 
 
 @router.callback_query(F.data.startswith("add_player_"))
@@ -317,3 +343,502 @@ async def reject_invite_handler(callback: CallbackQuery):
     reject_invite(team_id, user['id'])
     await callback.message.edit_text("Вы отклонили приглашение.")
     await callback.answer()
+
+# ========== НОВЫЙ РАЗДЕЛ: ПОИСК КОМАНД И ЗАЯВКИ ==========
+
+
+@router.callback_query(F.data == "teams_menu")
+async def teams_main_menu(callback: CallbackQuery):
+    """Главное меню раздела 'Команды'"""
+    await callback.message.edit_text("Выберите действие:", reply_markup=teams_main_keyboard())
+    await callback.answer()
+
+# --- Просмотр всех команд (без возможности подачи заявки) ---
+
+
+@router.callback_query(F.data == "teams_list_all")
+async def list_all_teams_sports(callback: CallbackQuery):
+    sports = get_all_sports()
+    await callback.message.edit_text(
+        "Выберите вид спорта:",
+        reply_markup=teams_sports_filter_keyboard(sports, "all")
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "teams_list_open")
+async def list_open_teams_sports(callback: CallbackQuery):
+    sports = get_all_sports()
+    await callback.message.edit_text(
+        "Выберите вид спорта:",
+        reply_markup=teams_sports_filter_keyboard(sports, "open")
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("teams_filter_all_"))
+async def filter_all_teams_by_sport(callback: CallbackQuery):
+    sport = callback.data.replace("teams_filter_all_", "")
+    await show_all_teams_page(callback.message, sport, 0, edit=True)
+    await callback.answer()
+
+
+async def show_all_teams_page(message, sport, offset, edit=False):
+    teams = get_teams_by_sport(sport, only_open=False, offset=offset, limit=10)
+    total = get_teams_count_by_sport(sport, only_open=False)
+    if not teams:
+        text = f"Команд по виду спорта {sport} пока нет."
+        kb = back_to_main_keyboard()
+    else:
+        text = f"Команды по {sport}:"
+        builder = InlineKeyboardBuilder()
+        for team in teams:
+            builder.button(
+                text=team['name'], callback_data=f"view_all_team_{team['id']}")
+        builder.adjust(2)
+        nav = []
+        if offset > 0:
+            nav.append(InlineKeyboardButton(
+                text="◀️", callback_data=f"all_teams_page_{sport}_{offset-10}"))
+        if offset + 10 < total:
+            nav.append(InlineKeyboardButton(
+                text="▶️", callback_data=f"all_teams_page_{sport}_{offset+10}"))
+        if nav:
+            builder.row(*nav)
+        builder.row(InlineKeyboardButton(
+            text="🔙 К выбору спорта", callback_data="teams_list_all"))
+        kb = builder.as_markup()
+    if edit:
+        await message.edit_text(text, reply_markup=kb)
+    else:
+        await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("all_teams_page_"))
+async def all_teams_page_callback(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    sport = parts[3]
+    offset = int(parts[4])
+    await show_all_teams_page(callback.message, sport, offset, edit=True)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("teams_filter_open_"))
+async def filter_open_teams_by_sport(callback: CallbackQuery):
+    sport = callback.data.replace("teams_filter_open_", "")
+    await show_open_teams_page(callback.message, sport, 0, edit=True)
+    await callback.answer()
+
+
+async def show_open_teams_page(message, sport, offset, edit=False):
+    teams = get_teams_by_sport(sport, only_open=True, offset=offset, limit=10)
+    total = get_teams_count_by_sport(sport, only_open=True)
+    if not teams:
+        text = f"Открытых команд по виду спорта {sport} пока нет."
+        kb = back_to_main_keyboard()
+    else:
+        text = f"Открытые команды по {sport}:"
+        builder = InlineKeyboardBuilder()
+        for team in teams:
+            builder.button(
+                text=team['name'], callback_data=f"view_open_team_{team['id']}")
+        builder.adjust(2)
+        nav = []
+        if offset > 0:
+            nav.append(InlineKeyboardButton(
+                text="◀️", callback_data=f"open_teams_page_{sport}_{offset-10}"))
+        if offset + 10 < total:
+            nav.append(InlineKeyboardButton(
+                text="▶️", callback_data=f"open_teams_page_{sport}_{offset+10}"))
+        if nav:
+            builder.row(*nav)
+        builder.row(InlineKeyboardButton(
+            text="🔙 К выбору спорта", callback_data="teams_list_open"))
+        kb = builder.as_markup()
+    if edit:
+        await message.edit_text(text, reply_markup=kb)
+    else:
+        await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("open_teams_page_"))
+async def open_teams_page_callback(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    sport = parts[3]
+    offset = int(parts[4])
+    await show_open_teams_page(callback.message, sport, offset, edit=True)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("view_all_team_"))
+async def view_all_team(callback: CallbackQuery):
+    team_id = int(callback.data.split("_")[3])
+    team = get_team_by_id(team_id)
+    if not team:
+        await callback.answer("Команда не найдена", show_alert=True)
+        return
+    captain = get_user_by_id(team['captain_id'])
+    captain_name = f"{captain['first_name']} (@{captain['username']})" if captain else "Неизвестно"
+    members = get_team_members(team_id)
+    members_list = "\n".join(
+        [f"- {m['first_name']} (@{m['username']})" for m in members])
+    settings = get_team_settings(team_id)
+    sport = team['sport']
+    text = f"""
+Команда: {team['name']}
+Вид спорта: {team['sport']}
+Город: {team['city']}
+Капитан: {captain_name}
+Набор: {"🔓 Открыт" if settings['is_open'] else "🔒 Закрыт"}
+Состав:
+{members_list}
+    """
+    await callback.message.edit_text(text, reply_markup=team_view_only_keyboard(team_id, sport))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("view_open_team_"))
+async def view_open_team(callback: CallbackQuery):
+    team_id = int(callback.data.split("_")[3])
+    team = get_team_by_id(team_id)
+    if not team:
+        await callback.answer("Команда не найдена", show_alert=True)
+        return
+
+    user = get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("Сначала зарегистрируйтесь", show_alert=True)
+        return
+
+    is_member = is_team_member(user['id'], team_id)
+    has_request = has_pending_request(user['id'], team_id)
+    settings = get_team_settings(team_id)
+    can_apply = not is_member and not has_request and settings['is_open']
+
+    captain = get_user_by_id(team['captain_id'])
+    captain_name = f"{captain['first_name']} (@{captain['username']})" if captain else "Неизвестно"
+    members = get_team_members(team_id)
+    members_list = "\n".join(
+        [f"- {m['first_name']} (@{m['username']})" for m in members])
+
+    text = f"""
+Команда: {team['name']}
+Вид спорта: {team['sport']}
+Город: {team['city']}
+Капитан: {captain_name}
+Набор: {"🔓 Открыт" if settings['is_open'] else "🔒 Закрыт"}
+Состав:
+{members_list}
+    """
+    sport = team['sport']
+    await callback.message.edit_text(text, reply_markup=team_view_join_keyboard(team_id, can_apply, sport))
+    await callback.answer()
+
+# --- Поиск команды по названию ---
+
+
+@router.callback_query(F.data == "teams_search")
+async def teams_search_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(SearchTeam.query)
+    await callback.message.edit_text("Введите название команды для поиска:")
+    await callback.answer()
+
+
+@router.message(SearchTeam.query)
+async def teams_search_query(message: Message, state: FSMContext):
+    query = message.text.strip()
+    await state.clear()
+    await show_search_results(message, query, 0)
+
+
+async def show_search_results(message, query, offset, edit=False):
+    teams = search_teams_by_name(query, offset, 10)
+    total = search_teams_count(query)
+    if not teams:
+        text = f"По запросу «{query}» ничего не найдено."
+        kb = back_to_main_keyboard()
+    else:
+        text = f"Результаты поиска по запросу «{query}»:"
+        builder = InlineKeyboardBuilder()
+        for team in teams:
+            builder.button(
+                text=team['name'], callback_data=f"view_search_team_{team['id']}_{query}")
+        builder.adjust(2)
+        nav = []
+        if offset > 0:
+            nav.append(InlineKeyboardButton(
+                text="◀️", callback_data=f"search_page_{query}_{offset-10}"))
+        if offset + 10 < total:
+            nav.append(InlineKeyboardButton(
+                text="▶️", callback_data=f"search_page_{query}_{offset+10}"))
+        if nav:
+            builder.row(*nav)
+        builder.row(InlineKeyboardButton(
+            text="🔙 В меню команд", callback_data="teams_menu"))
+        kb = builder.as_markup()
+    if edit:
+        await message.edit_text(text, reply_markup=kb)
+    else:
+        await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("search_page_"))
+async def search_page_callback(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    query = parts[2]
+    offset = int(parts[3])
+    await show_search_results(callback.message, query, offset, edit=True)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("view_search_team_"))
+async def view_search_team(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    team_id = int(parts[3])
+    query = parts[4] if len(parts) > 4 else ""
+    team = get_team_by_id(team_id)
+    if not team:
+        await callback.answer("Команда не найдена", show_alert=True)
+        return
+
+    user = get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("Сначала зарегистрируйтесь", show_alert=True)
+        return
+
+    is_member = is_team_member(user['id'], team_id)
+    has_request = has_pending_request(user['id'], team_id)
+    settings = get_team_settings(team_id)
+    can_apply = not is_member and not has_request and settings['is_open']
+
+    captain = get_user_by_id(team['captain_id'])
+    captain_name = f"{captain['first_name']} (@{captain['username']})" if captain else "Неизвестно"
+    members = get_team_members(team_id)
+    members_list = "\n".join(
+        [f"- {m['first_name']} (@{m['username']})" for m in members])
+
+    text = f"""
+Команда: {team['name']}
+Вид спорта: {team['sport']}
+Город: {team['city']}
+Капитан: {captain_name}
+Набор: {"🔓 Открыт" if settings['is_open'] else "🔒 Закрыт"}
+Состав:
+{members_list}
+    """
+    await callback.message.edit_text(text, reply_markup=team_view_search_keyboard(team_id, can_apply, query))
+    await callback.answer()
+
+# --- Обработчики подачи заявки и уведомления ---
+
+
+@router.callback_query(F.data.startswith("apply_team_"))
+async def apply_to_team(callback: CallbackQuery):
+    team_id = int(callback.data.split("_")[2])
+    user = get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("Сначала зарегистрируйтесь", show_alert=True)
+        return
+
+    # Проверки
+    if is_team_member(user['id'], team_id):
+        await callback.answer("Вы уже в этой команде", show_alert=True)
+        return
+
+    existing_status = get_team_invite_status(team_id, user['id'])
+
+    if existing_status == 'pending':
+        await callback.answer("Заявка уже отправлена", show_alert=True)
+        return
+    if existing_status == 'accepted':
+        await callback.answer("Вы уже в этой команде", show_alert=True)
+        return
+
+    settings = get_team_settings(team_id)
+    if not settings['is_open']:
+        await callback.answer("Набор в команду закрыт", show_alert=True)
+        return
+
+    if existing_status == 'rejected':
+        # Обновляем существующую запись на 'pending'
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE team_invites
+            SET status='pending', type='request'
+            WHERE team_id=? AND user_id=?
+        """, (team_id, user['id']))
+        conn.commit()
+        conn.close()
+    else:
+        # Создаём новую запись
+        create_team_request(team_id, user['id'])
+
+    team = get_team_by_id(team_id)
+
+    if settings['notify']:
+        fav_sports = json.loads(
+            user['favorite_sports']) if user['favorite_sports'] else []
+        sports_str = ", ".join(fav_sports) if fav_sports else "не указаны"
+        text = (
+            f"📩 Новая заявка на вступление в команду «{team['name']}»!\n\n"
+            f"👤 {user['first_name']} {user['last_name']} (@{user['username']})\n"
+            f"📧 Email: {user['email']}\n"
+            f"🏙 Город: {user['city']}\n"
+            f"🎯 Любимые виды спорта: {sports_str}"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_req_{team_id}_{user['id']}"),
+             InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject_req_{team_id}_{user['id']}")]
+        ])
+        captain = get_user_by_id(team['captain_id'])
+        if captain:
+            try:
+                await callback.bot.send_message(captain['telegram_id'], text, reply_markup=kb)
+            except Exception as e:
+                print(
+                    f"Не удалось отправить уведомление капитану {captain['telegram_id']}: {e}")
+        else:
+            print(f"Капитан с id {team['captain_id']} не найден")
+
+    await callback.answer("Заявка отправлена! Ожидайте решения капитана.", show_alert=True)
+    await callback.message.edit_text("Заявка отправлена. Вы можете вернуться в меню команд.",
+                                     reply_markup=back_to_main_keyboard())
+
+# --- Обработчики заявок для капитана ---
+
+
+async def show_team_requests_page(message, team_id, offset, edit=False):
+    requests = get_team_requests(team_id, offset, 10)
+    total = get_team_requests_count(team_id)
+    if not requests:
+        text = "Нет заявок на вступление."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text="🔙 Назад", callback_data=f"team_{team_id}")]
+        ])
+    else:
+        text = f"Заявки в команду (всего: {total}):"
+        kb = team_requests_keyboard(requests, offset, team_id, total)
+    if edit:
+        await message.edit_text(text, reply_markup=kb)
+    else:
+        await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("team_reqs_page_"))
+async def team_reqs_page_callback(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    team_id = int(parts[3])
+    offset = int(parts[4])
+    await show_team_requests_page(callback.message, team_id, offset, edit=True)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("accept_req_"))
+async def accept_request_handler(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    if len(parts) == 3:
+        request_id = int(parts[2])
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT team_id, user_id FROM team_invites WHERE id=?", (request_id,))
+        req = cur.fetchone()
+        conn.close()
+        if not req:
+            await callback.answer("Заявка не найдена", show_alert=True)
+            return
+        team_id, user_id = req['team_id'], req['user_id']
+        accept_request(request_id)
+    else:
+        team_id = int(parts[2])
+        user_id = int(parts[3])
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id FROM team_invites WHERE team_id=? AND user_id=? AND type='request'", (team_id, user_id))
+        row = cur.fetchone()
+        conn.close()
+        if not row:
+            await callback.answer("Заявка не найдена", show_alert=True)
+            return
+        request_id = row['id']
+        accept_request(request_id)
+
+    team = get_team_by_id(team_id)
+    user = get_user_by_id(user_id)
+    try:
+        await callback.bot.send_message(user['telegram_id'],
+                                        f"✅ Ваша заявка в команду «{team['name']}» принята! Теперь вы в составе.")
+    except Exception as e:
+        print(f"Не удалось отправить уведомление игроку {user_id}: {e}")
+
+    await callback.answer("Заявка принята!", show_alert=True)
+    await show_team_requests_page(callback.message, team_id, 0, edit=True)
+
+
+@router.callback_query(F.data.startswith("reject_req_"))
+async def reject_request_handler(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    if len(parts) == 3:
+        request_id = int(parts[2])
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT team_id, user_id FROM team_invites WHERE id=?", (request_id,))
+        req = cur.fetchone()
+        conn.close()
+        if not req:
+            await callback.answer("Заявка не найдена", show_alert=True)
+            return
+        team_id, user_id = req['team_id'], req['user_id']
+        reject_request(request_id)
+    else:
+        team_id = int(parts[2])
+        user_id = int(parts[3])
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE team_invites SET status='rejected' WHERE team_id=? AND user_id=? AND type='request'", (team_id, user_id))
+        conn.commit()
+        conn.close()
+
+    team = get_team_by_id(team_id)
+    user = get_user_by_id(user_id)
+    try:
+        await callback.bot.send_message(user['telegram_id'],
+                                        f"❌ Ваша заявка в команду «{team['name']}» отклонена.")
+    except Exception as e:
+        print(f"Не удалось отправить уведомление игроку {user_id}: {e}")
+
+    await callback.answer("Заявка отклонена!", show_alert=True)
+    await show_team_requests_page(callback.message, team_id, 0, edit=True)
+
+# --- Переключатели ---
+
+
+@router.callback_query(F.data.startswith("toggle_open_"))
+async def toggle_team_open(callback: CallbackQuery):
+    team_id = int(callback.data.split("_")[2])
+    settings = get_team_settings(team_id)
+    new_status = not settings['is_open']
+    set_team_open_status(team_id, new_status)
+    await callback.answer(f"Приём заявок {'открыт' if new_status else 'закрыт'}.")
+    user = get_user(callback.from_user.id)
+    is_capt = user and is_captain(user['id'], team_id)
+    await callback.message.edit_reply_markup(reply_markup=team_management_extended_keyboard(
+        team_id, is_capt, new_status, settings['notify']))
+
+
+@router.callback_query(F.data.startswith("toggle_notify_"))
+async def toggle_team_notify(callback: CallbackQuery):
+    team_id = int(callback.data.split("_")[2])
+    settings = get_team_settings(team_id)
+    new_status = not settings['notify']
+    set_team_notify_status(team_id, new_status)
+    await callback.answer(f"Уведомления {'включены' if new_status else 'выключены'}.")
+    user = get_user(callback.from_user.id)
+    is_capt = user and is_captain(user['id'], team_id)
+    await callback.message.edit_reply_markup(reply_markup=team_management_extended_keyboard(
+        team_id, is_capt, settings['is_open'], new_status))
