@@ -4,8 +4,6 @@ import asyncio
 import logging
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
-
-
 from database import init_db
 from handlers import start, menu, teams, tournaments, ratings, admin
 from middlewares import BanCheckMiddleware

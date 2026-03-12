@@ -19,7 +19,7 @@ class Registration(StatesGroup):
     sports = State()
 
 
-SPORTS_LIST = ["CS2", "Brawl Stars", "Basketball"]  # пока только CS2
+SPORTS_LIST = ["CS2", "Brawl Stars", "Basketball"]
 
 
 @router.message(Command("start"))

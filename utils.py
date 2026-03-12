@@ -4,6 +4,11 @@ from database import get_connection
 import datetime
 from datetime import datetime
 
+RUSSIAN_MONTHS = {
+    'янв.': 1, 'февр.': 2, 'марта': 3, 'апр.': 4, 'мая': 5, 'июня': 6,
+    'июля': 7, 'авг.': 8, 'сент.': 9, 'окт.': 10, 'нояб.': 11, 'дек.': 12
+}
+
 
 def get_user(telegram_id):
     conn = get_connection()
@@ -169,7 +174,7 @@ def update_team_rating(team_id, sport, month, points_change):
     conn.commit()
     conn.close()
 
-# ---------- Новые функции для управления пользователями ----------
+# ---------- Функции для управления пользователями ----------
 
 
 def get_all_users(offset=0, limit=20):
@@ -321,7 +326,6 @@ def get_all_sports():
     sports = cur.fetchall()   # каждая запись — (name, display_name)
     conn.close()
     return sports
-# Добавьте эти функции в конец файла utils.py
 
 
 def get_team_application(tournament_id, team_id):
@@ -680,3 +684,71 @@ def get_teams_count_by_sport(sport, only_open=False):
     count = cur.fetchone()[0]
     conn.close()
     return count
+
+
+def is_email_unique(email, exclude_telegram_id=None):
+    conn = get_connection()
+    cur = conn.cursor()
+    if exclude_telegram_id:
+        cur.execute("SELECT id FROM users WHERE email=? AND telegram_id != ?",
+                    (email, exclude_telegram_id))
+    else:
+        cur.execute("SELECT id FROM users WHERE email=?", (email,))
+    result = cur.fetchone() is not None
+    conn.close()
+    return not result   # True если уникален
+
+
+def parse_russian_date(date_str):
+    """
+    Парсит строку вида "день месяц" (например "1 янв.").
+    Возвращает кортеж (day, month) или None при ошибке.
+    """
+    parts = date_str.strip().split()
+    if len(parts) != 2:
+        return None
+    day_str, month_str = parts
+    if not day_str.isdigit():
+        return None
+    day = int(day_str)
+    if day < 1 or day > 31:
+        return None
+    month = RUSSIAN_MONTHS.get(month_str.lower())
+    if month is None:
+        return None
+    return day, month
+
+
+def parse_russian_datetime(datetime_str):
+    """
+    Парсит строку вида "день месяц часы:минуты" (например "1 янв. 18:00").
+    Требует, чтобы часы и минуты были двузначными.
+    Возвращает кортеж (day, month, hour, minute) или None.
+    """
+    parts = datetime_str.strip().split()
+    if len(parts) != 3:
+        return None
+    day_str, month_str, time_str = parts
+    # Проверка дня
+    if not day_str.isdigit():
+        return None
+    day = int(day_str)
+    if day < 1 or day > 31:
+        return None
+    # Проверка месяца
+    month = RUSSIAN_MONTHS.get(month_str.lower())
+    if month is None:
+        return None
+    # Проверка времени
+    time_parts = time_str.split(':')
+    if len(time_parts) != 2:
+        return None
+    hour_str, minute_str = time_parts
+    # Проверяем, что обе части состоят из двух цифр (допускаем ведущие нули)
+    if not (hour_str.isdigit() and minute_str.isdigit() and len(hour_str) == 2 and len(minute_str) == 2):
+        return None
+    hour = int(hour_str)
+    minute = int(minute_str)
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        return None
+    return day, month, hour, minute

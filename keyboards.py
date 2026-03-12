@@ -102,7 +102,7 @@ def choose_team_keyboard(teams, tournament_id):
     builder = InlineKeyboardBuilder()
     for team in teams:
         builder.button(
-            text=team['name'], callback_data=f"apply_team_{team['id']}_{tournament_id}")
+            text=team['name'], callback_data=f"tourn_apply_team_{team['id']}_{tournament_id}")
     builder.button(text="🔙 Назад", callback_data=f"tournament_{tournament_id}")
     builder.adjust(1)
     return builder.as_markup()
@@ -305,3 +305,20 @@ def sports_choice_keyboard_no_done(sports_list):
         builder.button(text=display, callback_data=f"create_team_sport_{name}")
     builder.adjust(2)
     return builder.as_markup()
+
+
+def edit_profile_menu_keyboard():
+    kb = [
+        [InlineKeyboardButton(text="✏️ Имя", callback_data="edit_name")],
+        [InlineKeyboardButton(text="✏️ Email", callback_data="edit_email")],
+        [InlineKeyboardButton(text="✏️ Город", callback_data="edit_city")],
+        [InlineKeyboardButton(text="✏️ Любимые виды спорта",
+                              callback_data="edit_sports")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="profile")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def cancel_keyboard():
+    kb = [[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_edit")]]
+    return InlineKeyboardMarkup(inline_keyboard=kb)

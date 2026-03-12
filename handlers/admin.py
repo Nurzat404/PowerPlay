@@ -9,14 +9,12 @@ from utils import (
     update_team_rating, get_all_users, search_users, get_user_by_id,
     update_user_role, toggle_user_ban, update_team_rating_same_conn,
     get_team_members, get_tournament_by_id, get_team_by_id,
-    # новые функции для управления турнирами и рейтингом
     delete_tournament, get_all_sports, reset_sport_rating,
     get_teams_with_rating, reset_team_rating, deduct_team_points,
-    get_all_teams, delete_team_admin
+    get_all_teams, delete_team_admin, parse_russian_date, parse_russian_datetime
 )
 from keyboards import (
     admin_menu_keyboard, back_to_main_keyboard,
-    # новые клавиатуры для рейтинга и удаления команд
     admin_rating_menu_keyboard, admin_rating_sport_actions_keyboard,
     admin_rating_teams_list_keyboard, admin_rating_team_actions_keyboard,
     admin_teams_list_keyboard
@@ -25,7 +23,7 @@ from datetime import datetime
 
 router = Router()
 
-# ---------- Создание турнира (добавлено описание) ----------
+# ---------- Создание турнира ----------
 
 
 class CreateTournament(StatesGroup):
@@ -66,19 +64,33 @@ async def create_tournament_sport(message: Message, state: FSMContext):
 async def create_tournament_city(message: Message, state: FSMContext):
     await state.update_data(city=message.text)
     await state.set_state(CreateTournament.start_date)
-    await message.answer("Введите дату начала (например, 2025-05-01):")
+    await message.answer("Введите дату начала турнира (в формате: день и сокращённое название месяца с точкой, например : 1 янв.):")
 
 
 @router.message(CreateTournament.start_date)
 async def create_tournament_start(message: Message, state: FSMContext):
-    await state.update_data(start_date=message.text)
+    date_str = message.text.strip()
+    if parse_russian_date(date_str) is None:
+        await message.answer("❌ Неверный формат. Введите дату в формате: день месяц (например: 1 янв.)\n"
+                             "Подсказка по месяцам:\n"
+                             "'янв.', 'февр.', 'марта', 'апр.', 'мая', 'июня', 'июля', 'авг.', 'сент.', 'окт.', 'нояб.', 'дек.'"
+                             )
+        return
+    await state.update_data(start_date=date_str)
     await state.set_state(CreateTournament.end_date)
-    await message.answer("Введите дату окончания (YYYY-MM-DD):")
+    await message.answer("Введите дату окончания турнира (в формате: день и сокращённое название месяца с точкой, например: 2 февр.):")
 
 
 @router.message(CreateTournament.end_date)
 async def create_tournament_end(message: Message, state: FSMContext):
-    await state.update_data(end_date=message.text)
+    date_str = message.text.strip()
+    if parse_russian_date(date_str) is None:
+        await message.answer("❌ Неверный формат. Введите дату в формате: день месяц (например: 2 февр.)\n"
+                             "Подсказка по месяцам:\n"
+                             "'янв.', 'февр.', 'марта', 'апр.', 'мая', 'июня', 'июля', 'авг.', 'сент.', 'окт.', 'нояб.', 'дек.'"
+                             )
+        return
+    await state.update_data(end_date=date_str)
     await state.set_state(CreateTournament.max_teams)
     await message.answer("Введите максимальное количество команд (число):")
 
@@ -330,13 +342,21 @@ async def match_choose_team2(callback: CallbackQuery, state: FSMContext):
     team2_id = int(callback.data.split("_")[2])
     await state.update_data(team2_id=team2_id)
     await state.set_state(CreateMatch.date)
-    await callback.message.edit_text("Введите дату и время матча (например, 2025-05-01 18:00):")
+    await callback.message.edit_text("Введите дату и время матча (например, 1 янв. 18:00):")
     await callback.answer()
 
 
 @router.message(CreateMatch.date)
 async def match_enter_date(message: Message, state: FSMContext):
-    await state.update_data(date=message.text)
+    datetime_str = message.text.strip()
+    if parse_russian_datetime(datetime_str) is None:
+        await message.answer("❌ Неверный формат. Введите дату и время в формате: день месяц часы:минуты (например: 1 янв. 18:00)\n"
+                             "Часы и минуты должны быть двузначными (например, 09:05, 18:00)."
+                             "Подсказка по месяцам:\n"
+                             "'янв.', 'февр.', 'марта', 'апр.', 'мая', 'июня', 'июля', 'авг.', 'сент.', 'окт.', 'нояб.', 'дек.'"
+                             )
+        return
+    await state.update_data(date=datetime_str)
     await state.set_state(CreateMatch.location)
     await message.answer("Введите место проведения:")
 

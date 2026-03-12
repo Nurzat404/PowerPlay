@@ -72,7 +72,6 @@ async def view_tournament(callback: CallbackQuery):
                     can_apply = True
                     break
 
-    # Русские статусы
     status_map = {
         'registration': 'Регистрация',
         'active': 'Активен',
@@ -110,11 +109,12 @@ async def view_tournament(callback: CallbackQuery):
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("apply_team_"))
+@router.callback_query(F.data.startswith("tourn_apply_team_"))
 async def apply_with_team(callback: CallbackQuery):
     parts = callback.data.split("_")
-    team_id = int(parts[2])
-    tournament_id = int(parts[3])
+    # формат: tourn_apply_team_{team_id}_{tournament_id}
+    team_id = int(parts[3])
+    tournament_id = int(parts[4])
     status = get_team_application(tournament_id, team_id)
     if status:
         await callback.answer("Заявка уже подана или команда участвует", show_alert=True)
