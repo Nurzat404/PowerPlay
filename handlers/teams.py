@@ -74,7 +74,16 @@ async def create_team_start(callback: CallbackQuery, state: FSMContext):
 
 @router.message(CreateTeam.name)
 async def create_team_name(message: Message, state: FSMContext):
-    await state.update_data(name=message.text)
+    name = message.text.strip()
+    # Проверка длины
+    if len(name) > 20:
+        await message.answer("❌ Название команды не должно превышать 20 символов. Попробуйте снова:")
+        return  # остаёмся в том же состоянии FSM, пользователь вводит заново
+    if len(name) < 3:
+        await message.answer("❌ Название команды должно быть не короче 3 символов. Попробуйте снова:")
+        return
+    # Если всё ок – сохраняем
+    await state.update_data(name=name)
     await state.set_state(CreateTeam.sport)
     sports = get_all_sports()
     await message.answer("Выберите вид спорта:", reply_markup=sports_choice_keyboard_no_done(sports))
@@ -174,6 +183,12 @@ async def rename_team_name(message: Message, state: FSMContext):
     new_name = message.text.strip()
     if not new_name:
         await message.answer("Название не может быть пустым.")
+        return
+    if len(new_name) > 20:
+        await message.answer("❌ Название команды не должно превышать 20 символов. Попробуйте снова:")
+        return
+    if len(new_name) < 3:
+        await message.answer("❌ Название команды должно быть не короче 3 символов. Попробуйте снова:")
         return
 
     conn = get_connection()
