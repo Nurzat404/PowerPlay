@@ -4,6 +4,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from database import get_connection
+from aiogram import Bot
 from utils import (
     is_admin, get_pending_applications, approve_application, reject_application,
     update_team_rating, get_all_users, search_users, get_user_by_id,
@@ -11,7 +12,8 @@ from utils import (
     get_team_members, get_tournament_by_id, get_team_by_id,
     delete_tournament, get_all_sports, reset_sport_rating,
     get_teams_with_rating, reset_team_rating, deduct_team_points,
-    get_all_teams, delete_team_admin, parse_russian_date, parse_russian_datetime
+    get_all_teams, delete_team_admin, parse_russian_date, parse_russian_datetime,
+    get_user, get_user_teams, get_team_application, get_approved_teams_count
 )
 from keyboards import (
     admin_menu_keyboard, back_to_main_keyboard,
@@ -21,6 +23,55 @@ from keyboards import (
 )
 from datetime import datetime
 
+
+async def send_tournament_info(bot: Bot, chat_id: int, tournament_id: int, user_id: int):
+    tournament = get_tournament_by_id(tournament_id)
+    if not tournament:
+        await bot.send_message(chat_id, "Турнир не найден.")
+        return
+    user = get_user(user_id)
+    teams = get_user_teams(user['id']) if user else []
+    approved_count = get_approved_teams_count(tournament_id)
+    can_apply = False
+    if user:
+        for team in teams:
+            if team['sport'] == tournament['sport']:
+                status = get_team_application(tournament_id, team['id'])
+                if status is None and approved_count < tournament['max_teams']:
+                    can_apply = True
+                    break
+    status_map = {
+        'registration': 'Регистрация',
+        'active': 'Активен',
+        'finished': 'Завершён'
+    }
+    status_display = status_map.get(tournament['status'], tournament['status'])
+    text = f"""
+🏆 {tournament['name']}
+Вид спорта: {tournament['sport']}
+Требуемый размер команды: {tournament['required_team_size']} чел.
+Город: {tournament['city']}
+Даты: {tournament['start_date']} - {tournament['end_date']}
+Макс. команд: {tournament['max_teams']}
+Статус: {status_display}
+"""
+    if tournament['description']:
+        text += f"\n📝 Описание: {tournament['description']}"
+    builder = InlineKeyboardBuilder()
+    if can_apply:
+        builder.button(text="📝 Подать заявку",
+                       callback_data=f"apply_{tournament_id}")
+    builder.button(text="📋 Список команд",
+                   callback_data=f"tournament_teams_{tournament_id}")
+    if user and is_admin(user['telegram_id']):
+        builder.button(text="✏️ Редактировать",
+                       callback_data=f"admin_edit_tournament_{tournament_id}")
+        builder.button(text="🗑 Удалить турнир",
+                       callback_data=f"admin_delete_tournament_{tournament_id}")
+    builder.button(
+        text="🔙 Назад", callback_data=f"tournament_sport_{tournament['sport']}")
+    builder.adjust(1)
+    await bot.send_message(chat_id, text, reply_markup=builder.as_markup())
 router = Router()
 
 # ---------- Создание турнира ----------
@@ -33,6 +84,7 @@ class CreateTournament(StatesGroup):
     start_date = State()
     end_date = State()
     max_teams = State()
+    required_team_size = State()
     description = State()
 
 
@@ -103,6 +155,20 @@ async def create_tournament_max(message: Message, state: FSMContext):
         await message.answer("Введите число!")
         return
     await state.update_data(max_teams=max_teams)
+    await state.set_state(CreateTournament.required_team_size)
+    await message.answer("Введите требуемое количество игроков в команде для участия в турнире (от 1 до 10):")
+
+
+@router.message(CreateTournament.required_team_size)
+async def create_tournament_required_size(message: Message, state: FSMContext):
+    try:
+        size = int(message.text)
+        if size < 1 or size > 10:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите целое число от 1 до 10.")
+        return
+    await state.update_data(required_team_size=size)
     await state.set_state(CreateTournament.description)
     await message.answer("Введите описание турнира (можно отправить 'нет', чтобы пропустить):")
 
@@ -114,9 +180,9 @@ async def create_tournament_description(message: Message, state: FSMContext):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO tournaments (name, sport, city, start_date, end_date, max_teams, description, created_by, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'registration')
-    """, (data['name'], data['sport'], data['city'], data['start_date'], data['end_date'], data['max_teams'], description, message.from_user.id))
+        INSERT INTO tournaments (name, sport, city, start_date, end_date, max_teams, required_team_size, description, created_by, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'registration')
+    """, (data['name'], data['sport'], data['city'], data['start_date'], data['end_date'], data['max_teams'], data['required_team_size'], description, message.from_user.id))
     conn.commit()
     conn.close()
     await state.clear()
@@ -138,8 +204,8 @@ async def edit_tournament_start(callback: CallbackQuery, state: FSMContext):
     tournament_id = int(callback.data.split("_")[3])
     await state.update_data(tournament_id=tournament_id)
     builder = InlineKeyboardBuilder()
-    fields = ["name", "sport", "city", "start_date",
-              "end_date", "max_teams", "description"]
+    fields = ["name", "sport", "city", "start_date", "end_date",
+              "max_teams", "required_team_size", "description"]
     for f in fields:
         builder.button(text=f, callback_data=f"edit_field_{f}")
     builder.button(text="🔙 Назад", callback_data=f"tournament_{tournament_id}")
@@ -163,9 +229,12 @@ async def edit_tournament_value(message: Message, state: FSMContext):
     tournament_id = data['tournament_id']
     field = data['field']
     new_value = message.text
-    if field == "max_teams":
+    if field == "max_teams" or field == "required_team_size":
         try:
             new_value = int(new_value)
+            if field == "required_team_size" and (new_value < 1 or new_value > 10):
+                await message.answer("❌ Требуемый размер команды должен быть от 1 до 10.")
+                return
         except ValueError:
             await message.answer("Введите число!")
             return
@@ -177,7 +246,7 @@ async def edit_tournament_value(message: Message, state: FSMContext):
     conn.close()
     await state.clear()
     await message.answer("Турнир обновлён!")
-    await message.answer("Панель администратора:", reply_markup=admin_menu_keyboard())
+    await send_tournament_info(message.bot, message.chat.id, tournament_id, message.from_user.id)
 
 # ---------- Заявки на турниры ----------
 
@@ -701,6 +770,7 @@ async def admin_delete_tournament_confirm(callback: CallbackQuery, state: FSMCon
     ])
     await callback.message.edit_text(f"Вы уверены, что хотите удалить турнир «{tournament['name']}»? Это действие нельзя отменить.", reply_markup=kb)
     await callback.answer()
+    await state.update_data(tournament_id=tournament_id, sport=tournament['sport'])
 
 
 @router.callback_query(F.data == "admin_confirm_delete_tournament")
@@ -713,11 +783,22 @@ async def admin_delete_tournament_execute(callback: CallbackQuery, state: FSMCon
     if not tournament_id:
         await callback.answer("Ошибка", show_alert=True)
         return
+
+    tournament = get_tournament_by_id(tournament_id)
+    sport = tournament['sport'] if tournament else None
+
     delete_tournament(tournament_id)
     await state.clear()
-    await callback.message.edit_text("Турнир удалён.")
-    await callback.message.answer("Панель администратора:", reply_markup=admin_menu_keyboard())
-    await callback.answer()
+
+    if sport:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"🔙 К турнирам по {sport}", callback_data=f"tournament_sport_{sport}")]
+        ])
+    else:
+        kb = back_to_main_keyboard()
+
+    await callback.message.edit_text("Турнир удалён.", reply_markup=kb)
 
 # ---------- Управление рейтингом ----------
 

@@ -2,7 +2,7 @@ import json
 import sqlite3
 from database import get_connection
 import datetime
-from datetime import datetime
+from datetime import datetime, timedelta
 
 RUSSIAN_MONTHS = {
     'янв.': 1, 'февр.': 2, 'марта': 3, 'апр.': 4, 'мая': 5, 'июня': 6,
@@ -118,8 +118,8 @@ def add_tournament_application(tournament_id, team_id):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO tournament_applications (tournament_id, team_id, status)
-        VALUES (?, ?, 'pending')
+        INSERT INTO tournament_applications (tournament_id, team_id, status, applied_at, updated_at)
+        VALUES (?, ?, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
     """, (tournament_id, team_id))
     conn.commit()
     conn.close()
@@ -141,20 +141,24 @@ def get_pending_applications():
     return apps
 
 
-def approve_application(app_id):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE tournament_applications SET status='approved' WHERE id=?", (app_id,))
-    conn.commit()
-    conn.close()
-
-
 def reject_application(app_id):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "UPDATE tournament_applications SET status='rejected' WHERE id=?", (app_id,))
+        "UPDATE tournament_applications SET status='rejected', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        (app_id,)
+    )
+    conn.commit()
+    conn.close()
+
+
+def approve_application(app_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE tournament_applications SET status='approved', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+        (app_id,)
+    )
     conn.commit()
     conn.close()
 
@@ -329,14 +333,54 @@ def get_all_sports():
 
 
 def get_team_application(tournament_id, team_id):
-    """Возвращает статус заявки команды на турнир или None, если заявки нет."""
+    """Возвращает статус заявки и время последнего обновления или None"""
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT status FROM tournament_applications WHERE tournament_id=? AND team_id=?",
+    cur.execute("SELECT status, updated_at FROM tournament_applications WHERE tournament_id=? AND team_id=?",
                 (tournament_id, team_id))
-    app = cur.fetchone()
+    row = cur.fetchone()
     conn.close()
-    return app['status'] if app else None
+    if row:
+        return {'status': row['status'], 'updated_at': row['updated_at']}
+    return None
+
+
+def update_tournament_application_status(application_id, new_status):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE tournament_applications SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (new_status, application_id))
+    conn.commit()
+    conn.close()
+
+
+def can_retry_tournament_application(tournament_id, team_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT updated_at FROM tournament_applications 
+        WHERE tournament_id=? AND team_id=? AND status='rejected'
+        ORDER BY updated_at DESC LIMIT 1
+    """, (tournament_id, team_id))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return True, None
+    if row['updated_at']:
+        try:
+            rejected_time = datetime.strptime(
+                row['updated_at'], '%Y-%m-%d %H:%M:%S')
+            now = datetime.utcnow()  # <-- исправлено
+            delta = now - rejected_time
+            if delta >= timedelta(hours=1):
+                return True, None
+            else:
+                minutes_left = 60 - int(delta.total_seconds() // 60)
+                return False, minutes_left
+        except Exception as e:
+            print(f"Ошибка парсинга updated_at: {e}")
+            return True, None
+    return True, None
 
 
 def get_approved_teams_count(tournament_id):
@@ -528,22 +572,19 @@ def get_team_requests_count(team_id):
 
 
 def accept_request(request_id):
-    """Принять заявку: добавить в team_members, обновить статус"""
+    """Принять заявку: добавить в team_members, обновить статус и updated_at"""
     conn = get_connection()
     cur = conn.cursor()
-    # Получаем данные заявки
     cur.execute(
         "SELECT team_id, user_id FROM team_invites WHERE id=? AND type='request'", (request_id,))
     req = cur.fetchone()
     if not req:
         conn.close()
         return False
-    # Добавляем в команду
     cur.execute("INSERT OR IGNORE INTO team_members (team_id, user_id) VALUES (?, ?)",
                 (req['team_id'], req['user_id']))
-    # Обновляем статус заявки
     cur.execute(
-        "UPDATE team_invites SET status='accepted' WHERE id=?", (request_id,))
+        "UPDATE team_invites SET status='accepted', updated_at=CURRENT_TIMESTAMP WHERE id=?", (request_id,))
     conn.commit()
     conn.close()
     return True
@@ -553,7 +594,7 @@ def reject_request(request_id):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "UPDATE team_invites SET status='rejected' WHERE id=? AND type='request'", (request_id,))
+        "UPDATE team_invites SET status='rejected', updated_at=CURRENT_TIMESTAMP WHERE id=? AND type='request'", (request_id,))
     conn.commit()
     conn.close()
 
@@ -752,3 +793,78 @@ def parse_russian_datetime(datetime_str):
     if hour < 0 or hour > 23 or minute < 0 or minute > 59:
         return None
     return day, month, hour, minute
+# ---------- Функции для работы с лимитами команды ----------
+
+
+def get_team_members_count(team_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM team_members WHERE team_id=?", (team_id,))
+    count = cur.fetchone()[0]
+    conn.close()
+    return count
+
+
+def get_team_max_members(team_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT max_members FROM teams WHERE id=?", (team_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row['max_members'] if row else 5
+
+
+def update_team_max_members(team_id, new_max):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE teams SET max_members=? WHERE id=?",
+                (new_max, team_id))
+    conn.commit()
+    conn.close()
+
+
+def update_team_request_status(request_id, new_status):
+    """Обновляет статус заявки и проставляет текущее время в updated_at"""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE team_invites 
+        SET status=?, updated_at=CURRENT_TIMESTAMP 
+        WHERE id=?
+    """, (new_status, request_id))
+    conn.commit()
+    conn.close()
+
+
+def can_retry_request(team_id, user_id):
+    """
+    Проверяет, можно ли подать заявку повторно после отклонения.
+    Возвращает (True, None) если можно, или (False, minutes_left) если нужно подождать.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT status, updated_at FROM team_invites 
+        WHERE team_id=? AND user_id=? AND type='request' 
+        ORDER BY updated_at DESC LIMIT 1
+    """, (team_id, user_id))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return True, None  # заявок не было
+    if row['status'] != 'rejected':
+        # не отклонена, значит можно (или pending, accepted – обработаем отдельно)
+        return True, None
+    # Была отклонена
+    if row['updated_at']:
+        # updated_at хранится как строка в формате SQLite, преобразуем в datetime
+        rejected_time = datetime.strptime(
+            row['updated_at'], '%Y-%m-%d %H:%M:%S')
+        now = datetime.now()
+        delta = now - rejected_time
+        if delta >= timedelta(hours=1):
+            return True, None
+        else:
+            minutes_left = 60 - int(delta.total_seconds() // 60)
+            return False, minutes_left
+    return True, None  # если нет времени (старые записи), разрешаем

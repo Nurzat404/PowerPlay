@@ -47,7 +47,7 @@ def teams_list_keyboard(teams, show_create=True):
     return builder.as_markup()
 
 
-def team_management_extended_keyboard(team_id, is_captain, is_open, notify_enabled):
+def team_management_extended_keyboard(team_id, is_captain, is_open, notify_enabled, max_members):
     builder = InlineKeyboardBuilder()
     if is_captain:
         builder.button(text="✏️ Изменить название",
@@ -58,6 +58,8 @@ def team_management_extended_keyboard(team_id, is_captain, is_open, notify_enabl
                        callback_data=f"delete_team_{team_id}")
         builder.button(text="📋 Заявки в команду",
                        callback_data=f"team_requests_{team_id}")
+        builder.button(text=f"👤 Лимит: {max_members} чел.",
+                       callback_data=f"edit_max_members_{team_id}")
         open_status = "🔓 Открыт" if is_open else "🔒 Закрыт"
         builder.button(
             text=f"Приём заявок: {open_status}", callback_data=f"toggle_open_{team_id}")
@@ -154,7 +156,7 @@ def teams_main_keyboard():
         [InlineKeyboardButton(text="📋 Список всех команд",
                               callback_data="teams_list_all")],
         [InlineKeyboardButton(
-            text="🔓 Команды с открытым набором", callback_data="teams_list_open")],
+            text="🔓 Вступление в команду", callback_data="teams_list_open")],
         [InlineKeyboardButton(text="🔍 Поиск команды",
                               callback_data="teams_search")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
@@ -321,4 +323,19 @@ def edit_profile_menu_keyboard():
 
 def cancel_keyboard():
     kb = [[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_edit")]]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def input_number_keyboard():
+    """Клавиатура с кнопками цифр от 1 до 10 для быстрого ввода"""
+    builder = InlineKeyboardBuilder()
+    for i in range(1, 11):
+        builder.button(text=str(i), callback_data=f"set_max_members_{i}")
+    builder.adjust(5)
+    return builder.as_markup()
+
+
+def back_to_teams_menu_keyboard():
+    kb = [[InlineKeyboardButton(
+        text="🔙 В меню команд", callback_data="teams_menu")]]
     return InlineKeyboardMarkup(inline_keyboard=kb)

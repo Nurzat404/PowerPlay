@@ -201,6 +201,37 @@ def init_db():
                 if 'type' not in columns:
                     cur.execute(
                         "ALTER TABLE team_invites ADD COLUMN type TEXT DEFAULT 'invite'")
+                # Добавляем поле max_members в teams
+                cur.execute("PRAGMA table_info(teams)")
+                columns = [col[1] for col in cur.fetchall()]
+                if 'max_members' not in columns:
+                    cur.execute(
+                        "ALTER TABLE teams ADD COLUMN max_members INTEGER DEFAULT 5")
+                    print("Поле max_members добавлено в таблицу teams (по умолчанию 5)")
+
+                # Добавляем поле required_team_size в tournaments
+                cur.execute("PRAGMA table_info(tournaments)")
+                columns = [col[1] for col in cur.fetchall()]
+                if 'required_team_size' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournaments ADD COLUMN required_team_size INTEGER DEFAULT 2")
+                    print(
+                        "Поле required_team_size добавлено в таблицу tournaments (по умолчанию 2)")
+                # Добавляем поле updated_at в team_invites (если нет)
+                cur.execute("PRAGMA table_info(team_invites)")
+                columns = [col[1] for col in cur.fetchall()]
+                if 'updated_at' not in columns:
+                    cur.execute(
+                        "ALTER TABLE team_invites ADD COLUMN updated_at TIMESTAMP")
+                    print(
+                        "Поле updated_at добавлено в таблицу team_invites (без DEFAULT)")
+                cur.execute("PRAGMA table_info(tournament_applications)")
+                columns = [col[1] for col in cur.fetchall()]
+                if 'updated_at' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournament_applications ADD COLUMN updated_at TIMESTAMP")
+                    print(
+                        "Поле updated_at добавлено в таблицу tournament_applications (без DEFAULT)")
 
             conn.close()
             print("База данных успешно инициализирована.")

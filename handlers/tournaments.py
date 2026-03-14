@@ -1,11 +1,11 @@
 from aiogram import Router, F
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-
+from database import get_connection
 from utils import (
     get_user, get_user_teams, get_tournaments_by_sport, get_tournament_by_id,
     add_tournament_application, get_all_sports, get_team_application,
-    get_approved_teams_count, get_tournament_teams, is_admin
+    get_approved_teams_count, get_tournament_teams, is_admin, get_team_members_count, can_retry_tournament_application, get_team_by_id
 )
 from keyboards import (
     tournaments_main_keyboard, tournaments_list_keyboard,
@@ -82,6 +82,7 @@ async def view_tournament(callback: CallbackQuery):
     text = f"""
 🏆 {tournament['name']}
 Вид спорта: {tournament['sport']}
+Требуемый размер команды: {tournament['required_team_size']} чел.
 Город: {tournament['city']}
 Даты: {tournament['start_date']} - {tournament['end_date']}
 Макс. команд: {tournament['max_teams']}
@@ -112,17 +113,60 @@ async def view_tournament(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("tourn_apply_team_"))
 async def apply_with_team(callback: CallbackQuery):
     parts = callback.data.split("_")
-    # формат: tourn_apply_team_{team_id}_{tournament_id}
     team_id = int(parts[3])
     tournament_id = int(parts[4])
-    status = get_team_application(tournament_id, team_id)
-    if status:
-        await callback.answer("Заявка уже подана или команда участвует", show_alert=True)
+
+    tournament = get_tournament_by_id(tournament_id)
+    if not tournament:
+        await callback.answer("Турнир не найден", show_alert=True)
         return
-    add_tournament_application(tournament_id, team_id)
-    await callback.message.edit_text("Заявка отправлена! Ожидайте подтверждения администратора.",
-                                     reply_markup=back_to_main_keyboard())
-    await callback.answer()
+
+    team = get_team_by_id(team_id)
+    if not team:
+        await callback.answer("Команда не найдена", show_alert=True)
+        return
+
+    user = get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("Сначала зарегистрируйтесь", show_alert=True)
+        return
+
+    # Получаем информацию о существующей заявке
+    app = get_team_application(tournament_id, team_id)
+
+    if app:
+        status = app['status']
+        if status == 'approved':   # было 'accepted'
+            await callback.answer("❌ Ваша команда уже участвует в турнире.", show_alert=True)
+            return
+        elif status == 'pending':
+            await callback.answer("⏳ Заявка уже отправлена, ожидайте решения.", show_alert=True)
+            return
+        elif status == 'rejected':
+            # Проверяем, можно ли повторно
+            ok, minutes = can_retry_tournament_application(
+                tournament_id, team_id)
+            if not ok:
+                await callback.answer(f"⏱ Повторная подача будет доступна через {minutes} мин.", show_alert=True)
+                return
+            else:
+                # Создаём НОВУЮ заявку (не обновляем старую)
+                add_tournament_application(tournament_id, team_id)
+                await callback.answer("✅ Заявка отправлена повторно!", show_alert=True)
+                await callback.message.edit_text("Заявка отправлена. Ожидайте подтверждения администратора.", reply_markup=back_to_main_keyboard())
+                return
+    else:
+        # Нет заявки – проверяем размер
+        current_size = get_team_members_count(team_id)
+        if current_size != tournament['required_team_size']:
+            await callback.answer(f"❌ В вашей команде {current_size} чел., а требуется {tournament['required_team_size']}.", show_alert=True)
+            return
+        # Создаём новую заявку
+        add_tournament_application(tournament_id, team_id)
+        await callback.answer("✅ Заявка отправлена!", show_alert=True)
+        await callback.message.edit_text("Заявка отправлена. Ожидайте подтверждения администратора.", reply_markup=back_to_main_keyboard())
+        # Уведомление админу (можно добавить)
+        await callback.answer()
 
 
 @router.callback_query(F.data.startswith("apply_"))
@@ -133,28 +177,22 @@ async def apply_to_tournament(callback: CallbackQuery):
         await callback.answer("Сначала зарегистрируйся", show_alert=True)
         return
 
+    tournament = get_tournament_by_id(tournament_id)
+    if not tournament:
+        await callback.answer("Турнир не найден", show_alert=True)
+        return
+
+    # Все команды пользователя по данному спорту (даже неподходящие)
     teams = [t for t in get_user_teams(
-        user['id']) if t['sport'] == get_tournament_by_id(tournament_id)['sport']]
+        user['id']) if t['sport'] == tournament['sport']]
     if not teams:
         await callback.answer("У вас нет команды по этому виду спорта", show_alert=True)
         return
 
-    valid_teams = []
-    for team in teams:
-        status = get_team_application(tournament_id, team['id'])
-        if status is None:
-            valid_teams.append(team)
-
-    if not valid_teams:
-        await callback.answer("Вы уже подали заявку или участвуете в турнире", show_alert=True)
-        return
-
-    if len(valid_teams) == 1:
-        team = valid_teams[0]
-        add_tournament_application(tournament_id, team['id'])
-        await callback.message.edit_text("Заявка отправлена! Ожидайте подтверждения администратора.",
-                                         reply_markup=back_to_main_keyboard())
-    else:
-        await callback.message.edit_text("Выберите команду для участия:",
-                                         reply_markup=choose_team_keyboard(valid_teams, tournament_id))
+    # Показываем список всех этих команд (без фильтрации)
+    await callback.message.edit_text(
+        "Выберите команду для участия:",
+        # используем существующую клавиатуру
+        reply_markup=choose_team_keyboard(teams, tournament_id)
+    )
     await callback.answer()

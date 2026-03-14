@@ -1,5 +1,6 @@
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram import Router, F
+from aiogram import Bot
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import CallbackQuery, Message
 from aiogram.fsm.context import FSMContext
@@ -15,21 +16,52 @@ from utils import (
     get_team_requests, get_team_requests_count, has_pending_request,
     accept_request, reject_request,
     search_teams_by_name, search_teams_count, get_team_invite_status,
-    get_teams_by_sport, get_teams_count_by_sport
+    get_teams_by_sport, get_teams_count_by_sport, get_team_members_count, get_team_max_members, update_team_max_members
 )
 from keyboards import (
     teams_list_keyboard, team_management_extended_keyboard, main_menu_keyboard,
     back_to_main_keyboard, confirm_keyboard, invite_keyboard, sports_choice_keyboard,
     teams_main_keyboard, team_view_only_keyboard, team_view_join_keyboard,
-    team_requests_keyboard, teams_sports_filter_keyboard, sports_choice_keyboard_no_done, team_view_search_keyboard
+    team_requests_keyboard, teams_sports_filter_keyboard, sports_choice_keyboard_no_done,
+    team_view_search_keyboard, input_number_keyboard, back_to_teams_menu_keyboard
 )
 
+
+async def send_team_info(bot: Bot, chat_id: int, team_id: int, user_id: int):
+    team = get_team_by_id(team_id)
+    if not team:
+        await bot.send_message(chat_id, "Команда не найдена.")
+        return
+    members = get_team_members(team_id)
+    members_count = len(members)
+    max_members = get_team_max_members(team_id)
+    members_list = "\n".join(
+        [f"- {m['first_name']} (@{m['username']})" for m in members])
+    captain = get_user_by_id(team['captain_id'])
+    captain_name = f"{captain['first_name']} (@{captain['username']})" if captain else "Неизвестно"
+    settings = get_team_settings(team_id)
+    text = f"""
+Команда: {team['name']}
+Вид спорта: {team['sport']}
+Город: {team['city']}
+Капитан: {captain_name}
+Участников: {members_count} / {max_members}
+Набор: {"🔓 Открыт" if settings['is_open'] else "🔒 Закрыт"}
+Состав:
+{members_list}
+    """
+    user = get_user(user_id)
+    is_capt = user and is_captain(user['id'], team_id)
+    kb = team_management_extended_keyboard(
+        team_id, is_capt, settings['is_open'], settings['notify'], max_members)
+    await bot.send_message(chat_id, text, reply_markup=kb)
 router = Router()
 
 
 class CreateTeam(StatesGroup):
     name = State()
     sport = State()
+    max_members = State()
 
 
 class RenameTeam(StatesGroup):
@@ -38,6 +70,10 @@ class RenameTeam(StatesGroup):
 
 class AddPlayer(StatesGroup):
     username = State()
+
+
+class EditMaxMembers(StatesGroup):
+    new_max = State()
 
 
 class SearchTeam(StatesGroup):
@@ -93,29 +129,58 @@ async def create_team_name(message: Message, state: FSMContext):
 async def create_team_sport_choice(callback: CallbackQuery, state: FSMContext):
     sport_name = callback.data.replace("create_team_sport_", "")
     await state.update_data(sport=sport_name)
+    await state.set_state(CreateTeam.max_members)
+    await callback.message.edit_text(
+        "Введите максимальное количество участников команды (от 1 до 10):\n"
+        "Можно ввести число или выбрать на клавиатуре.",
+        reply_markup=input_number_keyboard()
+    )
+    await callback.answer()
+
+
+@router.message(CreateTeam.max_members)
+async def create_team_max_members_text(message: Message, state: FSMContext):
+    try:
+        max_members = int(message.text.strip())
+        if max_members < 1 or max_members > 10:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите целое число от 1 до 10.")
+        return
+    await finish_create_team(message.from_user.id, message, state, max_members)
+
+
+@router.callback_query(CreateTeam.max_members, F.data.startswith("set_max_members_"))
+async def create_team_max_members_callback(callback: CallbackQuery, state: FSMContext):
+    max_members = int(callback.data.split("_")[3])
+    await callback.message.delete()
+    await finish_create_team(callback.from_user.id, callback.message, state, max_members)
+    await callback.answer()
+
+
+async def finish_create_team(user_id, message, state: FSMContext, max_members):
     data = await state.get_data()
     team_name = data['name']
     sport = data['sport']
-    user = get_user(callback.from_user.id)
+    user = get_user(user_id)
     if not user:
-        await callback.answer("Ошибка", show_alert=True)
+        await message.answer("Ошибка")
+        await state.clear()
         return
-
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO teams (name, sport, city, captain_id)
-        VALUES (?, ?, ?, ?)
-    """, (team_name, sport, user['city'], user['id']))
+        INSERT INTO teams (name, sport, city, captain_id, max_members)
+        VALUES (?, ?, ?, ?, ?)
+    """, (team_name, sport, user['city'], user['id'], max_members))
     team_id = cur.lastrowid
     cur.execute(
         "INSERT INTO team_members (team_id, user_id) VALUES (?, ?)", (team_id, user['id']))
     conn.commit()
     conn.close()
-
     await state.clear()
-    await callback.message.edit_text(f"Команда '{team_name}' создана!")
-    await callback.answer()
+    await message.answer(f"Команда '{team_name}' создана! Лимит участников: {max_members}.")
+    await send_team_info(message.bot, message.chat.id, team_id, user_id)
 
 # ВАЖНО: обработчик team_requests_ должен идти до общего team_
 
@@ -130,7 +195,6 @@ async def team_requests_menu(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("team_"))
 async def view_team(callback: CallbackQuery):
-    """Просмотр своей команды (из раздела Мои команды)"""
     team_id = int(callback.data.split("_")[1])
     team = get_team_by_id(team_id)
     if not team:
@@ -138,6 +202,8 @@ async def view_team(callback: CallbackQuery):
         return
 
     members = get_team_members(team_id)
+    members_count = len(members)
+    max_members = get_team_max_members(team_id)
     members_list = "\n".join(
         [f"- {m['first_name']} (@{m['username']})" for m in members])
     captain = get_user_by_id(team['captain_id'])
@@ -149,6 +215,7 @@ async def view_team(callback: CallbackQuery):
 Вид спорта: {team['sport']}
 Город: {team['city']}
 Капитан: {captain_name}
+Участников: {members_count} / {max_members}
 Набор: {"🔓 Открыт" if settings['is_open'] else "🔒 Закрыт"}
 Состав:
 {members_list}
@@ -156,7 +223,7 @@ async def view_team(callback: CallbackQuery):
     user = get_user(callback.from_user.id)
     is_capt = user and is_captain(user['id'], team_id)
     await callback.message.edit_text(text, reply_markup=team_management_extended_keyboard(
-        team_id, is_capt, settings['is_open'], settings['notify']))
+        team_id, is_capt, settings['is_open'], settings['notify'], max_members))
     await callback.answer()
 
 # ---------- Управление командой (rename, delete, add_player, accept_invite, reject_invite) ----------
@@ -197,10 +264,8 @@ async def rename_team_name(message: Message, state: FSMContext):
     conn.commit()
     conn.close()
     await state.clear()
-    user = get_user(message.from_user.id)
-    teams = get_user_teams(user['id'])
-    await message.answer(f"Название команды изменено на '{new_name}'.")
-    await message.answer("Ваши команды:", reply_markup=teams_list_keyboard(teams, show_create=True))
+    await message.answer("Название изменено!")
+    await send_team_info(message.bot, message.chat.id, team_id, message.from_user.id)
 
 
 @router.callback_query(F.data.startswith("delete_team_"))
@@ -301,7 +366,11 @@ async def add_player_username(message: Message, state: FSMContext):
         await message.answer("Приглашение этому игроку уже отправлено.")
         await state.clear()
         return
-
+    current_count = get_team_members_count(team_id)
+    max_members = get_team_max_members(team_id)
+    if current_count >= max_members:
+        await message.answer("❌ В команде уже максимальное количество участников.")
+        return
     create_invite(team_id, user_to_add['id'])
     team = get_team_by_id(team_id)
     try:
@@ -311,6 +380,7 @@ async def add_player_username(message: Message, state: FSMContext):
             reply_markup=invite_keyboard(team_id)
         )
         await message.answer(f"Приглашение отправлено пользователю @{username}.")
+        await send_team_info(message.bot, message.chat.id, team_id, message.from_user.id)
     except Exception as e:
         print(f"Ошибка отправки сообщения: {e}")
         conn = get_connection()
@@ -335,7 +405,11 @@ async def accept_invite_handler(callback: CallbackQuery):
         await callback.message.edit_text("Приглашение уже недействительно.")
         await callback.answer()
         return
-
+    current_count = get_team_members_count(team_id)
+    max_members = get_team_max_members(team_id)
+    if current_count >= max_members:
+        await callback.answer("❌ В команде уже максимальное количество участников.", show_alert=True)
+        return
     accept_invite(team_id, user['id'])
     team = get_team_by_id(team_id)
     await callback.message.edit_text(f"Вы вступили в команду «{team['name']}»!")
@@ -571,7 +645,7 @@ async def show_search_results(message, query, offset, edit=False):
     total = search_teams_count(query)
     if not teams:
         text = f"По запросу «{query}» ничего не найдено."
-        kb = back_to_main_keyboard()
+        kb = back_to_teams_menu_keyboard()
     else:
         text = f"Результаты поиска по запросу «{query}»:"
         builder = InlineKeyboardBuilder()
@@ -716,9 +790,13 @@ async def apply_to_team(callback: CallbackQuery):
         else:
             print(f"Капитан с id {team['captain_id']} не найден")
 
-    await callback.answer("Заявка отправлена! Ожидайте решения капитана.", show_alert=True)
-    await callback.message.edit_text("Заявка отправлена. Вы можете вернуться в меню команд.",
-                                     reply_markup=back_to_main_keyboard())
+        await callback.answer("Заявка отправлена! Ожидайте решения капитана.", show_alert=True)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 В меню команд",
+                                  callback_data="teams_menu")]
+        ])
+        await callback.message.edit_text("Заявка отправлена. Вы можете вернуться в меню команд.",
+                                         reply_markup=kb)
 
 # --- Обработчики заявок для капитана ---
 
@@ -779,6 +857,11 @@ async def accept_request_handler(callback: CallbackQuery):
             await callback.answer("Заявка не найдена", show_alert=True)
             return
         request_id = row['id']
+        current_count = get_team_members_count(team_id)
+        max_members = get_team_max_members(team_id)
+        if current_count >= max_members:
+            await callback.answer("❌ В команде уже максимальное количество участников.", show_alert=True)
+            return
         accept_request(request_id)
 
     team = get_team_by_id(team_id)
@@ -857,3 +940,52 @@ async def toggle_team_notify(callback: CallbackQuery):
     is_capt = user and is_captain(user['id'], team_id)
     await callback.message.edit_reply_markup(reply_markup=team_management_extended_keyboard(
         team_id, is_capt, settings['is_open'], new_status))
+
+
+@router.callback_query(F.data.startswith("edit_max_members_"))
+async def edit_max_members_start(callback: CallbackQuery, state: FSMContext):
+    team_id = int(callback.data.split("_")[3])
+    user = get_user(callback.from_user.id)
+    if not user or not is_captain(user['id'], team_id):
+        await callback.answer("Вы не капитан", show_alert=True)
+        return
+    await state.update_data(team_id=team_id)
+    await state.set_state(EditMaxMembers.new_max)
+    await callback.message.edit_text(
+        "Введите новый лимит участников (от 1 до 10):",
+        reply_markup=input_number_keyboard()
+    )
+    await callback.answer()
+
+
+@router.message(EditMaxMembers.new_max)
+async def edit_max_members_text(message: Message, state: FSMContext):
+    try:
+        new_max = int(message.text.strip())
+        if new_max < 1 or new_max > 10:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите целое число от 1 до 10.")
+        return
+    await finish_edit_max_members(message.from_user.id, message, state, new_max)
+
+
+@router.callback_query(EditMaxMembers.new_max, F.data.startswith("set_max_members_"))
+async def edit_max_members_callback(callback: CallbackQuery, state: FSMContext):
+    new_max = int(callback.data.split("_")[3])
+    await callback.message.delete()
+    await finish_edit_max_members(callback.from_user.id, callback.message, state, new_max)
+    await callback.answer()
+
+
+async def finish_edit_max_members(user_id, message, state: FSMContext, new_max):
+    data = await state.get_data()
+    team_id = data['team_id']
+    current_count = get_team_members_count(team_id)
+    if new_max < current_count:
+        await message.answer(f"❌ Нельзя установить лимит меньше текущего количества участников ({current_count}).")
+        return
+    update_team_max_members(team_id, new_max)
+    await state.clear()
+    await message.answer("Лимит изменен!")
+    await send_team_info(message.bot, message.chat.id, team_id, user_id)
