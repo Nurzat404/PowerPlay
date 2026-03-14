@@ -1,13 +1,27 @@
 import sqlite3
 import time
 from pathlib import Path
+import shutil  # добавили библиотеку для копирования файлов
 
 # Определяем папку для базы данных
 DATA_DIR = Path('/app/data')
 if not DATA_DIR.exists():
     DATA_DIR = Path('.')
+
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = DATA_DIR / 'powerplay1.db'
+DB_PATH = DATA_DIR / 'powerplay.db'
+
+# Путь к seed-файлу (наш запасной файл в папке db_seed)
+SEED_PATH = Path('db_seed') / 'powerplay_seed.db'
+
+# ВАЖНО: если мы на сервере (папка /app/data существует)
+# и основной базы ещё нет, то копируем seed-файл
+if DATA_DIR == Path('/app/data') and not DB_PATH.exists():
+    if SEED_PATH.exists():
+        shutil.copy(SEED_PATH, DB_PATH)
+        print(f"✅ База скопирована из {SEED_PATH} в {DB_PATH}")
+    else:
+        print(f"❌ Seed-файл {SEED_PATH} не найден, будет создана новая база.")
 
 
 def get_connection():
