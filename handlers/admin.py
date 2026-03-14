@@ -19,7 +19,7 @@ from keyboards import (
     admin_menu_keyboard, back_to_main_keyboard,
     admin_rating_menu_keyboard, admin_rating_sport_actions_keyboard,
     admin_rating_teams_list_keyboard, admin_rating_team_actions_keyboard,
-    admin_teams_list_keyboard
+    admin_teams_list_keyboard, sports_choice_keyboard_single
 )
 from datetime import datetime
 
@@ -46,13 +46,16 @@ async def send_tournament_info(bot: Bot, chat_id: int, tournament_id: int, user_
         'finished': 'Завершён'
     }
     status_display = status_map.get(tournament['status'], tournament['status'])
+    age_restriction = ""
+    if tournament['min_age'] is not None and tournament['max_age'] is not None:
+        age_restriction = f"\nВозраст: {tournament['min_age']}–{tournament['max_age']} лет"
     text = f"""
 🏆 {tournament['name']}
 Вид спорта: {tournament['sport']}
 Требуемый размер команды: {tournament['required_team_size']} чел.
 Город: {tournament['city']}
 Даты: {tournament['start_date']} - {tournament['end_date']}
-Макс. команд: {tournament['max_teams']}
+Макс. команд: {tournament['max_teams']}{age_restriction}
 Статус: {status_display}
 """
     if tournament['description']:
@@ -85,6 +88,8 @@ class CreateTournament(StatesGroup):
     end_date = State()
     max_teams = State()
     required_team_size = State()
+    min_age = State()        # новое
+    max_age = State()
     description = State()
 
 
@@ -102,14 +107,17 @@ async def admin_create_tournament_start(callback: CallbackQuery, state: FSMConte
 async def create_tournament_name(message: Message, state: FSMContext):
     await state.update_data(name=message.text)
     await state.set_state(CreateTournament.sport)
-    await message.answer("Введите вид спорта (например, CS2):")
+    sports = get_all_sports()
+    await message.answer("Выберите вид спорта:", reply_markup=sports_choice_keyboard_single(sports))
 
 
-@router.message(CreateTournament.sport)
-async def create_tournament_sport(message: Message, state: FSMContext):
-    await state.update_data(sport=message.text)
+@router.callback_query(CreateTournament.sport, F.data.startswith("admin_tourn_sport_"))
+async def create_tournament_sport_chosen(callback: CallbackQuery, state: FSMContext):
+    sport_name = callback.data.replace("admin_tourn_sport_", "")
+    await state.update_data(sport=sport_name)
     await state.set_state(CreateTournament.city)
-    await message.answer("Введите город проведения:")
+    await callback.message.edit_text("Введите город проведения:")
+    await callback.answer()
 
 
 @router.message(CreateTournament.city)
@@ -169,6 +177,39 @@ async def create_tournament_required_size(message: Message, state: FSMContext):
         await message.answer("❌ Введите целое число от 1 до 10.")
         return
     await state.update_data(required_team_size=size)
+    await state.set_state(CreateTournament.min_age)
+    await message.answer("Введите минимальный возраст участников (или 0, если нет ограничений):")
+
+
+@router.message(CreateTournament.min_age)
+async def create_tournament_min_age(message: Message, state: FSMContext):
+    try:
+        min_age = int(message.text)
+        if min_age < 0 or min_age > 100:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите целое число от 0 до 100.")
+        return
+    await state.update_data(min_age=min_age)
+    await state.set_state(CreateTournament.max_age)
+    await message.answer("Введите максимальный возраст участников (или 100, если нет ограничений):")
+
+
+@router.message(CreateTournament.max_age)
+async def create_tournament_max_age(message: Message, state: FSMContext):
+    try:
+        max_age = int(message.text)
+        if max_age < 0 or max_age > 100:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Введите целое число от 0 до 100.")
+        return
+    data = await state.get_data()
+    min_age = data.get('min_age')
+    if min_age is not None and min_age > max_age:
+        await message.answer("❌ Минимальный возраст не может быть больше максимального.")
+        return
+    await state.update_data(max_age=max_age)
     await state.set_state(CreateTournament.description)
     await message.answer("Введите описание турнира (можно отправить 'нет', чтобы пропустить):")
 
@@ -180,9 +221,9 @@ async def create_tournament_description(message: Message, state: FSMContext):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO tournaments (name, sport, city, start_date, end_date, max_teams, required_team_size, description, created_by, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'registration')
-    """, (data['name'], data['sport'], data['city'], data['start_date'], data['end_date'], data['max_teams'], data['required_team_size'], description, message.from_user.id))
+    INSERT INTO tournaments (name, sport, city, start_date, end_date, max_teams, required_team_size, min_age, max_age, description, created_by, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'registration')
+    """, (data['name'], data['sport'], data['city'], data['start_date'], data['end_date'], data['max_teams'], data['required_team_size'], data['min_age'], data['max_age'], description, message.from_user.id))
     conn.commit()
     conn.close()
     await state.clear()
@@ -194,6 +235,7 @@ async def create_tournament_description(message: Message, state: FSMContext):
 class EditTournament(StatesGroup):
     field = State()
     value = State()
+    sport_choice = State()
 
 
 @router.callback_query(F.data.startswith("admin_edit_tournament_"))
@@ -205,7 +247,7 @@ async def edit_tournament_start(callback: CallbackQuery, state: FSMContext):
     await state.update_data(tournament_id=tournament_id)
     builder = InlineKeyboardBuilder()
     fields = ["name", "sport", "city", "start_date", "end_date",
-              "max_teams", "required_team_size", "description"]
+              "max_teams", "required_team_size", "min_age", "max_age", "description"]
     for f in fields:
         builder.button(text=f, callback_data=f"edit_field_{f}")
     builder.button(text="🔙 Назад", callback_data=f"tournament_{tournament_id}")
@@ -218,8 +260,13 @@ async def edit_tournament_start(callback: CallbackQuery, state: FSMContext):
 async def edit_tournament_field(callback: CallbackQuery, state: FSMContext):
     field = callback.data.replace("edit_field_", "")
     await state.update_data(field=field)
-    await state.set_state(EditTournament.value)
-    await callback.message.edit_text(f"Введите новое значение для поля '{field}':")
+    if field == "sport":
+        sports = get_all_sports()
+        await state.set_state(EditTournament.sport_choice)
+        await callback.message.edit_text("Выберите новый вид спорта:", reply_markup=sports_choice_keyboard_single(sports))
+    else:
+        await state.set_state(EditTournament.value)
+        await callback.message.edit_text(f"Введите новое значение для поля '{field}':")
     await callback.answer()
 
 
@@ -229,15 +276,43 @@ async def edit_tournament_value(message: Message, state: FSMContext):
     tournament_id = data['tournament_id']
     field = data['field']
     new_value = message.text
-    if field == "max_teams" or field == "required_team_size":
+    if field == "max_teams" or field == "required_team_size" or field == "min_age" or field == "max_age":
         try:
             new_value = int(new_value)
             if field == "required_team_size" and (new_value < 1 or new_value > 10):
                 await message.answer("❌ Требуемый размер команды должен быть от 1 до 10.")
                 return
+            elif (field == "min_age" or field == "max_age") and (new_value < 0 or new_value > 100):
+                await message.answer("❌ Введите целое число от 0 до 100.")
+                return
         except ValueError:
             await message.answer("Введите число!")
             return
+
+        # Проверки на согласованность возраста
+        if field == "min_age":
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT max_age FROM tournaments WHERE id=?", (tournament_id,))
+            row = cur.fetchone()
+            current_max_age = row['max_age'] if row else None
+            conn.close()
+            if current_max_age is not None and new_value > current_max_age:
+                await message.answer("❌ Минимальный возраст не может быть больше максимального.")
+                return
+        elif field == "max_age":
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT min_age FROM tournaments WHERE id=?", (tournament_id,))
+            row = cur.fetchone()
+            current_min_age = row['min_age'] if row else None
+            conn.close()
+            if current_min_age is not None and current_min_age > new_value:
+                await message.answer("❌ Минимальный возраст не может быть больше максимального.")
+                return
+
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -247,6 +322,22 @@ async def edit_tournament_value(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Турнир обновлён!")
     await send_tournament_info(message.bot, message.chat.id, tournament_id, message.from_user.id)
+
+
+@router.callback_query(EditTournament.sport_choice, F.data.startswith("admin_tourn_sport_"))
+async def edit_tournament_sport_chosen(callback: CallbackQuery, state: FSMContext):
+    new_sport = callback.data.replace("admin_tourn_sport_", "")
+    data = await state.get_data()
+    tournament_id = data['tournament_id']
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE tournaments SET sport=? WHERE id=?",
+                (new_sport, tournament_id))
+    conn.commit()
+    conn.close()
+    await state.clear()
+    await send_tournament_info(callback.bot, callback.message.chat.id, tournament_id, callback.from_user.id)
+    await callback.answer()
 
 # ---------- Заявки на турниры ----------
 

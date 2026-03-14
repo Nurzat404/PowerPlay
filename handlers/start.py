@@ -16,6 +16,7 @@ class Registration(StatesGroup):
     name = State()
     email = State()
     city = State()
+    age = State()
     sports = State()
 
 
@@ -58,8 +59,22 @@ async def reg_email(message: Message, state: FSMContext):
 @router.message(Registration.city)
 async def reg_city(message: Message, state: FSMContext):
     await state.update_data(city=message.text)
+    await state.set_state(Registration.age)
+    await message.answer("Сколько вам лет? (введите число от 0 до 100)")
+
+
+@router.message(Registration.age)
+async def reg_age(message: Message, state: FSMContext):
+    try:
+        age = int(message.text.strip())
+        if age < 0 or age > 100:
+            raise ValueError
+    except ValueError:
+        await message.answer("❌ Некорректный возраст. Введите число от 0 до 100.")
+        return
+    await state.update_data(age=age)
     await state.set_state(Registration.sports)
-    sports = get_all_sports()   # получаем список спортов
+    sports = get_all_sports()
     await message.answer(
         "Каким видом спорта занимаешься? (можно выбрать несколько)",
         reply_markup=sports_choice_keyboard(sports)
@@ -93,6 +108,7 @@ async def reg_sports_done(callback: CallbackQuery, state: FSMContext):
         first_name=data.get('name'),
         email=data['email'],
         city=data['city'],
+        age=data['age'],
         favorite_sports=json.dumps(selected, ensure_ascii=False)
     )
 

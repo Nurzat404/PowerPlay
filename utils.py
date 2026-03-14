@@ -868,3 +868,21 @@ def can_retry_request(team_id, user_id):
             minutes_left = 60 - int(delta.total_seconds() // 60)
             return False, minutes_left
     return True, None  # если нет времени (старые записи), разрешаем
+
+
+def get_user_age(user_id):
+    """Возвращает возраст пользователя по его id или None"""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT age FROM users WHERE id=?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row['age'] if row else None
+
+
+def update_user_age(user_id, new_age):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET age=? WHERE id=?", (new_age, user_id))
+    conn.commit()
+    conn.close()

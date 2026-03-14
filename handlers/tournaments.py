@@ -5,7 +5,7 @@ from database import get_connection
 from utils import (
     get_user, get_user_teams, get_tournaments_by_sport, get_tournament_by_id,
     add_tournament_application, get_all_sports, get_team_application,
-    get_approved_teams_count, get_tournament_teams, is_admin, get_team_members_count, can_retry_tournament_application, get_team_by_id
+    get_approved_teams_count, get_tournament_teams, is_admin, get_team_members_count, can_retry_tournament_application, get_team_by_id, get_team_members
 )
 from keyboards import (
     tournaments_main_keyboard, tournaments_list_keyboard,
@@ -27,7 +27,11 @@ async def list_sport_tournaments(callback: CallbackQuery):
     sport = callback.data.replace("tournament_sport_", "")
     tournaments = get_tournaments_by_sport(sport)
     if not tournaments:
-        await callback.message.edit_text(f"Турниров по {sport} пока нет.", reply_markup=back_to_main_keyboard())
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 К выбору спорта",
+                                  callback_data="tournaments")]
+        ])
+        await callback.message.edit_text(f"Турниров по {sport} пока нет.", reply_markup=kb)
     else:
         await callback.message.edit_text(f"Турниры по {sport}:", reply_markup=tournaments_list_keyboard(tournaments, sport))
     await callback.answer()
@@ -78,7 +82,9 @@ async def view_tournament(callback: CallbackQuery):
         'finished': 'Завершён'
     }
     status_display = status_map.get(tournament['status'], tournament['status'])
-
+    age_restriction = ""
+    if tournament['min_age'] is not None and tournament['max_age'] is not None:
+        age_restriction = f"\nВозраст: {tournament['min_age']}–{tournament['max_age']} лет"
     text = f"""
 🏆 {tournament['name']}
 Вид спорта: {tournament['sport']}
@@ -86,6 +92,7 @@ async def view_tournament(callback: CallbackQuery):
 Город: {tournament['city']}
 Даты: {tournament['start_date']} - {tournament['end_date']}
 Макс. команд: {tournament['max_teams']}
+{age_restriction}
 Статус: {status_display}
 """
     if tournament['description']:
@@ -153,7 +160,13 @@ async def apply_with_team(callback: CallbackQuery):
                 # Создаём НОВУЮ заявку (не обновляем старую)
                 add_tournament_application(tournament_id, team_id)
                 await callback.answer("✅ Заявка отправлена повторно!", show_alert=True)
-                await callback.message.edit_text("Заявка отправлена. Ожидайте подтверждения администратора.", reply_markup=back_to_main_keyboard())
+                await callback.message.edit_text(
+                    "Заявка отправлена! Ожидайте подтверждения администратора.",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(
+                            text="🔙 К турниру", callback_data=f"tournament_{tournament_id}")]
+                    ])
+                )
                 return
     else:
         # Нет заявки – проверяем размер
@@ -161,10 +174,32 @@ async def apply_with_team(callback: CallbackQuery):
         if current_size != tournament['required_team_size']:
             await callback.answer(f"❌ В вашей команде {current_size} чел., а требуется {tournament['required_team_size']}.", show_alert=True)
             return
+        members = get_team_members(team_id)
+        problems = []
+        for member in members:
+            age = member['age']
+            if age is None:
+                problems.append(
+                    f"❌ {member['first_name']} (@{member['username']}) не указал возраст.")
+            elif tournament['min_age'] is not None and tournament['max_age'] is not None:
+                if age < tournament['min_age'] or age > tournament['max_age']:
+                    problems.append(
+                        f"❌ {member['first_name']} (@{member['username']}) имеет возраст {age}, требуется {tournament['min_age']}-{tournament['max_age']}.")
+
+        if problems:
+            # Объединяем все проблемы в одно сообщение
+            await callback.answer("\n".join(problems), show_alert=True)
+            return
         # Создаём новую заявку
         add_tournament_application(tournament_id, team_id)
         await callback.answer("✅ Заявка отправлена!", show_alert=True)
-        await callback.message.edit_text("Заявка отправлена. Ожидайте подтверждения администратора.", reply_markup=back_to_main_keyboard())
+        await callback.message.edit_text(
+            "Заявка отправлена! Ожидайте подтверждения администратора.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(
+                    text="🔙 К турниру", callback_data=f"tournament_{tournament_id}")]
+            ])
+        )
         # Уведомление админу (можно добавить)
         await callback.answer()
 

@@ -204,8 +204,12 @@ async def view_team(callback: CallbackQuery):
     members = get_team_members(team_id)
     members_count = len(members)
     max_members = get_team_max_members(team_id)
-    members_list = "\n".join(
-        [f"- {m['first_name']} (@{m['username']})" for m in members])
+    members_list_lines = []
+    for m in members:
+        age_str = f"[{m['age']} лет]" if m['age'] else "[возраст не указан]"
+        members_list_lines.append(
+            f"- {m['first_name']} (@{m['username']}) {age_str}")
+    members_list = "\n".join(members_list_lines)
     captain = get_user_by_id(team['captain_id'])
     captain_name = f"{captain['first_name']} (@{captain['username']})" if captain else "Неизвестно"
     settings = get_team_settings(team_id)
@@ -477,7 +481,10 @@ async def show_all_teams_page(message, sport, offset, edit=False):
     total = get_teams_count_by_sport(sport, only_open=False)
     if not teams:
         text = f"Команд по виду спорта {sport} пока нет."
-        kb = back_to_main_keyboard()
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 К выбору спорта",
+                                  callback_data="teams_list_all")]
+        ])
     else:
         text = f"Команды по {sport}:"
         builder = InlineKeyboardBuilder()
@@ -524,7 +531,10 @@ async def show_open_teams_page(message, sport, offset, edit=False):
     total = get_teams_count_by_sport(sport, only_open=True)
     if not teams:
         text = f"Открытых команд по виду спорта {sport} пока нет."
-        kb = back_to_main_keyboard()
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 К выбору спорта",
+                                  callback_data="teams_list_open")]
+        ])
     else:
         text = f"Открытые команды по {sport}:"
         builder = InlineKeyboardBuilder()
@@ -566,11 +576,18 @@ async def view_all_team(callback: CallbackQuery):
     if not team:
         await callback.answer("Команда не найдена", show_alert=True)
         return
+
     captain = get_user_by_id(team['captain_id'])
     captain_name = f"{captain['first_name']} (@{captain['username']})" if captain else "Неизвестно"
     members = get_team_members(team_id)
-    members_list = "\n".join(
-        [f"- {m['first_name']} (@{m['username']})" for m in members])
+    members_count = len(members)
+    max_members = get_team_max_members(team_id)
+    members_list_lines = []
+    for m in members:
+        age_str = f"[{m['age']} лет]" if m['age'] else "[возраст не указан]"
+        members_list_lines.append(
+            f"- {m['first_name']} (@{m['username']}) {age_str}")
+    members_list = "\n".join(members_list_lines)
     settings = get_team_settings(team_id)
     sport = team['sport']
     text = f"""
@@ -578,6 +595,7 @@ async def view_all_team(callback: CallbackQuery):
 Вид спорта: {team['sport']}
 Город: {team['city']}
 Капитан: {captain_name}
+Участников: {members_count} / {max_members}
 Набор: {"🔓 Открыт" if settings['is_open'] else "🔒 Закрыт"}
 Состав:
 {members_list}
@@ -599,22 +617,31 @@ async def view_open_team(callback: CallbackQuery):
         await callback.answer("Сначала зарегистрируйтесь", show_alert=True)
         return
 
-    is_member = is_team_member(user['id'], team_id)
-    has_request = has_pending_request(user['id'], team_id)
-    settings = get_team_settings(team_id)
-    can_apply = not is_member and not has_request and settings['is_open']
+    members = get_team_members(team_id)
+    members_count = len(members)
+    max_members = get_team_max_members(team_id)
+    members_list_lines = []
+    for m in members:
+        age_str = f"[{m['age']} лет]" if m['age'] else "[возраст не указан]"
+        members_list_lines.append(
+            f"- {m['first_name']} (@{m['username']}) {age_str}")
+    members_list = "\n".join(members_list_lines)
 
     captain = get_user_by_id(team['captain_id'])
     captain_name = f"{captain['first_name']} (@{captain['username']})" if captain else "Неизвестно"
-    members = get_team_members(team_id)
-    members_list = "\n".join(
-        [f"- {m['first_name']} (@{m['username']})" for m in members])
+    settings = get_team_settings(team_id)
+
+    # Проверяем, может ли пользователь подать заявку
+    is_member = is_team_member(user['id'], team_id)
+    has_request = has_pending_request(user['id'], team_id)
+    can_apply = not is_member and not has_request and settings['is_open']
 
     text = f"""
 Команда: {team['name']}
 Вид спорта: {team['sport']}
 Город: {team['city']}
 Капитан: {captain_name}
+Участников: {members_count} / {max_members}
 Набор: {"🔓 Открыт" if settings['is_open'] else "🔒 Закрыт"}
 Состав:
 {members_list}
@@ -695,22 +722,30 @@ async def view_search_team(callback: CallbackQuery):
         await callback.answer("Сначала зарегистрируйтесь", show_alert=True)
         return
 
-    is_member = is_team_member(user['id'], team_id)
-    has_request = has_pending_request(user['id'], team_id)
-    settings = get_team_settings(team_id)
-    can_apply = not is_member and not has_request and settings['is_open']
+    members = get_team_members(team_id)
+    members_count = len(members)
+    max_members = get_team_max_members(team_id)
+    members_list_lines = []
+    for m in members:
+        age_str = f"[{m['age']} лет]" if m['age'] else "[возраст не указан]"
+        members_list_lines.append(
+            f"- {m['first_name']} (@{m['username']}) {age_str}")
+    members_list = "\n".join(members_list_lines)
 
     captain = get_user_by_id(team['captain_id'])
     captain_name = f"{captain['first_name']} (@{captain['username']})" if captain else "Неизвестно"
-    members = get_team_members(team_id)
-    members_list = "\n".join(
-        [f"- {m['first_name']} (@{m['username']})" for m in members])
+    settings = get_team_settings(team_id)
+
+    is_member = is_team_member(user['id'], team_id)
+    has_request = has_pending_request(user['id'], team_id)
+    can_apply = not is_member and not has_request and settings['is_open']
 
     text = f"""
 Команда: {team['name']}
 Вид спорта: {team['sport']}
 Город: {team['city']}
 Капитан: {captain_name}
+Участников: {members_count} / {max_members}
 Набор: {"🔓 Открыт" if settings['is_open'] else "🔒 Закрыт"}
 Состав:
 {members_list}
@@ -729,9 +764,15 @@ async def apply_to_team(callback: CallbackQuery):
         await callback.answer("Сначала зарегистрируйтесь", show_alert=True)
         return
 
-    # Проверки
     if is_team_member(user['id'], team_id):
         await callback.answer("Вы уже в этой команде", show_alert=True)
+        return
+
+    # Проверка лимита – добавляем перед проверкой статуса
+    current_count = get_team_members_count(team_id)
+    max_members = get_team_max_members(team_id)
+    if current_count >= max_members:
+        await callback.answer("❌ В команде уже максимальное количество участников.", show_alert=True)
         return
 
     existing_status = get_team_invite_status(team_id, user['id'])
@@ -769,11 +810,13 @@ async def apply_to_team(callback: CallbackQuery):
         fav_sports = json.loads(
             user['favorite_sports']) if user['favorite_sports'] else []
         sports_str = ", ".join(fav_sports) if fav_sports else "не указаны"
+        age_str = f"{user['age']} лет" if user['age'] else "не указан"
         text = (
             f"📩 Новая заявка на вступление в команду «{team['name']}»!\n\n"
             f"👤 {user['first_name']} {user['last_name']} (@{user['username']})\n"
             f"📧 Email: {user['email']}\n"
             f"🏙 Город: {user['city']}\n"
+            f"🎂 Возраст: {age_str}\n"
             f"🎯 Любимые виды спорта: {sports_str}"
         )
         kb = InlineKeyboardMarkup(inline_keyboard=[

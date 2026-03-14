@@ -232,7 +232,23 @@ def init_db():
                         "ALTER TABLE tournament_applications ADD COLUMN updated_at TIMESTAMP")
                     print(
                         "Поле updated_at добавлено в таблицу tournament_applications (без DEFAULT)")
-
+                cur.execute("PRAGMA table_info(users)")
+                columns = [col[1] for col in cur.fetchall()]
+                if 'age' not in columns:
+                    cur.execute("ALTER TABLE users ADD COLUMN age INTEGER")
+                    print("Поле age добавлено в таблицу users")
+                cur.execute("PRAGMA table_info(tournaments)")
+                columns = [col[1] for col in cur.fetchall()]
+                if 'min_age' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournaments ADD COLUMN min_age INTEGER DEFAULT 0")
+                    print(
+                        "Поле min_age добавлено в таблицу tournaments (по умолчанию 0)")
+                if 'max_age' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournaments ADD COLUMN max_age INTEGER DEFAULT 100")
+                    print(
+                        "Поле max_age добавлено в таблицу tournaments (по умолчанию 100)")
             conn.close()
             print("База данных успешно инициализирована.")
             return

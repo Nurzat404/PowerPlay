@@ -1,5 +1,6 @@
 from aiogram import Router, F
 from aiogram.types import CallbackQuery
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from database import get_connection
 from utils import get_all_sports
 from keyboards import ratings_sport_keyboard, back_to_main_keyboard
@@ -41,5 +42,9 @@ async def show_sport_rating(callback: CallbackQuery):
         for i, row in enumerate(rows, 1):
             text += f"{i}. {row['name']} — {row['points']} очков\n"
 
-    await callback.message.edit_text(text, reply_markup=back_to_main_keyboard())
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 К выбору спорта",
+                              callback_data="ratings")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
     await callback.answer()

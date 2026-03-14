@@ -9,6 +9,7 @@ def main_menu_keyboard():
         [InlineKeyboardButton(text="🏆 Турниры", callback_data="tournaments")],
         [InlineKeyboardButton(text="📊 Рейтинги", callback_data="ratings")],
         [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
+        [InlineKeyboardButton(text="📜 Правила проекта", callback_data="rules")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
@@ -314,6 +315,7 @@ def edit_profile_menu_keyboard():
         [InlineKeyboardButton(text="✏️ Имя", callback_data="edit_name")],
         [InlineKeyboardButton(text="✏️ Email", callback_data="edit_email")],
         [InlineKeyboardButton(text="✏️ Город", callback_data="edit_city")],
+        [InlineKeyboardButton(text="✏️ Возраст", callback_data="edit_age")],
         [InlineKeyboardButton(text="✏️ Любимые виды спорта",
                               callback_data="edit_sports")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="profile")]
@@ -339,3 +341,12 @@ def back_to_teams_menu_keyboard():
     kb = [[InlineKeyboardButton(
         text="🔙 В меню команд", callback_data="teams_menu")]]
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def sports_choice_keyboard_single(sports_list):
+    builder = InlineKeyboardBuilder()
+    for name, display in sports_list:
+        builder.button(text=display, callback_data=f"admin_tourn_sport_{name}")
+    builder.button(text="❌ Отмена", callback_data="admin_menu")
+    builder.adjust(2)
+    return builder.as_markup()
