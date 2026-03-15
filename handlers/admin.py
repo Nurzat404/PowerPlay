@@ -752,7 +752,7 @@ async def admin_user_page(callback: CallbackQuery):
         await callback.answer("Нет прав", show_alert=True)
         return
     offset = int(callback.data.split("_")[3])
-    users = get_all_users(offset, 2)
+    users = get_all_users(offset, 10)
     total = get_all_users_count()
     await show_user_list(callback.message, users, offset, total)
     await callback.answer()
