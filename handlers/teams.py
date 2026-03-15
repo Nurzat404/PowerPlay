@@ -23,23 +23,30 @@ from keyboards import (
     back_to_main_keyboard, confirm_keyboard, invite_keyboard, sports_choice_keyboard,
     teams_main_keyboard, team_view_only_keyboard, team_view_join_keyboard,
     team_requests_keyboard, teams_sports_filter_keyboard, sports_choice_keyboard_no_done,
-    team_view_search_keyboard, input_number_keyboard, back_to_teams_menu_keyboard
+    team_view_search_keyboard, input_number_keyboard, back_to_teams_menu_keyboard, choose_new_captain_keyboard
 )
 
 
-async def send_team_info(bot: Bot, chat_id: int, team_id: int, user_id: int):
+async def get_team_card_data(team_id: int, user_id: int):
+    """Возвращает текст и клавиатуру для карточки команды."""
     team = get_team_by_id(team_id)
     if not team:
-        await bot.send_message(chat_id, "Команда не найдена.")
-        return
+        return None, None
+
     members = get_team_members(team_id)
     members_count = len(members)
     max_members = get_team_max_members(team_id)
-    members_list = "\n".join(
-        [f"- {m['first_name']} (@{m['username']})" for m in members])
+    members_list_lines = []
+    for m in members:
+        age_str = f"[{m['age']} лет]" if m['age'] else "[возраст не указан]"
+        members_list_lines.append(
+            f"- {m['first_name']} (@{m['username']}) {age_str}")
+    members_list = "\n".join(members_list_lines)
+
     captain = get_user_by_id(team['captain_id'])
     captain_name = f"{captain['first_name']} (@{captain['username']})" if captain else "Неизвестно"
     settings = get_team_settings(team_id)
+
     text = f"""
 Команда: {team['name']}
 Вид спорта: {team['sport']}
@@ -50,11 +57,22 @@ async def send_team_info(bot: Bot, chat_id: int, team_id: int, user_id: int):
 Состав:
 {members_list}
     """
+
     user = get_user(user_id)
     is_capt = user and is_captain(user['id'], team_id)
     kb = team_management_extended_keyboard(
         team_id, is_capt, settings['is_open'], settings['notify'], max_members)
-    await bot.send_message(chat_id, text, reply_markup=kb)
+    return text, kb
+
+
+class ConfirmLeave(StatesGroup):
+    confirm = State()
+
+
+class LeaveTeam(StatesGroup):
+    choose_captain = State()
+
+
 router = Router()
 
 
@@ -180,7 +198,8 @@ async def finish_create_team(user_id, message, state: FSMContext, max_members):
     conn.close()
     await state.clear()
     await message.answer(f"Команда '{team_name}' создана! Лимит участников: {max_members}.")
-    await send_team_info(message.bot, message.chat.id, team_id, user_id)
+    text, kb = await get_team_card_data(team_id, user_id)
+    await message.answer(text, reply_markup=kb)
 
 # ВАЖНО: обработчик team_requests_ должен идти до общего team_
 
@@ -194,43 +213,220 @@ async def team_requests_menu(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("team_"))
-async def view_team(callback: CallbackQuery):
+async def view_team(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     team_id = int(callback.data.split("_")[1])
-    team = get_team_by_id(team_id)
-    if not team:
-        await callback.answer("Команда не найдена")
+    text, kb = await get_team_card_data(team_id, callback.from_user.id)
+    if text is None:
+        await callback.answer("Команда не найдена", show_alert=True)
         return
-
-    members = get_team_members(team_id)
-    members_count = len(members)
-    max_members = get_team_max_members(team_id)
-    members_list_lines = []
-    for m in members:
-        age_str = f"[{m['age']} лет]" if m['age'] else "[возраст не указан]"
-        members_list_lines.append(
-            f"- {m['first_name']} (@{m['username']}) {age_str}")
-    members_list = "\n".join(members_list_lines)
-    captain = get_user_by_id(team['captain_id'])
-    captain_name = f"{captain['first_name']} (@{captain['username']})" if captain else "Неизвестно"
-    settings = get_team_settings(team_id)
-
-    text = f"""
-Команда: {team['name']}
-Вид спорта: {team['sport']}
-Город: {team['city']}
-Капитан: {captain_name}
-Участников: {members_count} / {max_members}
-Набор: {"🔓 Открыт" if settings['is_open'] else "🔒 Закрыт"}
-Состав:
-{members_list}
-    """
-    user = get_user(callback.from_user.id)
-    is_capt = user and is_captain(user['id'], team_id)
-    await callback.message.edit_text(text, reply_markup=team_management_extended_keyboard(
-        team_id, is_capt, settings['is_open'], settings['notify'], max_members))
+    await callback.message.edit_text(text, reply_markup=kb)
     await callback.answer()
 
 # ---------- Управление командой (rename, delete, add_player, accept_invite, reject_invite) ----------
+
+
+@router.callback_query(F.data.startswith("leave_team_"))
+async def leave_team_start(callback: CallbackQuery, state: FSMContext):
+    team_id = int(callback.data.split("_")[2])
+    user = get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("Сначала зарегистрируйтесь", show_alert=True)
+        return
+
+    if not is_team_member(user['id'], team_id):
+        await callback.answer("Вы не состоите в этой команде", show_alert=True)
+        return
+
+    team = get_team_by_id(team_id)
+    if not team:
+        await callback.answer("Команда не найдена", show_alert=True)
+        return
+
+    await state.update_data(team_id=team_id)
+
+    if is_captain(user['id'], team_id):
+        members = get_team_members(team_id)
+        other_members = [m for m in members if m['id'] != user['id']]
+        if not other_members:
+            # Капитан один
+            text = "Вы покинете команду и она будет удалена. Вы согласны?"
+            await state.set_state(ConfirmLeave.confirm)
+            await state.update_data(scenario="captain_alone")
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Да", callback_data="confirm_leave_yes"),
+                 InlineKeyboardButton(text="❌ Нет", callback_data="confirm_leave_no")]
+            ])
+            await callback.message.edit_text(text, reply_markup=kb)
+            await callback.answer()
+            return
+        else:
+            # Капитан с другими → выбор нового капитана
+            await state.set_state(LeaveTeam.choose_captain)
+            await state.update_data(scenario="captain_with_others")
+            await callback.message.edit_text(
+                "Вы капитан. Чтобы выйти из команды, передайте капитанство другому участнику:",
+                reply_markup=choose_new_captain_keyboard(
+                    team_id, other_members)
+            )
+            await callback.answer()
+            return
+    else:
+        # Обычный игрок
+        text = "Вы точно хотите покинуть команду?"
+        await state.set_state(ConfirmLeave.confirm)
+        await state.update_data(scenario="regular")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да", callback_data="confirm_leave_yes"),
+             InlineKeyboardButton(text="❌ Нет", callback_data="confirm_leave_no")]
+        ])
+        await callback.message.edit_text(text, reply_markup=kb)
+        await callback.answer()
+
+
+@router.callback_query(ConfirmLeave.confirm, F.data.in_({"confirm_leave_yes", "confirm_leave_no"}))
+async def confirm_leave_handler(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    team_id = data.get('team_id')
+    scenario = data.get('scenario')
+    user = get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("Ошибка", show_alert=True)
+        await state.clear()
+        return
+
+    if callback.data == "confirm_leave_no":
+        # Получаем team_id до очистки состояния
+        data = await state.get_data()
+        team_id = data.get('team_id')
+        await state.clear()
+        if team_id:
+            text, kb = await get_team_card_data(team_id, callback.from_user.id)
+            if text:
+                await callback.message.edit_text(text, reply_markup=kb)
+            else:
+                await callback.message.edit_text("Ошибка загрузки команды.")
+        else:
+            await callback.message.edit_text("Ошибка: команда не найдена.")
+        await callback.answer()
+        return
+
+    # Подтверждено (Yes)
+    if scenario == "captain_alone":
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM team_members WHERE team_id=?", (team_id,))
+        cur.execute("DELETE FROM team_invites WHERE team_id=?", (team_id,))
+        cur.execute(
+            "DELETE FROM tournament_applications WHERE team_id=?", (team_id,))
+        cur.execute(
+            "DELETE FROM matches WHERE team1_id=? OR team2_id=?", (team_id, team_id))
+        cur.execute("DELETE FROM teams WHERE id=?", (team_id,))
+        cur.execute("DELETE FROM ratings WHERE team_id=?", (team_id,))
+        conn.commit()
+        conn.close()
+        await state.clear()
+        await callback.message.edit_text("Команда удалена, так как вы были единственным участником.")
+        teams = get_user_teams(user['id'])
+        await callback.message.answer("Ваши команды:", reply_markup=teams_list_keyboard(teams, show_create=True))
+        await callback.answer()
+        return
+
+    elif scenario == "regular":
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM team_members WHERE team_id=? AND user_id=?", (team_id, user['id']))
+        cur.execute(
+            "DELETE FROM team_invites WHERE team_id=? AND user_id=?", (team_id, user['id']))
+        conn.commit()
+        conn.close()
+        await state.clear()
+        await callback.message.edit_text("Вы вышли из команды.")
+        teams = get_user_teams(user['id'])
+        await callback.message.answer("Ваши команды:", reply_markup=teams_list_keyboard(teams, show_create=True))
+        await callback.answer()
+        return
+
+    elif scenario == "captain_with_others":
+        new_captain_id = data.get('new_captain_id')
+        if not new_captain_id:
+            await callback.answer("Ошибка: не выбран новый капитан", show_alert=True)
+            await state.clear()
+            return
+
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("UPDATE teams SET captain_id=? WHERE id=?",
+                    (new_captain_id, team_id))
+        cur.execute(
+            "DELETE FROM team_members WHERE team_id=? AND user_id=?", (team_id, user['id']))
+        cur.execute(
+            "DELETE FROM team_invites WHERE team_id=? AND user_id=?", (team_id, user['id']))
+        conn.commit()
+        conn.close()
+
+        new_captain = get_user_by_id(new_captain_id)
+        if new_captain:
+            try:
+                await callback.bot.send_message(
+                    new_captain['telegram_id'],
+                    f"Вы стали капитаном команды «{get_team_by_id(team_id)['name']}», так как прошлый капитан покинул ее!"
+                )
+            except Exception as e:
+                print(f"Не удалось уведомить нового капитана: {e}")
+
+        await state.clear()
+        await callback.message.edit_text("Вы передали капитанство и покинули команду.")
+        teams = get_user_teams(user['id'])
+        await callback.message.answer("Ваши команды:", reply_markup=teams_list_keyboard(teams, show_create=True))
+        await callback.answer()
+
+    else:
+        await state.clear()
+        await callback.answer("Ошибка", show_alert=True)
+
+
+@router.callback_query(LeaveTeam.choose_captain, F.data.startswith("set_captain_"))
+async def set_new_captain(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    team_id = int(parts[2])
+    new_captain_id = int(parts[3])
+
+    data = await state.get_data()
+    stored_team_id = data.get('team_id')
+    if stored_team_id != team_id:
+        await callback.answer("Ошибка данных", show_alert=True)
+        await state.clear()
+        return
+
+    user = get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("Ошибка", show_alert=True)
+        await state.clear()
+        return
+
+    if not is_captain(user['id'], team_id):
+        await callback.answer("Вы больше не капитан", show_alert=True)
+        await state.clear()
+        return
+
+    if not is_team_member(new_captain_id, team_id):
+        await callback.answer("Этот пользователь не в команде", show_alert=True)
+        await state.clear()
+        return
+
+    # Сохраняем выбранного нового капитана
+    await state.update_data(new_captain_id=new_captain_id, scenario="captain_with_others")
+    # Переходим к подтверждению
+    await state.set_state(ConfirmLeave.confirm)
+    text = "Вы точно хотите покинуть команду? Капитанство будет передано выбранному участнику."
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да", callback_data="confirm_leave_yes"),
+         InlineKeyboardButton(text="❌ Нет", callback_data="confirm_leave_no")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("rename_team_"))
@@ -269,7 +465,8 @@ async def rename_team_name(message: Message, state: FSMContext):
     conn.close()
     await state.clear()
     await message.answer("Название изменено!")
-    await send_team_info(message.bot, message.chat.id, team_id, message.from_user.id)
+    text, kb = await get_team_card_data(team_id, message.from_user.id)
+    await message.answer(text, reply_markup=kb)
 
 
 @router.callback_query(F.data.startswith("delete_team_"))
@@ -384,7 +581,8 @@ async def add_player_username(message: Message, state: FSMContext):
             reply_markup=invite_keyboard(team_id)
         )
         await message.answer(f"Приглашение отправлено пользователю @{username}.")
-        await send_team_info(message.bot, message.chat.id, team_id, message.from_user.id)
+        text, kb = await get_team_card_data(team_id, message.from_user.id)
+        await message.answer(text, reply_markup=kb)
     except Exception as e:
         print(f"Ошибка отправки сообщения: {e}")
         conn = get_connection()
@@ -835,11 +1033,10 @@ async def apply_to_team(callback: CallbackQuery):
 
         await callback.answer("Заявка отправлена! Ожидайте решения капитана.", show_alert=True)
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 В меню команд",
-                                  callback_data="teams_menu")]
+            [InlineKeyboardButton(text="🔙 К команде",
+                                  callback_data=f"team_{team_id}")]
         ])
-        await callback.message.edit_text("Заявка отправлена. Вы можете вернуться в меню команд.",
-                                         reply_markup=kb)
+        await callback.message.edit_text("Заявка отправлена! Ожидайте решения капитана.", reply_markup=kb)
 
 # --- Обработчики заявок для капитана ---
 
@@ -1031,4 +1228,5 @@ async def finish_edit_max_members(user_id, message, state: FSMContext, new_max):
     update_team_max_members(team_id, new_max)
     await state.clear()
     await message.answer("Лимит изменен!")
-    await send_team_info(message.bot, message.chat.id, team_id, user_id)
+    text, kb = await get_team_card_data(team_id, user_id)
+    await message.answer(text, reply_markup=kb)

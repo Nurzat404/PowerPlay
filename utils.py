@@ -2,7 +2,7 @@ import json
 import sqlite3
 from database import get_connection
 import datetime
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 RUSSIAN_MONTHS = {
     'янв.': 1, 'февр.': 2, 'марта': 3, 'апр.': 4, 'мая': 5, 'июня': 6,
@@ -369,7 +369,8 @@ def can_retry_tournament_application(tournament_id, team_id):
         try:
             rejected_time = datetime.strptime(
                 row['updated_at'], '%Y-%m-%d %H:%M:%S')
-            now = datetime.utcnow()  # <-- исправлено
+            now = datetime.now(timezone.utc).replace(
+                tzinfo=None)  # <-- исправлено
             delta = now - rejected_time
             if delta >= timedelta(hours=1):
                 return True, None
@@ -466,7 +467,7 @@ def reset_team_rating(team_id, sport):
 
 def deduct_team_points(team_id, sport, points):
     """Снять points очков с команды в указанном спорте за текущий месяц"""
-    month = datetime.now().strftime("%Y-%m")
+    month = datetime.now(timezone.utc).strftime("%Y-%m")
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT points FROM ratings WHERE team_id=? AND sport=? AND month=?",
@@ -482,7 +483,7 @@ def deduct_team_points(team_id, sport, points):
 
 def get_teams_with_rating(sport):
     """Возвращает команды с их текущими очками для указанного спорта (за текущий месяц)"""
-    month = datetime.now().strftime("%Y-%m")
+    month = datetime.now(timezone.utc).strftime("%Y-%m")
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -859,7 +860,7 @@ def can_retry_request(team_id, user_id):
         # updated_at хранится как строка в формате SQLite, преобразуем в datetime
         rejected_time = datetime.strptime(
             row['updated_at'], '%Y-%m-%d %H:%M:%S')
-        now = datetime.now()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         delta = now - rejected_time
         if delta >= timedelta(hours=1):
             return True, None

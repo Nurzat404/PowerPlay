@@ -4,7 +4,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from database import get_connection
 from utils import get_all_sports
 from keyboards import ratings_sport_keyboard, back_to_main_keyboard
-from datetime import datetime
+from datetime import datetime, timezone
 
 router = Router()
 
@@ -22,7 +22,7 @@ async def ratings_menu(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("rating_sport_"))
 async def show_sport_rating(callback: CallbackQuery):
     sport = callback.data.replace("rating_sport_", "")
-    month = datetime.now().strftime("%Y-%m")
+    month = datetime.now(timezone.utc).strftime("%Y-%m")
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""

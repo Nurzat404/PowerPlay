@@ -21,7 +21,7 @@ from keyboards import (
     admin_rating_teams_list_keyboard, admin_rating_team_actions_keyboard,
     admin_teams_list_keyboard, sports_choice_keyboard_single
 )
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 async def send_tournament_info(bot: Bot, chat_id: int, tournament_id: int, user_id: int):
@@ -224,10 +224,12 @@ async def create_tournament_description(message: Message, state: FSMContext):
     INSERT INTO tournaments (name, sport, city, start_date, end_date, max_teams, required_team_size, min_age, max_age, description, created_by, status)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'registration')
     """, (data['name'], data['sport'], data['city'], data['start_date'], data['end_date'], data['max_teams'], data['required_team_size'], data['min_age'], data['max_age'], description, message.from_user.id))
+    tournament_id = cur.lastrowid
     conn.commit()
     conn.close()
     await state.clear()
-    await message.answer("Турнир создан!", reply_markup=admin_menu_keyboard())
+    # Вместо админ-меню показываем карточку нового турнира
+    await send_tournament_info(message.bot, message.chat.id, tournament_id, message.from_user.id)
 
 # ---------- Редактирование турнира ----------
 
@@ -640,7 +642,7 @@ async def result_enter_score2(message: Message, state: FSMContext):
             "SELECT team1_id, team2_id, tournament_id FROM matches WHERE id=?", (match_id,))
         match = cur.fetchone()
         if match:
-            month = datetime.now().strftime("%Y-%m")
+            month = datetime.now(timezone.utc).strftime("%Y-%m")
             cur.execute("SELECT sport FROM tournaments WHERE id=?",
                         (match['tournament_id'],))
             tour = cur.fetchone()

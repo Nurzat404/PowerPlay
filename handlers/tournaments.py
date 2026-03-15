@@ -9,7 +9,7 @@ from utils import (
 )
 from keyboards import (
     tournaments_main_keyboard, tournaments_list_keyboard,
-    choose_team_keyboard, back_to_main_keyboard
+    choose_team_keyboard, back_to_main_keyboard, back_to_tournament_keyboard
 )
 
 router = Router()
@@ -128,6 +128,12 @@ async def apply_with_team(callback: CallbackQuery):
         await callback.answer("Турнир не найден", show_alert=True)
         return
 
+    # Проверка лимита команд (должна выполняться в любом случае)
+    approved_count = get_approved_teams_count(tournament_id)
+    if approved_count >= tournament['max_teams']:
+        await callback.answer("❌ Все места в турнире уже заняты.", show_alert=True)
+        return
+
     team = get_team_by_id(team_id)
     if not team:
         await callback.answer("Команда не найдена", show_alert=True)
@@ -143,33 +149,33 @@ async def apply_with_team(callback: CallbackQuery):
 
     if app:
         status = app['status']
-        if status == 'approved':   # было 'accepted'
+        if status == 'approved':
             await callback.answer("❌ Ваша команда уже участвует в турнире.", show_alert=True)
             return
         elif status == 'pending':
             await callback.answer("⏳ Заявка уже отправлена, ожидайте решения.", show_alert=True)
             return
         elif status == 'rejected':
-            # Проверяем, можно ли повторно
+            # Проверяем, можно ли подать повторно
             ok, minutes = can_retry_tournament_application(
                 tournament_id, team_id)
             if not ok:
                 await callback.answer(f"⏱ Повторная подача будет доступна через {minutes} мин.", show_alert=True)
                 return
-            else:
-                # Создаём НОВУЮ заявку (не обновляем старую)
-                add_tournament_application(tournament_id, team_id)
-                await callback.answer("✅ Заявка отправлена повторно!", show_alert=True)
-                await callback.message.edit_text(
-                    "Заявка отправлена! Ожидайте подтверждения администратора.",
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                        [InlineKeyboardButton(
-                            text="🔙 К турниру", callback_data=f"tournament_{tournament_id}")]
-                    ])
-                )
-                return
+            # Обновляем статус
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE tournament_applications SET status='pending', updated_at=CURRENT_TIMESTAMP WHERE tournament_id=? AND team_id=?",
+                (tournament_id, team_id))
+            conn.commit()
+            conn.close()
+            await callback.answer("✅ Заявка отправлена повторно!", show_alert=True)
+            await callback.message.edit_text("Заявка отправлена! Ожидайте подтверждения администратора.",
+                                             reply_markup=back_to_tournament_keyboard(tournament_id))
+            return
     else:
-        # Нет заявки – проверяем размер
+        # НОВАЯ ЗАЯВКА – проверяем размер и возраст
         current_size = get_team_members_count(team_id)
         if current_size != tournament['required_team_size']:
             await callback.answer(f"❌ В вашей команде {current_size} чел., а требуется {tournament['required_team_size']}.", show_alert=True)
@@ -187,20 +193,14 @@ async def apply_with_team(callback: CallbackQuery):
                         f"❌ {member['first_name']} (@{member['username']}) имеет возраст {age}, требуется {tournament['min_age']}-{tournament['max_age']}.")
 
         if problems:
-            # Объединяем все проблемы в одно сообщение
             await callback.answer("\n".join(problems), show_alert=True)
             return
-        # Создаём новую заявку
+
+        # Создаём новую заявку (лимит команд уже проверен выше)
         add_tournament_application(tournament_id, team_id)
         await callback.answer("✅ Заявка отправлена!", show_alert=True)
-        await callback.message.edit_text(
-            "Заявка отправлена! Ожидайте подтверждения администратора.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(
-                    text="🔙 К турниру", callback_data=f"tournament_{tournament_id}")]
-            ])
-        )
-        # Уведомление админу (можно добавить)
+        await callback.message.edit_text("Заявка отправлена! Ожидайте подтверждения администратора.",
+                                         reply_markup=back_to_tournament_keyboard(tournament_id))
         await callback.answer()
 
 

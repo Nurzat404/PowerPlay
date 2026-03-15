@@ -50,6 +50,9 @@ def teams_list_keyboard(teams, show_create=True):
 
 def team_management_extended_keyboard(team_id, is_captain, is_open, notify_enabled, max_members):
     builder = InlineKeyboardBuilder()
+    # Кнопка выхода для всех
+    builder.button(text="🚪 Выйти из команды",
+                   callback_data=f"leave_team_{team_id}")
     if is_captain:
         builder.button(text="✏️ Изменить название",
                        callback_data=f"rename_team_{team_id}")
@@ -68,6 +71,18 @@ def team_management_extended_keyboard(team_id, is_captain, is_open, notify_enabl
         builder.button(
             text=f"Уведомления: {notify_status}", callback_data=f"toggle_notify_{team_id}")
     builder.button(text="🔙 Назад", callback_data="my_teams")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def choose_new_captain_keyboard(team_id, members):
+    """Клавиатура для выбора нового капитана из списка участников (кроме текущего)"""
+    builder = InlineKeyboardBuilder()
+    for member in members:
+        text = f"{member['first_name']} (@{member['username']})"
+        builder.button(
+            text=text, callback_data=f"set_captain_{team_id}_{member['id']}")
+    builder.button(text="❌ Отмена", callback_data=f"team_{team_id}")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -98,6 +113,13 @@ def tournament_card_keyboard(tournament_id, sport_name, can_apply):
     builder.button(
         text="🔙 Назад", callback_data=f"tournament_sport_{sport_name}")
     builder.adjust(1)
+    return builder.as_markup()
+
+
+def back_to_tournament_keyboard(tournament_id):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔙 К турниру",
+                   callback_data=f"tournament_{tournament_id}")
     return builder.as_markup()
 
 

@@ -123,7 +123,12 @@ def init_db():
                         applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
-
+                try:
+                    cur.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tournament_team ON tournament_applications(tournament_id, team_id)")
+                except sqlite3.OperationalError as e:
+                    print(
+                        f"Не удалось создать индекс (возможно, есть дубли): {e}")
                 # Матчи
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS matches (
