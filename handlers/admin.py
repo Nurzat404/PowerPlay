@@ -13,7 +13,7 @@ from utils import (
     delete_tournament, get_all_sports, reset_sport_rating,
     get_teams_with_rating, reset_team_rating, deduct_team_points,
     get_all_teams, delete_team_admin, parse_russian_date, parse_russian_datetime,
-    get_user, get_user_teams, get_team_application, get_approved_teams_count
+    get_user, get_user_teams, get_team_application, get_approved_teams_count, get_all_users_count, search_users_count
 )
 from keyboards import (
     admin_menu_keyboard, back_to_main_keyboard,
@@ -95,12 +95,12 @@ class CreateTournament(StatesGroup):
 
 @router.callback_query(F.data == "admin_create_tournament")
 async def admin_create_tournament_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
     await state.set_state(CreateTournament.name)
     await callback.message.edit_text("Введите название турнира:")
-    await callback.answer()
 
 
 @router.message(CreateTournament.name)
@@ -113,11 +113,11 @@ async def create_tournament_name(message: Message, state: FSMContext):
 
 @router.callback_query(CreateTournament.sport, F.data.startswith("admin_tourn_sport_"))
 async def create_tournament_sport_chosen(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     sport_name = callback.data.replace("admin_tourn_sport_", "")
     await state.update_data(sport=sport_name)
     await state.set_state(CreateTournament.city)
     await callback.message.edit_text("Введите город проведения:")
-    await callback.answer()
 
 
 @router.message(CreateTournament.city)
@@ -240,6 +240,7 @@ class EditTournament(StatesGroup):
 
 @router.callback_query(F.data.startswith("admin_edit_tournament_"))
 async def edit_tournament_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
@@ -258,6 +259,7 @@ async def edit_tournament_start(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(EditTournament.field, F.data.startswith("edit_field_"))
 async def edit_tournament_field(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     field = callback.data.replace("edit_field_", "")
     await state.update_data(field=field)
     if field == "sport":
@@ -267,7 +269,6 @@ async def edit_tournament_field(callback: CallbackQuery, state: FSMContext):
     else:
         await state.set_state(EditTournament.value)
         await callback.message.edit_text(f"Введите новое значение для поля '{field}':")
-    await callback.answer()
 
 
 @router.message(EditTournament.value)
@@ -326,6 +327,7 @@ async def edit_tournament_value(message: Message, state: FSMContext):
 
 @router.callback_query(EditTournament.sport_choice, F.data.startswith("admin_tourn_sport_"))
 async def edit_tournament_sport_chosen(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     new_sport = callback.data.replace("admin_tourn_sport_", "")
     data = await state.get_data()
     tournament_id = data['tournament_id']
@@ -337,13 +339,14 @@ async def edit_tournament_sport_chosen(callback: CallbackQuery, state: FSMContex
     conn.close()
     await state.clear()
     await send_tournament_info(callback.bot, callback.message.chat.id, tournament_id, callback.from_user.id)
-    await callback.answer()
+
 
 # ---------- Заявки на турниры ----------
 
 
 @router.callback_query(F.data == "admin_applications")
 async def admin_applications(callback: CallbackQuery):
+    await callback.answer()
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
@@ -367,7 +370,6 @@ async def admin_applications(callback: CallbackQuery):
     builder.button(text="🔙 Назад", callback_data="admin_menu")
     builder.adjust(2)
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("approve_"))
@@ -404,6 +406,7 @@ class CreateMatch(StatesGroup):
 
 @router.callback_query(F.data == "admin_create_match")
 async def admin_create_match_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
@@ -428,11 +431,11 @@ async def admin_create_match_start(callback: CallbackQuery, state: FSMContext):
     builder.button(text="🔙 Назад", callback_data="admin_menu")
     builder.adjust(1)
     await callback.message.edit_text("Выберите турнир:", reply_markup=builder.as_markup())
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("match_tournament_"))
 async def match_choose_tournament(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     tournament_id = int(callback.data.split("_")[2])
     await state.update_data(tournament_id=tournament_id)
     conn = get_connection()
@@ -460,11 +463,11 @@ async def match_choose_tournament(callback: CallbackQuery, state: FSMContext):
     builder.adjust(1)
     await callback.message.edit_text("Выберите ПЕРВУЮ команду:", reply_markup=builder.as_markup())
     await state.set_state(CreateMatch.team1)
-    await callback.answer()
 
 
 @router.callback_query(CreateMatch.team1, F.data.startswith("match_team1_"))
 async def match_choose_team1(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     team1_id = int(callback.data.split("_")[2])
     await state.update_data(team1_id=team1_id)
     data = await state.get_data()
@@ -494,16 +497,15 @@ async def match_choose_team1(callback: CallbackQuery, state: FSMContext):
     builder.adjust(1)
     await callback.message.edit_text("Выберите ВТОРУЮ команду:", reply_markup=builder.as_markup())
     await state.set_state(CreateMatch.team2)
-    await callback.answer()
 
 
 @router.callback_query(CreateMatch.team2, F.data.startswith("match_team2_"))
 async def match_choose_team2(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     team2_id = int(callback.data.split("_")[2])
     await state.update_data(team2_id=team2_id)
     await state.set_state(CreateMatch.date)
     await callback.message.edit_text("Введите дату и время матча (например, 1 янв. 18:00):")
-    await callback.answer()
 
 
 @router.message(CreateMatch.date)
@@ -564,6 +566,7 @@ class EnterResult(StatesGroup):
 
 @router.callback_query(F.data == "admin_enter_result")
 async def admin_enter_result_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
@@ -593,7 +596,6 @@ async def admin_enter_result_start(callback: CallbackQuery, state: FSMContext):
     builder.button(text="🔙 Назад", callback_data="admin_menu")
     builder.adjust(1)
     await callback.message.edit_text("Выберите матч для ввода результата:", reply_markup=builder.as_markup())
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("result_match_"))
@@ -681,6 +683,7 @@ class UserManagement(StatesGroup):
 
 @router.callback_query(F.data == "admin_users")
 async def admin_users_menu(callback: CallbackQuery):
+    await callback.answer()
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
@@ -691,7 +694,6 @@ async def admin_users_menu(callback: CallbackQuery):
     builder.button(text="🔙 Назад", callback_data="admin_menu")
     builder.adjust(1)
     await callback.message.edit_text("Управление пользователями:", reply_markup=builder.as_markup())
-    await callback.answer()
 
 
 @router.callback_query(F.data == "admin_user_list")
@@ -700,28 +702,60 @@ async def admin_user_list(callback: CallbackQuery):
         await callback.answer("Нет прав", show_alert=True)
         return
     users = get_all_users(0, 10)
-    await show_user_list(callback.message, users, 0)
+    total = get_all_users_count()  # нужно добавить функцию в utils
+    await show_user_list(callback.message, users, 0, total)
+    await callback.answer()
 
 
-async def show_user_list(message, users, offset):
+async def show_user_list(message, users, offset, total):
+    """
+    Отображает список пользователей в виде кнопок.
+    users – список пользователей для текущей страницы
+    offset – текущее смещение
+    total – общее количество пользователей
+    """
     if not users:
         text = "Пользователи не найдены."
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_menu")]
-        ])
-    else:
-        text = "Список пользователей (первые 10):\n\n"
-        builder = InlineKeyboardBuilder()
-        for u in users:
-            status = "🔴" if u['is_banned'] else "🟢"
-            text += f"{status} {u['id']}: {u['first_name']} @{u['username']} ({u['role']})\n"
-            builder.button(
-                text=f"👤 {u['id']}", callback_data=f"admin_user_view_{u['id']}")
-        builder.button(text="▶️ Далее", callback_data="admin_user_next")
-        builder.button(text="🔙 Назад", callback_data="admin_users")
-        builder.adjust(4)
-        kb = builder.as_markup()
-    await message.edit_text(text, reply_markup=kb)
+        kb = back_to_main_keyboard()
+        await message.edit_text(text, reply_markup=kb)
+        return
+
+    builder = InlineKeyboardBuilder()
+    for u in users:
+        status_icon = "🟢" if not u['is_banned'] else "🔴"
+        button_text = f"{status_icon} {u['id']}: {u['first_name']} @{u['username']} ({u['role']})"
+        builder.button(
+            text=button_text, callback_data=f"admin_user_view_{u['id']}_list_{offset}")
+    builder.adjust(1)
+
+    # Кнопки пагинации
+    nav_buttons = []
+    if offset > 0:
+        nav_buttons.append(InlineKeyboardButton(
+            text="◀️", callback_data=f"admin_user_page_{offset-10}"))
+    if offset + 10 < total:
+        nav_buttons.append(InlineKeyboardButton(
+            text="▶️", callback_data=f"admin_user_page_{offset+10}"))
+    if nav_buttons:
+        builder.row(*nav_buttons)
+
+    # Кнопка назад в меню пользователей
+    builder.row(InlineKeyboardButton(
+        text="🔙 Назад", callback_data="admin_users"))
+
+    await message.edit_text("Список пользователей:", reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("admin_user_page_"))
+async def admin_user_page(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    offset = int(callback.data.split("_")[3])
+    users = get_all_users(offset, 2)
+    total = get_all_users_count()
+    await show_user_list(callback.message, users, offset, total)
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("admin_user_view_"))
@@ -729,11 +763,19 @@ async def admin_user_view(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
-    user_id = int(callback.data.split("_")[3])
+
+    parts = callback.data.split("_")
+    user_id = int(parts[3])
+    source = parts[4]  # "list" или "search"
+    offset = int(parts[5]) if source == "list" else 0
+    query = parts[5] if source == "search" else ""
+
     user = get_user_by_id(user_id)
     if not user:
         await callback.answer("Пользователь не найден", show_alert=True)
         return
+
+    age_str = str(user['age']) if user['age'] is not None else "не указан"
     text = f"""
 👤 Пользователь #{user['id']}
 Telegram ID: {user['telegram_id']}
@@ -741,16 +783,28 @@ Telegram ID: {user['telegram_id']}
 Username: @{user['username']}
 Email: {user['email']}
 Город: {user['city']}
+Возраст: {age_str}
 Любимые виды спорта: {user['favorite_sports']}
 Роль: {user['role']}
 Статус: {'🔴 Забанен' if user['is_banned'] else '🟢 Активен'}
     """
+
     builder = InlineKeyboardBuilder()
     builder.button(text="🔄 Сменить роль",
                    callback_data=f"admin_user_changerole_{user_id}")
     builder.button(text="🔨 Бан/Разбан",
                    callback_data=f"admin_user_toggleban_{user_id}")
-    builder.button(text="🔙 Назад", callback_data="admin_users")
+
+    # Кнопка назад в зависимости от источника
+    if source == "list":
+        builder.button(text="🔙 Назад к списку",
+                       callback_data=f"admin_user_page_{offset}")
+    elif source == "search":
+        builder.button(text="🔙 К результатам поиска",
+                       callback_data=f"admin_search_page_{query}_{offset}")
+    else:
+        builder.button(text="🔙 Назад", callback_data="admin_users")
+
     builder.adjust(1)
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
@@ -815,35 +869,64 @@ async def admin_user_search_start(callback: CallbackQuery, state: FSMContext):
 @router.message(UserManagement.searching)
 async def admin_user_search_results(message: Message, state: FSMContext):
     query = message.text.strip()
-    users = search_users(query)
     await state.clear()
+    users = search_users(query)
+    total = search_users_count(query)  # нужно добавить в utils
+    await show_search_results(message, query, users, 0, total)
+
+
+async def show_search_results(message, query, users, offset, total):
     if not users:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_menu")]
-        ])
-        await message.answer("Ничего не найдено.", reply_markup=kb)
+        kb = back_to_main_keyboard()
+        await message.answer(f"По запросу «{query}» ничего не найдено.", reply_markup=kb)
         return
-    text = f"Результаты поиска по запросу «{query}»:\n\n"
+
     builder = InlineKeyboardBuilder()
     for u in users:
-        status = "🔴" if u['is_banned'] else "🟢"
-        text += f"{status} {u['id']}: {u['first_name']} @{u['username']} ({u['role']})\n"
-        builder.button(text=f"👤 {u['id']}",
-                       callback_data=f"admin_user_view_{u['id']}")
-    builder.button(text="🔙 Назад", callback_data="admin_users")
-    builder.adjust(4)
-    await message.answer(text, reply_markup=builder.as_markup())
+        status_icon = "🟢" if not u['is_banned'] else "🔴"
+        button_text = f"{status_icon} {u['id']}: {u['first_name']} @{u['username']} ({u['role']})"
+        builder.button(
+            text=button_text, callback_data=f"admin_user_view_{u['id']}_search_{query}_{offset}")
+    builder.adjust(1)
+
+    # Пагинация
+    nav_buttons = []
+    if offset > 0:
+        nav_buttons.append(InlineKeyboardButton(
+            text="◀️", callback_data=f"admin_search_page_{query}_{offset-10}"))
+    if offset + 10 < total:
+        nav_buttons.append(InlineKeyboardButton(
+            text="▶️", callback_data=f"admin_search_page_{query}_{offset+10}"))
+    if nav_buttons:
+        builder.row(*nav_buttons)
+
+    builder.row(InlineKeyboardButton(
+        text="🔙 Назад", callback_data="admin_users"))
+
+    await message.answer(f"Результаты поиска по запросу «{query}»:", reply_markup=builder.as_markup())
 
 
-@router.callback_query(F.data == "admin_user_next")
-async def admin_user_next(callback: CallbackQuery):
-    await callback.answer("Пагинация пока не реализована, используйте поиск.", show_alert=True)
+@router.callback_query(F.data.startswith("admin_search_page_"))
+async def admin_search_page(callback: CallbackQuery):
+    await callback.answer()
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    parts = callback.data.split("_")
+    query = parts[3]
+    offset = int(parts[4])
+    # нужно изменить search_users, добавив offset/limit
+    users = search_users(query, offset, 10)
+    total = search_users_count(query)
+    await show_search_results(callback.message, query, users, offset, total)
+
 
 # ---------- Удаление турнира (кнопка в карточке турнира) ----------
 
 
 @router.callback_query(F.data.startswith("admin_delete_tournament_"))
 async def admin_delete_tournament_confirm(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
@@ -860,7 +943,6 @@ async def admin_delete_tournament_confirm(callback: CallbackQuery, state: FSMCon
             text="❌ Нет", callback_data=f"tournament_{tournament_id}")]
     ])
     await callback.message.edit_text(f"Вы уверены, что хотите удалить турнир «{tournament['name']}»? Это действие нельзя отменить.", reply_markup=kb)
-    await callback.answer()
     await state.update_data(tournament_id=tournament_id, sport=tournament['sport'])
 
 
@@ -906,12 +988,12 @@ async def admin_rating_menu(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("admin_rating_sport_"))
 async def admin_rating_sport_actions(callback: CallbackQuery):
+    await callback.answer()
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
     sport = callback.data.replace("admin_rating_sport_", "")
     await callback.message.edit_text(f"Действия для спорта {sport}:", reply_markup=admin_rating_sport_actions_keyboard(sport))
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("admin_rating_reset_all_"))
@@ -927,6 +1009,7 @@ async def admin_rating_reset_all(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("admin_rating_list_teams_"))
 async def admin_rating_list_teams(callback: CallbackQuery):
+    await callback.answer()
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
@@ -937,11 +1020,11 @@ async def admin_rating_list_teams(callback: CallbackQuery):
         await callback.answer()
         return
     await callback.message.edit_text(f"Команды по {sport}:", reply_markup=admin_rating_teams_list_keyboard(teams, sport))
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("admin_rating_team_"))
 async def admin_rating_team_actions(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
@@ -950,11 +1033,11 @@ async def admin_rating_team_actions(callback: CallbackQuery, state: FSMContext):
     sport = parts[4]
     await state.update_data(team_id=team_id, sport=sport)
     await callback.message.edit_text(f"Действия для команды:", reply_markup=admin_rating_team_actions_keyboard(team_id, sport))
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("admin_rating_reset_team_"))
 async def admin_rating_reset_team(callback: CallbackQuery):
+    await callback.answer()
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
@@ -966,7 +1049,6 @@ async def admin_rating_reset_team(callback: CallbackQuery):
     # Вернуться к списку команд этого спорта
     teams = get_teams_with_rating(sport)
     await callback.message.edit_text(f"Команды по {sport}:", reply_markup=admin_rating_teams_list_keyboard(teams, sport))
-    await callback.answer()
 
 
 class DeductPoints(StatesGroup):
@@ -975,6 +1057,7 @@ class DeductPoints(StatesGroup):
 
 @router.callback_query(F.data.startswith("admin_rating_deduct_"))
 async def admin_rating_deduct_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
@@ -984,7 +1067,6 @@ async def admin_rating_deduct_start(callback: CallbackQuery, state: FSMContext):
     await state.update_data(team_id=team_id, sport=sport)
     await state.set_state(DeductPoints.points)
     await callback.message.edit_text("Введите количество очков для снятия:")
-    await callback.answer()
 
 
 @router.message(DeductPoints.points)
@@ -1011,6 +1093,7 @@ async def admin_rating_deduct_execute(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "admin_teams")
 async def admin_teams_list(callback: CallbackQuery):
+    await callback.answer()
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
@@ -1020,11 +1103,11 @@ async def admin_teams_list(callback: CallbackQuery):
         await callback.answer()
         return
     await callback.message.edit_text("Список команд:", reply_markup=admin_teams_list_keyboard(teams))
-    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("admin_delete_team_"))
 async def admin_delete_team_confirm(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
@@ -1040,11 +1123,11 @@ async def admin_delete_team_confirm(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="❌ Нет", callback_data="admin_teams")]
     ])
     await callback.message.edit_text(f"Вы уверены, что хотите удалить команду «{team['name']}»? Это действие нельзя отменить.", reply_markup=kb)
-    await callback.answer()
 
 
 @router.callback_query(F.data == "admin_confirm_delete_team")
 async def admin_delete_team_execute(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
@@ -1057,13 +1140,12 @@ async def admin_delete_team_execute(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text("Команда удалена.")
     await callback.message.answer("Панель администратора:", reply_markup=admin_menu_keyboard())
-    await callback.answer()
 
 
 @router.callback_query(F.data == "admin_menu")
 async def back_to_admin_menu(callback: CallbackQuery):
+    await callback.answer()
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
     await callback.message.edit_text("Панель администратора:", reply_markup=admin_menu_keyboard())
-    await callback.answer()

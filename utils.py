@@ -186,7 +186,7 @@ def get_all_users(offset=0, limit=20):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, telegram_id, first_name, last_name, username, email, city, role, is_banned
+        SELECT id, telegram_id, first_name, last_name, username, email, city, age, favorite_sports, role, is_banned
         FROM users
         ORDER BY id DESC
         LIMIT ? OFFSET ?
@@ -196,18 +196,17 @@ def get_all_users(offset=0, limit=20):
     return users
 
 
-def search_users(query):
-    """Поиск пользователей по имени, username или telegram_id"""
+def search_users(query, offset=0, limit=20):
     conn = get_connection()
     cur = conn.cursor()
     pattern = f"%{query}%"
     cur.execute("""
-        SELECT id, telegram_id, first_name, last_name, username, email, city, role, is_banned
+        SELECT id, telegram_id, first_name, last_name, username, email, city, age, favorite_sports, role, is_banned
         FROM users
         WHERE first_name LIKE ? OR last_name LIKE ? OR username LIKE ? OR telegram_id LIKE ?
         ORDER BY id DESC
-        LIMIT 20
-    """, (pattern, pattern, pattern, pattern))
+        LIMIT ? OFFSET ?
+    """, (pattern, pattern, pattern, pattern, limit, offset))
     users = cur.fetchall()
     conn.close()
     return users
@@ -886,3 +885,23 @@ def update_user_age(user_id, new_age):
     cur.execute("UPDATE users SET age=? WHERE id=?", (new_age, user_id))
     conn.commit()
     conn.close()
+
+
+def get_all_users_count():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM users")
+    count = cur.fetchone()[0]
+    conn.close()
+    return count
+
+
+def search_users_count(query):
+    conn = get_connection()
+    cur = conn.cursor()
+    pattern = f"%{query}%"
+    cur.execute("SELECT COUNT(*) FROM users WHERE first_name LIKE ? OR last_name LIKE ? OR username LIKE ? OR telegram_id LIKE ?",
+                (pattern, pattern, pattern, pattern))
+    count = cur.fetchone()[0]
+    conn.close()
+    return count
