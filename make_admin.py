@@ -19,6 +19,6 @@ cursor.execute(
 if cursor.rowcount == 0:
     print("❌ Пользователь с таким telegram_id не найден. Сначала зарегистрируйся в боте.")
 else:
-    print("✅ Роль обновлена на admin. Готово!")
+    print("✅ Роль обновлена на admin.")
 conn.commit()
 conn.close()
