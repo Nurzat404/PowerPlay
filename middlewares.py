@@ -1,7 +1,7 @@
 from aiogram import BaseMiddleware
 from aiogram.types import Message, CallbackQuery
 from typing import Callable, Dict, Any, Awaitable
-from utils import get_user
+from razryad_arena_utils import get_user
 
 
 class BanCheckMiddleware(BaseMiddleware):
@@ -24,3 +24,4 @@ class BanCheckMiddleware(BaseMiddleware):
 
         # Если не забанен, передаём управление дальше
         return await handler(event, data)
+

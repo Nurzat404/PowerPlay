@@ -2,7 +2,7 @@ from aiogram import Router, F
 from aiogram.types import CallbackQuery
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from database import get_connection
-from utils import get_all_sports
+from razryad_arena_utils import get_all_sports, get_sport_display_name
 from keyboards import ratings_sport_keyboard, back_to_main_keyboard
 from datetime import datetime, timezone
 
@@ -22,6 +22,7 @@ async def ratings_menu(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("rating_sport_"))
 async def show_sport_rating(callback: CallbackQuery):
     sport = callback.data.replace("rating_sport_", "")
+    sport_display = get_sport_display_name(sport)
     month = datetime.now(timezone.utc).strftime("%Y-%m")
     conn = get_connection()
     cur = conn.cursor()
@@ -36,9 +37,9 @@ async def show_sport_rating(callback: CallbackQuery):
     conn.close()
 
     if not rows:
-        text = f"Рейтинг по {sport} пока пуст."
+        text = f"Рейтинг по {sport_display} пока пуст."
     else:
-        text = f"🏆 Рейтинг команд {sport}:\n\n"
+        text = f"🏆 Рейтинг команд {sport_display}:\n\n"
         for i, row in enumerate(rows, 1):
             text += f"{i}. {row['name']} — {row['points']} очков\n"
 
@@ -48,3 +49,4 @@ async def show_sport_rating(callback: CallbackQuery):
     ])
     await callback.message.edit_text(text, reply_markup=kb)
     await callback.answer()
+

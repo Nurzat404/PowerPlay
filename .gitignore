@@ -1,7 +1,11 @@
 __pycache__/
 *.pyc
 .env
-powerplay.db
+razryad_arena.db
 .venv/
 venv/
 config.py
+temp/
+README_FOR_AI.md
+scripts/
+.editorconfig

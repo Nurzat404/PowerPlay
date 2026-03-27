@@ -4,9 +4,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery
 import json
-from utils import get_all_sports
-from database import get_connection
-from utils import get_user, get_or_create_user, update_user
+from razryad_arena_utils import get_all_sports, get_user, get_or_create_user, update_user
 from keyboards import main_menu_keyboard, sports_choice_keyboard
 
 router = Router()
@@ -20,9 +18,6 @@ class Registration(StatesGroup):
     sports = State()
 
 
-SPORTS_LIST = ["CS2", "Brawl Stars", "Basketball"]
-
-
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     telegram_id = message.from_user.id
@@ -34,7 +29,7 @@ async def cmd_start(message: Message, state: FSMContext):
 
     if not user['email']:
         await state.set_state(Registration.name)
-        await message.answer("Добро пожаловать в PowerPlay! Давай зарегистрируемся.\nКак тебя зовут?")
+        await message.answer("Добро пожаловать в Разряд-Арена! Давай зарегистрируемся.\nКак тебя зовут?")
     else:
         await message.answer("Главное меню:", reply_markup=main_menu_keyboard())
 
@@ -91,8 +86,11 @@ async def reg_sports_choice(callback: CallbackQuery, state: FSMContext):
     else:
         selected.append(sport)
     await state.update_data(selected_sports=selected)
-    await callback.answer(f"Выбрано: {', '.join(selected) if selected else 'ничего'}")
-    await callback.message.edit_reply_markup(reply_markup=sports_choice_keyboard(SPORTS_LIST, selected))
+    sports = get_all_sports()
+    sports_map = {item["name"]: item["display_name"] for item in sports}
+    selected_display = [sports_map.get(item, item) for item in selected]
+    await callback.answer(f"Выбрано: {', '.join(selected_display) if selected_display else 'ничего'}")
+    await callback.message.edit_reply_markup(reply_markup=sports_choice_keyboard(sports, selected))
 
 
 @router.callback_query(Registration.sports, F.data == "sport_done")
@@ -113,6 +111,7 @@ async def reg_sports_done(callback: CallbackQuery, state: FSMContext):
     )
 
     await state.clear()
-    await callback.message.edit_text("Регистрация завершена! Добро пожаловать в PowerPlay.")
+    await callback.message.edit_text("Регистрация завершена! Добро пожаловать в Разряд-Арена.")
     await callback.message.answer("Главное меню:", reply_markup=main_menu_keyboard())
     await callback.answer()
+

@@ -1,5 +1,6 @@
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from razryad_arena_utils import get_sport_display_name
 
 
 def main_menu_keyboard():
@@ -123,11 +124,24 @@ def back_to_tournament_keyboard(tournament_id):
     return builder.as_markup()
 
 
-def choose_team_keyboard(teams, tournament_id):
+def choose_team_keyboard(teams, tournament_id, offset=0, page_size=10):
     builder = InlineKeyboardBuilder()
-    for team in teams:
+    total = len(teams)
+    teams_slice = teams[offset:offset + page_size]
+    for team in teams_slice:
         builder.button(
             text=team['name'], callback_data=f"tourn_apply_team_{team['id']}_{tournament_id}")
+
+    nav = []
+    if offset > 0:
+        nav.append(InlineKeyboardButton(
+            text="◀️", callback_data=f"apply_page_{tournament_id}_{offset-page_size}"))
+    if offset + page_size < total:
+        nav.append(InlineKeyboardButton(
+            text="▶️", callback_data=f"apply_page_{tournament_id}_{offset+page_size}"))
+    if nav:
+        builder.row(*nav)
+
     builder.button(text="🔙 Назад", callback_data=f"tournament_{tournament_id}")
     builder.adjust(1)
     return builder.as_markup()
@@ -144,19 +158,13 @@ def ratings_sport_keyboard(sports_list):
 
 def admin_menu_keyboard():
     kb = [
-        [InlineKeyboardButton(text="➕ Создать турнир",
-                              callback_data="admin_create_tournament")],
-        [InlineKeyboardButton(text="📋 Заявки на турниры",
-                              callback_data="admin_applications")],
-        [InlineKeyboardButton(text="➕ Создать матч",
-                              callback_data="admin_create_match")],
-        [InlineKeyboardButton(text="✏️ Ввести результат",
-                              callback_data="admin_enter_result")],
+        [InlineKeyboardButton(text="🏆 Управление турнирами",
+                              callback_data="admin_tournaments_list")],
         [InlineKeyboardButton(
             text="👥 Управление пользователями", callback_data="admin_users")],
         [InlineKeyboardButton(text="🏆 Управление рейтингом",
                               callback_data="admin_rating")],
-        [InlineKeyboardButton(text="⚙️ Удаление команд",
+        [InlineKeyboardButton(text="⚙️ Управление командами",
                               callback_data="admin_teams")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
     ]
@@ -284,7 +292,9 @@ def admin_teams_list_keyboard(teams):
     builder = InlineKeyboardBuilder()
     for team in teams:
         builder.button(
-            text=f"🗑 {team['name']}", callback_data=f"admin_delete_team_{team['id']}")
+            text=f"⚙️ {team['name']} ({get_sport_display_name(team['sport'])})",
+            callback_data=f"admin_team_manage_{team['id']}",
+        )
     builder.button(text="🔙 Назад", callback_data="admin_menu")
     builder.adjust(1)
     return builder.as_markup()
@@ -372,3 +382,4 @@ def sports_choice_keyboard_single(sports_list):
     builder.button(text="❌ Отмена", callback_data="admin_menu")
     builder.adjust(2)
     return builder.as_markup()
+

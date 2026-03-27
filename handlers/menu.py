@@ -4,11 +4,49 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
-from utils import get_user, is_admin, get_all_sports, update_user, is_email_unique, update_user_age
+from razryad_arena_utils import get_user, is_admin, get_all_sports, update_user, is_email_unique, update_user_age, update_user_steam_id, get_user_by_steam_id, get_steam_profile_name, map_sports_to_display
 from keyboards import main_menu_keyboard, back_to_main_keyboard, admin_menu_keyboard, edit_profile_menu_keyboard, cancel_keyboard, sports_choice_keyboard
+from utils.steam_utils import parse_steam_link, validate_steam_id64, get_steam_id_instructions
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = Router()
+
+
+def format_profile_text(user: dict) -> str:
+    """Форматирует текст профиля для отображения."""
+    fav_sports_raw = user['favorite_sports'] if user['favorite_sports'] else None
+    if fav_sports_raw:
+        try:
+            sports_list = json.loads(fav_sports_raw)
+            sports_display = ", ".join(map_sports_to_display(sports_list))
+        except:
+            sports_display = fav_sports_raw
+    else:
+        sports_display = "не указаны"
+
+    # Steam профиль
+    steam_display = "❌ Не указан"
+    if user['steam_id']:
+        profile_name = get_steam_profile_name(user['steam_id'])
+        if profile_name:
+            steam_display = f"{profile_name}"
+        else:
+            steam_display = "🔗 Профиль"
+        steam_display += f"\n{user['steam_id']}"
+
+    return f"""
+👤 Профиль
+Имя: {user['first_name']}
+Email: {user['email']}
+Город: {user['city']}
+Возраст: {user['age'] if user['age'] else 'не указан'}
+Любимые виды спорта: {sports_display}
+Steam: {steam_display}
+Роль: {user['role']}
+"""
 
 
 class EditProfile(StatesGroup):
@@ -17,6 +55,7 @@ class EditProfile(StatesGroup):
     waiting_city = State()
     waiting_age = State()
     waiting_sports = State()
+    waiting_steam = State()
 
 
 @router.message(Command("menu"))
@@ -37,33 +76,24 @@ async def show_profile(callback: CallbackQuery):
         await callback.answer("Ошибка", show_alert=True)
         return
 
-    # Получаем строку из БД
-    fav_sports_raw = user['favorite_sports']
-    if fav_sports_raw:
-        try:
-            sports_list = json.loads(fav_sports_raw)
-            sports_display = ", ".join(sports_list)
-        except:
-            sports_display = fav_sports_raw  # если вдруг не JSON
-    else:
-        sports_display = "не указаны"
+    text = format_profile_text(user)
 
-    text = f"""
-👤 Профиль
-Имя: {user['first_name']}
-Email: {user['email']}
-Город: {user['city']}
-Возраст: {user['age'] if user['age'] else 'не указан'}
-Любимые виды спорта: {sports_display}
-Роль: {user['role']}
-    """
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Редактировать профиль",
                               callback_data="edit_profile")],
+        [InlineKeyboardButton(text="📊 Статистика",
+                              callback_data="player_stats")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
     ])
-    await callback.message.edit_text(text, reply_markup=kb)
-    await callback.answer()
+
+    try:
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+    except Exception as e:
+        if "message is not modified" in str(e):
+            # Сообщение не изменилось - просто отвечаем
+            await callback.answer()
+        else:
+            raise
 
 
 @router.message(Command("admin"))
@@ -76,9 +106,20 @@ async def cmd_admin(message: Message):
 
 @router.callback_query(F.data == "edit_profile")
 async def edit_profile_menu(callback: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Имя", callback_data="edit_name")],
+        [InlineKeyboardButton(text="✏️ Email", callback_data="edit_email")],
+        [InlineKeyboardButton(text="✏️ Город", callback_data="edit_city")],
+        [InlineKeyboardButton(text="✏️ Возраст", callback_data="edit_age")],
+        [InlineKeyboardButton(text="✏️ Любимые виды спорта",
+                              callback_data="edit_sports")],
+        [InlineKeyboardButton(
+            text="✏️ Профиль steam", callback_data="edit_steam_id")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="profile")]
+    ])
     await callback.message.edit_text(
         "Выберите, что хотите изменить:",
-        reply_markup=edit_profile_menu_keyboard()
+        reply_markup=kb
     )
     await callback.answer()
 
@@ -102,27 +143,12 @@ async def edit_name_finish(message: Message, state: FSMContext):
     update_user(message.from_user.id, first_name=new_name)
     await state.clear()
     user = get_user(message.from_user.id)
-    fav_sports_raw = user['favorite_sports']
-    if fav_sports_raw:
-        try:
-            sports_list = json.loads(fav_sports_raw)
-            sports_display = ", ".join(sports_list)
-        except:
-            sports_display = fav_sports_raw
-    else:
-        sports_display = "не указаны"
-    text = f"""
-👤 Профиль
-Имя: {user['first_name']}
-Email: {user['email']}
-Город: {user['city']}
-Возраст: {user['age'] if user['age'] else 'не указан'}
-Любимые виды спорта: {sports_display}
-Роль: {user['role']}
-    """
+    text = format_profile_text(user)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Редактировать профиль",
                               callback_data="edit_profile")],
+        [InlineKeyboardButton(text="📊 Статистика",
+                              callback_data="player_stats")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
     ])
     await message.answer(text, reply_markup=kb)
@@ -151,27 +177,12 @@ async def edit_email_finish(message: Message, state: FSMContext):
     update_user(message.from_user.id, email=new_email)
     await state.clear()
     user = get_user(message.from_user.id)
-    fav_sports_raw = user['favorite_sports']
-    if fav_sports_raw:
-        try:
-            sports_list = json.loads(fav_sports_raw)
-            sports_display = ", ".join(sports_list)
-        except:
-            sports_display = fav_sports_raw
-    else:
-        sports_display = "не указаны"
-    text = f"""
-👤 Профиль
-Имя: {user['first_name']}
-Email: {user['email']}
-Город: {user['city']}
-Возраст: {user['age'] if user['age'] else 'не указан'}
-Любимые виды спорта: {sports_display}
-Роль: {user['role']}
-    """
+    text = format_profile_text(user)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Редактировать профиль",
                               callback_data="edit_profile")],
+        [InlineKeyboardButton(text="📊 Статистика",
+                              callback_data="player_stats")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
     ])
     await message.answer(text, reply_markup=kb)
@@ -196,27 +207,12 @@ async def edit_city_finish(message: Message, state: FSMContext):
     update_user(message.from_user.id, city=new_city)
     await state.clear()
     user = get_user(message.from_user.id)
-    fav_sports_raw = user['favorite_sports']
-    if fav_sports_raw:
-        try:
-            sports_list = json.loads(fav_sports_raw)
-            sports_display = ", ".join(sports_list)
-        except:
-            sports_display = fav_sports_raw
-    else:
-        sports_display = "не указаны"
-    text = f"""
-👤 Профиль
-Имя: {user['first_name']}
-Email: {user['email']}
-Город: {user['city']}
-Возраст: {user['age'] if user['age'] else 'не указан'}
-Любимые виды спорта: {sports_display}
-Роль: {user['role']}
-    """
+    text = format_profile_text(user)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Редактировать профиль",
                               callback_data="edit_profile")],
+        [InlineKeyboardButton(text="📊 Статистика",
+                              callback_data="player_stats")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
     ])
     await message.answer(text, reply_markup=kb)
@@ -274,19 +270,12 @@ async def edit_sports_done(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     # Показываем обновлённый профиль
     user = get_user(callback.from_user.id)
-    sports_display = ", ".join(selected)
-    text = f"""
-👤 Профиль
-Имя: {user['first_name']}
-Email: {user['email']}
-Город: {user['city']}
-Возраст: {user['age'] if user['age'] else 'не указан'}
-Любимые виды спорта: {sports_display}
-Роль: {user['role']}
-    """
+    text = format_profile_text(user)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Редактировать профиль",
                               callback_data="edit_profile")],
+        [InlineKeyboardButton(text="📊 Статистика",
+                              callback_data="player_stats")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
     ])
     await callback.message.edit_text(text, reply_markup=kb)
@@ -326,34 +315,96 @@ async def edit_age_finish(message: Message, state: FSMContext):
 
     # Вместо update_user_age используем update_user
     update_user(message.from_user.id, age=new_age)
-    print(
+    logger.info(
         f"DEBUG: возраст пользователя {message.from_user.id} обновлён на {new_age}")
 
     await state.clear()
     # Показываем обновлённый профиль
     user = get_user(message.from_user.id)
-    print(f"DEBUG: после обновления возраст = {user['age']}")
-    fav_sports_raw = user['favorite_sports']
-    if fav_sports_raw:
-        try:
-            sports_list = json.loads(fav_sports_raw)
-            sports_display = ", ".join(sports_list)
-        except:
-            sports_display = fav_sports_raw
-    else:
-        sports_display = "не указаны"
-    text = f"""
-👤 Профиль
-Имя: {user['first_name']}
-Email: {user['email']}
-Город: {user['city']}
-Возраст: {user['age'] if user['age'] else 'не указан'}
-Любимые виды спорта: {sports_display}
-Роль: {user['role']}
-    """
+    logger.info(f"DEBUG: после обновления возраст = {user['age']}")
+    text = format_profile_text(user)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Редактировать профиль",
                               callback_data="edit_profile")],
+        [InlineKeyboardButton(text="📊 Статистика",
+                              callback_data="player_stats")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
+    ])
+    await message.answer(text, reply_markup=kb)
+
+
+# ========== Обработчики для редактирования SteamID ==========
+
+@router.callback_query(F.data == "edit_steam_id")
+async def edit_steam_id_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(EditProfile.waiting_steam)
+    await callback.message.edit_text(
+        "🎮 Введите ссылку на профиль Steam\n\n" +
+        "Примеры правильных ссылок:\n" +
+        "• https://steamcommunity.com/id/username\n" +
+        "• https://steamcommunity.com/profiles/76561198000000000\n\n" +
+        "Это нужно для участия в турнирах по CS2.",
+        reply_markup=cancel_keyboard()
+    )
+    await callback.answer()
+
+
+@router.message(EditProfile.waiting_steam)
+async def edit_steam_id_finish(message: Message, state: FSMContext):
+    steam_input = message.text.strip()
+
+    # Парсим ссылку
+    steam_id = parse_steam_link(steam_input)
+
+    # Если не распарсилось, пробуем взять как есть
+    if not steam_id:
+        if steam_input.isdigit() and len(steam_input) >= 17:
+            steam_id = steam_input[:17]
+
+    if not steam_id:
+        await message.answer(
+            "❌ Неверный формат ссылки на Steam.\n\n" +
+            "Примеры:\n" +
+            "• https://steamcommunity.com/id/username\n" +
+            "• https://steamcommunity.com/profiles/76561198000000000",
+            reply_markup=cancel_keyboard()
+        )
+        return
+
+    # Сохраняем как полную ссылку
+    steam_url = f"https://steamcommunity.com/profiles/{steam_id}"
+
+    # Получаем пользователя по telegram_id
+    user = get_user(message.from_user.id)
+    if not user:
+        await message.answer("❌ Ошибка: пользователь не найден", reply_markup=cancel_keyboard())
+        return
+
+    # Проверяем, не занят ли уже этот SteamID
+    existing_user = get_user_by_steam_id(steam_id)
+
+    if existing_user and existing_user['id'] != user['id']:
+        await message.answer(
+            "❌ Этот Steam профиль уже привязан к другому аккаунту.\n\n" +
+            "Используйте другой профиль или обратитесь к администратору.",
+            reply_markup=cancel_keyboard()
+        )
+        return
+
+    # Сохраняем ссылку
+    update_user(message.from_user.id, steam_id=steam_url)
+    await state.clear()
+
+    # Получаем имя профиля
+    profile_name = get_steam_profile_name(steam_url) or "Профиль Steam"
+
+    user = get_user(message.from_user.id)
+    text = format_profile_text(user)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Редактировать профиль",
+                              callback_data="edit_profile")],
+        [InlineKeyboardButton(text="📊 Статистика",
+                              callback_data="player_stats")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
     ])
     await message.answer(text, reply_markup=kb)
@@ -362,7 +413,7 @@ Email: {user['email']}
 @router.callback_query(F.data == "rules")
 async def show_rules(callback: CallbackQuery):
     rules_text = """
-📜 Правила проекта PowerPlay
+📜 Правила проекта Разряд-Арена
 
 1. Общие положения
    - Платформа создана для организации любительских турниров и общения игроков.

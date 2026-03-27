@@ -2,14 +2,15 @@ from aiogram import Router, F
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from database import get_connection
-from utils import (
+from razryad_arena_utils import (
     get_user, get_user_teams, get_tournaments_by_sport, get_tournament_by_id,
     add_tournament_application, get_all_sports, get_team_application,
-    get_approved_teams_count, get_tournament_teams, is_admin, get_team_members_count, can_retry_tournament_application, get_team_by_id, get_team_members
+    get_approved_teams_count, get_tournament_teams, is_admin, get_team_members_count, can_retry_tournament_application, get_team_by_id, get_team_members, is_captain,
+    get_sport_display_name, normalize_sport_name
 )
 from keyboards import (
     tournaments_main_keyboard, tournaments_list_keyboard,
-    choose_team_keyboard, back_to_main_keyboard, back_to_tournament_keyboard
+    choose_team_keyboard, back_to_tournament_keyboard
 )
 
 router = Router()
@@ -25,15 +26,16 @@ async def tournaments_main(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("tournament_sport_"))
 async def list_sport_tournaments(callback: CallbackQuery):
     sport = callback.data.replace("tournament_sport_", "")
+    sport_display = get_sport_display_name(sport)
     tournaments = get_tournaments_by_sport(sport)
     if not tournaments:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔙 К выбору спорта",
                                   callback_data="tournaments")]
         ])
-        await callback.message.edit_text(f"Турниров по {sport} пока нет.", reply_markup=kb)
+        await callback.message.edit_text(f"Турниров по {sport_display} пока нет.", reply_markup=kb)
     else:
-        await callback.message.edit_text(f"Турниры по {sport}:", reply_markup=tournaments_list_keyboard(tournaments, sport))
+        await callback.message.edit_text(f"Турниры по {sport_display}:", reply_markup=tournaments_list_keyboard(tournaments, sport))
     await callback.answer()
 
 
@@ -64,30 +66,28 @@ async def view_tournament(callback: CallbackQuery):
 
     user = get_user(callback.from_user.id)
     teams = get_user_teams(user['id']) if user else []
-    approved_count = get_approved_teams_count(tournament_id)
 
-    # Проверяем, может ли пользователь подать заявку
+    # Кнопка "Подать заявку" доступна только капитану команды нужного спорта.
     can_apply = False
-    if user:
+    if user and tournament['status'] == 'registration':
         for team in teams:
-            if team['sport'] == tournament['sport']:
-                status = get_team_application(tournament_id, team['id'])
-                if status is None and approved_count < tournament['max_teams']:
-                    can_apply = True
-                    break
+            if normalize_sport_name(team['sport']) == normalize_sport_name(tournament['sport']) and is_captain(user['id'], team['id']):
+                can_apply = True
+                break
 
     status_map = {
         'registration': 'Регистрация',
-        'active': 'Активен',
+        'active': 'Идёт',
         'finished': 'Завершён'
     }
     status_display = status_map.get(tournament['status'], tournament['status'])
     age_restriction = ""
     if tournament['min_age'] is not None and tournament['max_age'] is not None:
         age_restriction = f"\nВозраст: {tournament['min_age']}–{tournament['max_age']} лет"
+
     text = f"""
 🏆 {tournament['name']}
-Вид спорта: {tournament['sport']}
+Вид спорта: {get_sport_display_name(tournament['sport'])}
 Требуемый размер команды: {tournament['required_team_size']} чел.
 Город: {tournament['city']}
 Даты: {tournament['start_date']} - {tournament['end_date']}
@@ -104,16 +104,29 @@ async def view_tournament(callback: CallbackQuery):
                        callback_data=f"apply_{tournament_id}")
     builder.button(text="📋 Список команд",
                    callback_data=f"tournament_teams_{tournament_id}")
+
+    # Кнопка просмотра сетки (если сгенерирована - показывают ВСЕМ)
+    if tournament['bracket_generated']:
+        builder.button(text="📊 Турнирная сетка",
+                       callback_data=f"view_bracket_{tournament_id}")
+
+    # Кнопка управления турниром (только админ)
     if user and is_admin(user['telegram_id']):
-        builder.button(text="✏️ Редактировать",
-                       callback_data=f"admin_edit_tournament_{tournament_id}")
-        builder.button(text="🗑 Удалить турнир",
-                       callback_data=f"admin_delete_tournament_{tournament_id}")
+        builder.button(text="⚙️ Управление турниром",
+                       callback_data=f"admin_tournament_manage_{tournament_id}")
+
     builder.button(
         text="🔙 Назад", callback_data=f"tournament_sport_{tournament['sport']}")
     builder.adjust(1)
 
-    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    try:
+        await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    except Exception as e:
+        if "there is no text" in str(e):
+            # Если сообщение содержит фото, отправляем новое
+            await callback.message.answer(text, reply_markup=builder.as_markup())
+        else:
+            raise
     await callback.answer()
 
 
@@ -128,10 +141,13 @@ async def apply_with_team(callback: CallbackQuery):
         await callback.answer("Турнир не найден", show_alert=True)
         return
 
-    # Проверка лимита команд (должна выполняться в любом случае)
-    approved_count = get_approved_teams_count(tournament_id)
-    if approved_count >= tournament['max_teams']:
-        await callback.answer("❌ Все места в турнире уже заняты.", show_alert=True)
+    user = get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("Сначала зарегистрируйтесь", show_alert=True)
+        return
+
+    if tournament['status'] != 'registration':
+        await callback.answer("❌ Подача заявок закрыта: турнир уже не в стадии регистрации.", show_alert=True)
         return
 
     team = get_team_by_id(team_id)
@@ -139,9 +155,18 @@ async def apply_with_team(callback: CallbackQuery):
         await callback.answer("Команда не найдена", show_alert=True)
         return
 
-    user = get_user(callback.from_user.id)
-    if not user:
-        await callback.answer("Сначала зарегистрируйтесь", show_alert=True)
+    if normalize_sport_name(team['sport']) != normalize_sport_name(tournament['sport']):
+        await callback.answer("❌ Эта команда не подходит по виду спорта турнира.", show_alert=True)
+        return
+
+    if not is_captain(user['id'], team_id):
+        await callback.answer("❌ Подать заявку может только капитан команды.", show_alert=True)
+        return
+
+    # Проверка лимита команд (должна выполняться в любом случае)
+    approved_count = get_approved_teams_count(tournament_id)
+    if approved_count >= tournament['max_teams']:
+        await callback.answer("❌ Все места в турнире уже заняты.", show_alert=True)
         return
 
     # Получаем информацию о существующей заявке
@@ -175,14 +200,17 @@ async def apply_with_team(callback: CallbackQuery):
                                              reply_markup=back_to_tournament_keyboard(tournament_id))
             return
     else:
-        # НОВАЯ ЗАЯВКА – проверяем размер и возраст
+        # НОВАЯ ЗАЯВКА – проверяем размер, возраст и SteamID
         current_size = get_team_members_count(team_id)
         if current_size != tournament['required_team_size']:
             await callback.answer(f"❌ В вашей команде {current_size} чел., а требуется {tournament['required_team_size']}.", show_alert=True)
             return
+
         members = get_team_members(team_id)
         problems = []
+
         for member in members:
+            # Проверка возраста
             age = member['age']
             if age is None:
                 problems.append(
@@ -191,6 +219,12 @@ async def apply_with_team(callback: CallbackQuery):
                 if age < tournament['min_age'] or age > tournament['max_age']:
                     problems.append(
                         f"❌ {member['first_name']} (@{member['username']}) имеет возраст {age}, требуется {tournament['min_age']}-{tournament['max_age']}.")
+
+            # Проверка SteamID (только для CS2)
+            if normalize_sport_name(tournament['sport']) == 'CS2':
+                if not member['steam_id']:
+                    problems.append(
+                        f"❌ {member['first_name']} (@{member['username']}) не указал свой Steam профиль. Необходимо для участия в CS2 турнире.")
 
         if problems:
             await callback.answer("\n".join(problems), show_alert=True)
@@ -201,33 +235,70 @@ async def apply_with_team(callback: CallbackQuery):
         await callback.answer("✅ Заявка отправлена!", show_alert=True)
         await callback.message.edit_text("Заявка отправлена! Ожидайте подтверждения администратора.",
                                          reply_markup=back_to_tournament_keyboard(tournament_id))
-        await callback.answer()
 
 
-@router.callback_query(F.data.startswith("apply_"))
-async def apply_to_tournament(callback: CallbackQuery):
-    tournament_id = int(callback.data.split("_")[1])
+async def _build_apply_teams_context(callback: CallbackQuery, tournament_id: int):
     user = get_user(callback.from_user.id)
     if not user:
-        await callback.answer("Сначала зарегистрируйся", show_alert=True)
-        return
+        return None, None, None, "Сначала зарегистрируйся"
 
     tournament = get_tournament_by_id(tournament_id)
     if not tournament:
-        await callback.answer("Турнир не найден", show_alert=True)
-        return
+        return None, None, None, "Турнир не найден"
 
-    # Все команды пользователя по данному спорту (даже неподходящие)
-    teams = [t for t in get_user_teams(
-        user['id']) if t['sport'] == tournament['sport']]
+    if tournament['status'] != 'registration':
+        return None, None, None, "❌ Подача заявок закрыта: турнир уже не в стадии регистрации."
+
+    # Только команды нужного спорта, где пользователь капитан.
+    teams = [
+        t for t in get_user_teams(user['id'])
+        if normalize_sport_name(t['sport']) == normalize_sport_name(tournament['sport']) and is_captain(user['id'], t['id'])
+    ]
     if not teams:
-        await callback.answer("У вас нет команды по этому виду спорта", show_alert=True)
+        return None, None, None, "❌ У вас нет команды по этому виду спорта, где вы капитан."
+
+    # Проверяем лимит команд в турнире
+    approved_count = get_approved_teams_count(tournament_id)
+    if approved_count >= tournament['max_teams']:
+        return None, None, None, f"❌ Достигнуто максимальное количество команд в турнире ({tournament['max_teams']})."
+
+    return user, tournament, teams, None
+
+
+@router.callback_query(F.data.startswith("apply_page_"))
+async def apply_teams_page(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    tournament_id = int(parts[2])
+    offset = int(parts[3])
+
+    _, _, teams, error = await _build_apply_teams_context(callback, tournament_id)
+    if error:
+        await callback.answer(error, show_alert=True)
         return
 
-    # Показываем список всех этих команд (без фильтрации)
+    # Показываем список команд капитана (без дополнительной фильтрации по статусам заявок).
+    total = len(teams)
+    safe_offset = max(0, min(offset, max(total - 1, 0)))
+    safe_offset = (safe_offset // 10) * 10
     await callback.message.edit_text(
         "Выберите команду для участия:",
-        # используем существующую клавиатуру
-        reply_markup=choose_team_keyboard(teams, tournament_id)
+        reply_markup=choose_team_keyboard(teams, tournament_id, offset=safe_offset, page_size=10)
     )
     await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^apply_\d+$"))
+async def apply_to_tournament(callback: CallbackQuery):
+    """Показывает список команд пользователя по спорту, где он капитан."""
+    tournament_id = int(callback.data.split("_")[1])
+    _, _, teams, error = await _build_apply_teams_context(callback, tournament_id)
+    if error:
+        await callback.answer(error, show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "Выберите команду для участия:",
+        reply_markup=choose_team_keyboard(teams, tournament_id, offset=0, page_size=10)
+    )
+    await callback.answer()
+

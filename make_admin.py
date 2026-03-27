@@ -1,24 +1,32 @@
-import sqlite3
-import os
+﻿import sqlite3
 from pathlib import Path
 
-# Определяем путь к базе (как в database.py)
-if Path('/app/data').exists():
-    DB_PATH = Path('/app/data') / 'powerplay.db'
-else:
-    DB_PATH = Path('.') / 'powerplay.db'
+DB_NAME = "razryad_arena.db"
 
-conn = sqlite3.connect(str(DB_PATH))
-cursor = conn.cursor()
 
-# Замени ID на свой Telegram ID (можно узнать у @userinfobot)
-telegram_id = 2144911894  # ⬅️ поставь свой числовой ID
+def resolve_db_path() -> Path:
+    data_dir = Path('/app/data') if Path('/app/data').exists() else Path('.')
+    return data_dir / DB_NAME
 
-cursor.execute(
-    "UPDATE users SET role='admin' WHERE telegram_id=?", (telegram_id,))
-if cursor.rowcount == 0:
-    print("❌ Пользователь с таким telegram_id не найден. Сначала зарегистрируйся в боте.")
-else:
-    print("✅ Роль обновлена на admin.")
-conn.commit()
-conn.close()
+
+def main() -> int:
+    db_path = resolve_db_path()
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.cursor()
+        telegram_id = 2144911894  # Set your numeric Telegram ID here
+        cursor.execute("UPDATE users SET role='admin' WHERE telegram_id=?", (telegram_id,))
+        if cursor.rowcount == 0:
+            print("User with this telegram_id was not found. Register in the bot first.")
+            conn.commit()
+            return 1
+
+        print("Role was updated to admin.")
+        conn.commit()
+        return 0
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

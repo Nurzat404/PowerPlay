@@ -6,8 +6,9 @@ from aiogram.types import CallbackQuery, Message
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 import json
+import logging
 from database import get_connection
-from utils import (
+from razryad_arena_utils import (
     get_user, get_user_teams, is_captain, get_team_by_id, get_team_members,
     get_user_by_username, is_team_member, has_pending_invite,
     create_invite, accept_invite, reject_invite, get_user_by_id, get_all_sports,
@@ -16,7 +17,8 @@ from utils import (
     get_team_requests, get_team_requests_count, has_pending_request,
     accept_request, reject_request,
     search_teams_by_name, search_teams_count, get_team_invite_status,
-    get_teams_by_sport, get_teams_count_by_sport, get_team_members_count, get_team_max_members, update_team_max_members
+    get_teams_by_sport, get_teams_count_by_sport, get_team_members_count, get_team_max_members, update_team_max_members,
+    get_sport_display_name, map_sports_to_display
 )
 from keyboards import (
     teams_list_keyboard, team_management_extended_keyboard, main_menu_keyboard,
@@ -25,6 +27,8 @@ from keyboards import (
     team_requests_keyboard, teams_sports_filter_keyboard, sports_choice_keyboard_no_done,
     team_view_search_keyboard, input_number_keyboard, back_to_teams_menu_keyboard, choose_new_captain_keyboard
 )
+
+logger = logging.getLogger(__name__)
 
 
 async def get_team_card_data(team_id: int, user_id: int):
@@ -46,10 +50,11 @@ async def get_team_card_data(team_id: int, user_id: int):
     captain = get_user_by_id(team['captain_id'])
     captain_name = f"{captain['first_name']} (@{captain['username']})" if captain else "Неизвестно"
     settings = get_team_settings(team_id)
+    sport_display = get_sport_display_name(team['sport'])
 
     text = f"""
 Команда: {team['name']}
-Вид спорта: {team['sport']}
+Вид спорта: {sport_display}
 Город: {team['city']}
 Капитан: {captain_name}
 Участников: {members_count} / {max_members}
@@ -374,7 +379,7 @@ async def confirm_leave_handler(callback: CallbackQuery, state: FSMContext):
                     f"Вы стали капитаном команды «{get_team_by_id(team_id)['name']}», так как прошлый капитан покинул ее!"
                 )
             except Exception as e:
-                print(f"Не удалось уведомить нового капитана: {e}")
+                logger.info(f"Не удалось уведомить нового капитана: {e}")
 
         await state.clear()
         await callback.message.edit_text("Вы передали капитанство и покинули команду.")
@@ -584,7 +589,7 @@ async def add_player_username(message: Message, state: FSMContext):
         text, kb = await get_team_card_data(team_id, message.from_user.id)
         await message.answer(text, reply_markup=kb)
     except Exception as e:
-        print(f"Ошибка отправки сообщения: {e}")
+        logger.info(f"Ошибка отправки сообщения: {e}")
         conn = get_connection()
         cur = conn.cursor()
         cur.execute("DELETE FROM team_invites WHERE team_id=? AND user_id=?",
@@ -675,16 +680,17 @@ async def filter_all_teams_by_sport(callback: CallbackQuery):
 
 
 async def show_all_teams_page(message, sport, offset, edit=False):
+    sport_display = get_sport_display_name(sport)
     teams = get_teams_by_sport(sport, only_open=False, offset=offset, limit=10)
     total = get_teams_count_by_sport(sport, only_open=False)
     if not teams:
-        text = f"Команд по виду спорта {sport} пока нет."
+        text = f"Команд по виду спорта {sport_display} пока нет."
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔙 К выбору спорта",
                                   callback_data="teams_list_all")]
         ])
     else:
-        text = f"Команды по {sport}:"
+        text = f"Команды по {sport_display}:"
         builder = InlineKeyboardBuilder()
         for team in teams:
             builder.button(
@@ -725,16 +731,17 @@ async def filter_open_teams_by_sport(callback: CallbackQuery):
 
 
 async def show_open_teams_page(message, sport, offset, edit=False):
+    sport_display = get_sport_display_name(sport)
     teams = get_teams_by_sport(sport, only_open=True, offset=offset, limit=10)
     total = get_teams_count_by_sport(sport, only_open=True)
     if not teams:
-        text = f"Открытых команд по виду спорта {sport} пока нет."
+        text = f"Открытых команд по виду спорта {sport_display} пока нет."
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔙 К выбору спорта",
                                   callback_data="teams_list_open")]
         ])
     else:
-        text = f"Открытые команды по {sport}:"
+        text = f"Открытые команды по {sport_display}:"
         builder = InlineKeyboardBuilder()
         for team in teams:
             builder.button(
@@ -788,9 +795,10 @@ async def view_all_team(callback: CallbackQuery):
     members_list = "\n".join(members_list_lines)
     settings = get_team_settings(team_id)
     sport = team['sport']
+    sport_display = get_sport_display_name(sport)
     text = f"""
 Команда: {team['name']}
-Вид спорта: {team['sport']}
+Вид спорта: {sport_display}
 Город: {team['city']}
 Капитан: {captain_name}
 Участников: {members_count} / {max_members}
@@ -833,10 +841,11 @@ async def view_open_team(callback: CallbackQuery):
     is_member = is_team_member(user['id'], team_id)
     has_request = has_pending_request(user['id'], team_id)
     can_apply = not is_member and not has_request and settings['is_open']
+    sport_display = get_sport_display_name(team['sport'])
 
     text = f"""
 Команда: {team['name']}
-Вид спорта: {team['sport']}
+Вид спорта: {sport_display}
 Город: {team['city']}
 Капитан: {captain_name}
 Участников: {members_count} / {max_members}
@@ -937,10 +946,11 @@ async def view_search_team(callback: CallbackQuery):
     is_member = is_team_member(user['id'], team_id)
     has_request = has_pending_request(user['id'], team_id)
     can_apply = not is_member and not has_request and settings['is_open']
+    sport_display = get_sport_display_name(team['sport'])
 
     text = f"""
 Команда: {team['name']}
-Вид спорта: {team['sport']}
+Вид спорта: {sport_display}
 Город: {team['city']}
 Капитан: {captain_name}
 Участников: {members_count} / {max_members}
@@ -1007,7 +1017,7 @@ async def apply_to_team(callback: CallbackQuery):
     if settings['notify']:
         fav_sports = json.loads(
             user['favorite_sports']) if user['favorite_sports'] else []
-        sports_str = ", ".join(fav_sports) if fav_sports else "не указаны"
+        sports_str = ", ".join(map_sports_to_display(fav_sports)) if fav_sports else "не указаны"
         age_str = f"{user['age']} лет" if user['age'] else "не указан"
         text = (
             f"📩 Новая заявка на вступление в команду «{team['name']}»!\n\n"
@@ -1026,10 +1036,10 @@ async def apply_to_team(callback: CallbackQuery):
             try:
                 await callback.bot.send_message(captain['telegram_id'], text, reply_markup=kb)
             except Exception as e:
-                print(
+                logger.info(
                     f"Не удалось отправить уведомление капитану {captain['telegram_id']}: {e}")
         else:
-            print(f"Капитан с id {team['captain_id']} не найден")
+            logger.info(f"Капитан с id {team['captain_id']} не найден")
 
         await callback.answer("Заявка отправлена! Ожидайте решения капитана.", show_alert=True)
         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1110,7 +1120,7 @@ async def accept_request_handler(callback: CallbackQuery):
         await callback.bot.send_message(user['telegram_id'],
                                         f"✅ Ваша заявка в команду «{team['name']}» принята! Теперь вы в составе.")
     except Exception as e:
-        print(f"Не удалось отправить уведомление игроку {user_id}: {e}")
+        logger.info(f"Не удалось отправить уведомление игроку {user_id}: {e}")
 
     await callback.answer("Заявка принята!", show_alert=True)
     await show_team_requests_page(callback.message, team_id, 0, edit=True)
@@ -1148,7 +1158,7 @@ async def reject_request_handler(callback: CallbackQuery):
         await callback.bot.send_message(user['telegram_id'],
                                         f"❌ Ваша заявка в команду «{team['name']}» отклонена.")
     except Exception as e:
-        print(f"Не удалось отправить уведомление игроку {user_id}: {e}")
+        logger.info(f"Не удалось отправить уведомление игроку {user_id}: {e}")
 
     await callback.answer("Заявка отклонена!", show_alert=True)
     await show_team_requests_page(callback.message, team_id, 0, edit=True)
