@@ -629,17 +629,48 @@ def draw_tournament_bracket(teams: list, tournament_name: str, round_names: list
     # -------------------------------------------------------------------------
     # 5. Отрисовка заголовка турнира
     # -------------------------------------------------------------------------
-    title_bbox = draw.textbbox((0, 0), tournament_name, font=font_title)
+    title_text = (tournament_name or "Турнир").strip() or "Турнир"
+    max_title_width = canvas_width - 120
+
+    # Подбираем размер шрифта, чтобы заголовок влезал в холст.
+    title_font_size = FONT_SIZE_TITLE
+    font_title = get_font(title_font_size, bold=True)
+    title_bbox = draw.textbbox((0, 0), title_text, font=font_title)
     title_width = title_bbox[2] - title_bbox[0]
+
+    while title_width > max_title_width and title_font_size > 18:
+        title_font_size -= 2
+        font_title = get_font(title_font_size, bold=True)
+        title_bbox = draw.textbbox((0, 0), title_text, font=font_title)
+        title_width = title_bbox[2] - title_bbox[0]
+
+    # Если даже минимальный размер не влезает — обрезаем с многоточием.
+    if title_width > max_title_width:
+        ellipsis = "..."
+        trimmed = title_text
+        while trimmed:
+            candidate = trimmed + ellipsis
+            candidate_width = draw.textbbox((0, 0), candidate, font=font_title)[2]
+            if candidate_width <= max_title_width:
+                title_text = candidate
+                title_width = candidate_width
+                break
+            trimmed = trimmed[:-1]
+
+        if not trimmed:
+            title_text = ellipsis
+            title_width = draw.textbbox((0, 0), title_text, font=font_title)[2]
+
+    title_bbox = draw.textbbox((0, 0), title_text, font=font_title)
+    title_width = title_bbox[2] - title_bbox[0]
+    title_height = title_bbox[3] - title_bbox[1]
     title_x = (canvas_width - title_width) // 2
     title_y = 40
-    draw.text((title_x, title_y), tournament_name,
-              fill=TITLE_COLOR, font=font_title)
+    draw.text((title_x, title_y), title_text, fill=TITLE_COLOR, font=font_title)
 
     # Декоративная линия под заголовком
-    line_y = title_y + FONT_SIZE_TITLE + 15
-    draw.line([(50, line_y), (canvas_width - 50, line_y)],
-              fill=LINE_COLOR, width=2)
+    line_y = title_y + title_height + 15
+    draw.line([(50, line_y), (canvas_width - 50, line_y)], fill=LINE_COLOR, width=2)
 
     # -------------------------------------------------------------------------
     # 6. Расчёт позиций раундов
@@ -1145,4 +1176,6 @@ def calculate_match_y_db(round_num: int, match_num: int, base_start_y: int,
             y_bottom = int(group_center_y + BOX_H / 2 + PAIR_GAP / 2)
 
     return y_top, y_bottom
+
+
 
