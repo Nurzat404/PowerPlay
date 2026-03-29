@@ -871,9 +871,37 @@ def init_db():
                 if 'steam_id' not in columns:
                     cur.execute(
                         "ALTER TABLE users ADD COLUMN steam_id TEXT")
-                    logger.info("Поле steam_id добавлено в таблицу users")
+                    logger.info("???? steam_id ????????? ? ??????? users")
 
-                # Полностью удаляем Brawl Stars из проекта и связанных данных.
+                # Нормализуем старые numeric SteamID в канонический URL
+                cur.execute("""
+                    UPDATE users
+                    SET steam_id = 'https://steamcommunity.com/profiles/' || substr(TRIM(steam_id), 1, 17)
+                    WHERE steam_id IS NOT NULL
+                      AND TRIM(steam_id) <> ''
+                      AND TRIM(steam_id) NOT LIKE 'https://steamcommunity.com/profiles/%'
+                      AND TRIM(steam_id) NOT GLOB '*[^0-9]*'
+                      AND LENGTH(TRIM(steam_id)) >= 17
+                """)
+                cur.execute("""
+                    UPDATE users
+                    SET steam_id = RTRIM(TRIM(steam_id), '/')
+                    WHERE steam_id LIKE 'https://steamcommunity.com/profiles/%/'
+                """)
+
+                # Обеспечиваем уникальность Steam-профиля на уровне БД
+                try:
+                    cur.execute("""
+                        CREATE UNIQUE INDEX IF NOT EXISTS idx_users_steam_id_unique
+                        ON users(steam_id)
+                        WHERE steam_id IS NOT NULL AND TRIM(steam_id) <> ''
+                    """)
+                except sqlite3.IntegrityError:
+                    logger.warning(
+                        "Не удалось создать unique-индекс steam_id: уже есть дубли. "
+                        "Новые дубли блокируются проверкой в коде."
+                    )
+
                 _purge_removed_sport(cur, "Brawl Stars")
                 _cleanup_user_favorite_sports(cur, {"Brawl Stars"})
 

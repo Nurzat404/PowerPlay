@@ -9,6 +9,7 @@ from keyboards import main_menu_keyboard, back_to_main_keyboard, admin_menu_keyb
 from utils.steam_utils import parse_steam_link, validate_steam_id64, get_steam_id_instructions
 import json
 import logging
+import sqlite3
 
 logger = logging.getLogger(__name__)
 
@@ -392,7 +393,16 @@ async def edit_steam_id_finish(message: Message, state: FSMContext):
         return
 
     # Сохраняем ссылку
-    update_user(message.from_user.id, steam_id=steam_url)
+    try:
+        update_user(message.from_user.id, steam_id=steam_url)
+    except (ValueError, sqlite3.IntegrityError):
+        await message.answer(
+            "❌ Этот Steam профиль уже привязан к другому аккаунту.\n\n" +
+            "Используйте другой профиль или обратитесь к администратору.",
+            reply_markup=cancel_keyboard()
+        )
+        return
+
     await state.clear()
 
     # Получаем имя профиля

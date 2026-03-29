@@ -1389,11 +1389,43 @@ def create_third_place_bracket_match(tournament_id: int, team1_id: int, team2_id
     conn.close()
 
 
+def _steam_lookup_variants(steam_value: str):
+    """Формирует варианты одного Steam-профиля (id/url) для поиска дублей."""
+    if not steam_value:
+        return []
+
+    raw = steam_value.strip().rstrip('/')
+    variants = []
+    if raw:
+        variants.append(raw)
+
+    steam_id64 = None
+    if raw.isdigit() and len(raw) >= 17:
+        steam_id64 = raw[:17]
+    elif '/profiles/' in raw:
+        part = raw.split('/profiles/', 1)[1].split('/', 1)[0].strip()
+        if part.isdigit() and len(part) >= 17:
+            steam_id64 = part[:17]
+
+    if steam_id64:
+        canonical = f"https://steamcommunity.com/profiles/{steam_id64}"
+        for item in (steam_id64, canonical):
+            if item not in variants:
+                variants.append(item)
+
+    return variants
+
+
 def get_user_by_steam_id(steam_id: str):
-    """Находит пользователя по SteamID64."""
+    """Ищет пользователя по SteamID64/ссылке с учетом разных форматов хранения."""
+    variants = _steam_lookup_variants(steam_id)
+    if not variants:
+        return None
+
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE steam_id=?", (steam_id,))
+    placeholders = ','.join(['?'] * len(variants))
+    cur.execute(f"SELECT * FROM users WHERE steam_id IN ({placeholders}) LIMIT 1", tuple(variants))
     user = cur.fetchone()
     conn.close()
     return user
@@ -1414,10 +1446,27 @@ def get_users_without_steam_id():
 
 
 def update_user_steam_id(user_id: int, steam_id: str):
-    """Обновляет SteamID пользователя (ссылку на профиль)."""
+    """Обновляет Steam-профиль пользователя с защитой от дублей."""
+    normalized = (steam_id or '').strip()
+    if normalized.isdigit() and len(normalized) >= 17:
+        normalized = f"https://steamcommunity.com/profiles/{normalized[:17]}"
+
+    variants = _steam_lookup_variants(normalized)
+
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE users SET steam_id=? WHERE id=?", (steam_id, user_id))
+
+    if variants:
+        placeholders = ','.join(['?'] * len(variants))
+        cur.execute(
+            f"SELECT id FROM users WHERE steam_id IN ({placeholders}) AND id<>? LIMIT 1",
+            (*variants, user_id),
+        )
+        if cur.fetchone():
+            conn.close()
+            raise ValueError('steam_id_taken')
+
+    cur.execute("UPDATE users SET steam_id=? WHERE id=?", (normalized, user_id))
     conn.commit()
     conn.close()
 
