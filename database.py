@@ -871,7 +871,7 @@ def init_db():
                 if 'steam_id' not in columns:
                     cur.execute(
                         "ALTER TABLE users ADD COLUMN steam_id TEXT")
-                    logger.info("???? steam_id ????????? ? ??????? users")
+                    logger.info("Поле steam_id добавлено в таблицу users")
 
                 # Нормализуем старые numeric SteamID в канонический URL
                 cur.execute("""
