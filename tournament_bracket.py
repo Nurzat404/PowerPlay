@@ -1,4 +1,4 @@
-"""
+﻿"""
 Генератор турнирных сеток (bracket) для олимпийской системы (плей-офф).
 Поддерживает нечётное количество участников с автоматическим добавлением "BYE".
 
@@ -61,23 +61,80 @@ SHADOW_OFFSET = 4     # Смещение тени блоков
 
 def get_font(size: int, bold: bool = False, italic: bool = False):
     """
-    Получение шрифта заданного размера.
-    Пытается загрузить Arial, при неудаче использует дефолтный.
-    """
-    font_name = "arial.ttf"
-    if bold:
-        font_name = "arialbd.ttf"
-    elif italic:
-        font_name = "ariali.ttf"
+    Возвращает шрифт нужного размера с надёжной поддержкой кириллицы.
 
+    Приоритет:
+    1) Локальные шрифты проекта (assets/fonts, fonts)
+    2) Системные шрифты (Linux/Windows)
+    3) Шрифты из пакета Pillow
+    4) PIL default (крайний fallback)
+    """
+    from pathlib import Path
+
+    # Варианты файлов шрифтов для разных стилей.
+    if bold:
+        candidates = [
+            "arialbd.ttf",
+            "DejaVuSans-Bold.ttf",
+            "NotoSans-Bold.ttf",
+            "FreeSansBold.ttf",
+        ]
+    elif italic:
+        candidates = [
+            "ariali.ttf",
+            "DejaVuSans-Oblique.ttf",
+            "NotoSans-Italic.ttf",
+            "FreeSansOblique.ttf",
+        ]
+    else:
+        candidates = [
+            "arial.ttf",
+            "DejaVuSans.ttf",
+            "NotoSans-Regular.ttf",
+            "NotoSans.ttf",
+            "FreeSans.ttf",
+        ]
+
+    project_root = Path(__file__).resolve().parent
+    search_dirs = [
+        project_root / "assets" / "fonts",
+        project_root / "fonts",
+        # Частые Linux-пути на хостингах
+        Path("/usr/share/fonts/truetype/dejavu"),
+        Path("/usr/share/fonts/truetype/noto"),
+        Path("/usr/share/fonts/truetype/freefont"),
+        Path("/usr/local/share/fonts"),
+    ]
+
+    # Путь к шрифтам Pillow (если присутствуют в окружении)
     try:
-        return ImageFont.truetype(font_name, size)
-    except (IOError, OSError):
-        # Если Arial недоступен, пробуем другие варианты
+        import PIL
+        search_dirs.append(Path(PIL.__file__).resolve().parent / "fonts")
+    except Exception:
+        pass
+
+    # 1) Пробуем абсолютные пути из директорий поиска.
+    for font_name in candidates:
+        for directory in search_dirs:
+            font_path = directory / font_name
+            if font_path.exists():
+                try:
+                    return ImageFont.truetype(str(font_path), size)
+                except (IOError, OSError):
+                    continue
+
+    # 2) Пробуем шрифт по имени (Windows и часть Linux окружений).
+    for font_name in candidates:
         try:
-            return ImageFont.truetype("DejaVuSans.ttf", size)
+            return ImageFont.truetype(font_name, size)
         except (IOError, OSError):
-            return ImageFont.load_default()
+            continue
+
+    # 3) Крайний fallback.
+    logger.warning(
+        "Не удалось найти TTF-шрифт с кириллицей, используется PIL default (текст может быть мелким)."
+    )
+    return ImageFont.load_default()
 
 
 def next_power_of_two(n: int) -> int:
@@ -1088,3 +1145,4 @@ def calculate_match_y_db(round_num: int, match_num: int, base_start_y: int,
             y_bottom = int(group_center_y + BOX_H / 2 + PAIR_GAP / 2)
 
     return y_top, y_bottom
+
