@@ -17,6 +17,7 @@ from razryad_arena_utils import (
     set_bracket_match_schedule, mark_bracket_schedule_notified,
     parse_msk_datetime_input, datetime_to_utc_storage, format_utc_to_msk,
     parse_utc_storage_datetime, mark_bracket_reminder_sent,
+    clear_bracket_related_data, can_create_third_place_match,
 )
 from utils.bracket_utils import generate_bracket, get_semifinal_losers
 from database import get_connection
@@ -342,6 +343,16 @@ async def admin_regenerate_bracket_confirm(callback: CallbackQuery):
         await callback.answer("Турнир не найден", show_alert=True)
         return
 
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM tournament_brackets
+        WHERE tournament_id=? AND status='completed' AND COALESCE(is_bye, 0)=0
+    """, (tournament_id,))
+    played_matches = cur.fetchone()[0]
+    conn.close()
+
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Да, перегенерировать",
               callback_data=f"confirm_regenerate_bracket_{tournament_id}")
@@ -349,9 +360,12 @@ async def admin_regenerate_bracket_confirm(callback: CallbackQuery):
               callback_data=f"admin_tournament_manage_{tournament_id}")
     kb.adjust(1)
 
+    warning = "⚠️ Старые пары сетки будут удалены и созданы заново."
+    if played_matches > 0:
+        warning += f"\n⚠️ Уже завершено матчей: {played_matches}. Эти результаты будут сброшены."
+
     await callback.message.edit_text(
-        f"Перегенерировать сетку турнира «{tournament['name']}»?\n\n"
-        f"⚠️ Старые пары сетки будут удалены и созданы заново.",
+        f"Перегенерировать сетку турнира «{tournament['name']}»?\n\n{warning}",
         reply_markup=kb.as_markup()
     )
     await callback.answer()
@@ -359,7 +373,7 @@ async def admin_regenerate_bracket_confirm(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("confirm_regenerate_bracket_"))
 async def confirm_regenerate_bracket(callback: CallbackQuery, state: FSMContext):
-    """Перегенерация сетки (только если ещё не было сыгранных матчей)."""
+    """Перегенерация сетки с предупреждением о сбросе уже сыгранных матчей."""
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
@@ -373,21 +387,9 @@ async def confirm_regenerate_bracket(callback: CallbackQuery, state: FSMContext)
         await callback.answer("Нельзя перегенерировать сетку завершённого турнира.", show_alert=True)
         return
 
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT COUNT(*)
-        FROM tournament_brackets
-        WHERE tournament_id=? AND status='completed' AND COALESCE(is_bye, 0)=0
-    """, (tournament_id,))
-    played_matches = cur.fetchone()[0]
-    conn.close()
-
-    if played_matches > 0:
-        await callback.answer(
-            "Перегенерация недоступна: в сетке уже есть сыгранные матчи.",
-            show_alert=True
-        )
+    cleanup_result = clear_bracket_related_data(tournament_id)
+    if not cleanup_result.get("ok"):
+        await callback.answer("❌ Ошибка очистки старых данных сетки", show_alert=True)
         return
 
     success = generate_bracket(tournament_id)
@@ -680,23 +682,15 @@ async def create_third_place_match_confirm(callback: CallbackQuery):
         return
 
     tournament_id = int(callback.data.split("_")[3])
-
-    semifinals = get_semifinal_matches(tournament_id)
-
-    if len(semifinals) < 2:
-        await callback.answer("Недостаточно полуфинальных матчей", show_alert=True)
-        return
-
-    for match in semifinals:
-        if match['status'] not in ('completed', 'bye'):
-            await callback.answer("Сначала завершите оба полуфинала!", show_alert=True)
-            return
-
-    matches = get_bracket_matches(tournament_id)
-    third_place_exists = any(m['round_number'] == 5 for m in matches)
-
-    if third_place_exists:
-        await callback.answer("Матч за 3-е место уже создан", show_alert=True)
+    check = can_create_third_place_match(tournament_id)
+    if not check.get('ok'):
+        reason_map = {
+            'already_exists': 'Матч за 3-е место уже создан.',
+            'not_enough_semifinals': 'Недостаточно полуфиналов для матча за 3-е место.',
+            'semifinals_not_completed': 'Сначала завершите оба полуфинала.',
+            'not_enough_losers': 'Невозможно определить двух проигравших полуфиналов.',
+        }
+        await callback.answer(reason_map.get(check.get('reason'), 'Пока нельзя создать матч за 3-е место.'), show_alert=True)
         return
 
     kb = InlineKeyboardBuilder()
@@ -721,14 +715,18 @@ async def confirm_create_third_place(callback: CallbackQuery, state: FSMContext)
         return
 
     tournament_id = int(callback.data.split("_")[3])
-
-    semifinals = get_semifinal_matches(tournament_id)
-    losers = get_semifinal_losers(semifinals)
-
-    if len(losers) < 2:
-        await callback.answer("Недостаточно проигравших", show_alert=True)
+    check = can_create_third_place_match(tournament_id)
+    if not check.get('ok'):
+        reason_map = {
+            'already_exists': 'Матч за 3-е место уже создан.',
+            'not_enough_semifinals': 'Недостаточно полуфиналов для матча за 3-е место.',
+            'semifinals_not_completed': 'Сначала завершите оба полуфинала.',
+            'not_enough_losers': 'Невозможно определить двух проигравших полуфиналов.',
+        }
+        await callback.answer(reason_map.get(check.get('reason'), 'Пока нельзя создать матч за 3-е место.'), show_alert=True)
         return
 
+    losers = check['losers']
     create_third_place_bracket_match(tournament_id, losers[0], losers[1])
 
     await callback.answer("✅ Матч за 3-е место создан!", show_alert=True)

@@ -271,6 +271,8 @@ def init_db():
                         captain_id INTEGER NOT NULL REFERENCES users(id),
                         is_open_for_requests INTEGER DEFAULT 1,
                         notify_on_requests INTEGER DEFAULT 1,
+                        invite_join_mode TEXT DEFAULT 'request',
+                        invite_enabled INTEGER DEFAULT 1,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
@@ -405,12 +407,23 @@ def init_db():
                     cur.execute(
                         "ALTER TABLE team_invites ADD COLUMN type TEXT DEFAULT 'invite'")
                 # Добавляем поле max_members в teams
+                # Миграции таблицы teams
                 cur.execute("PRAGMA table_info(teams)")
                 columns = [col[1] for col in cur.fetchall()]
                 if 'max_members' not in columns:
                     cur.execute(
                         "ALTER TABLE teams ADD COLUMN max_members INTEGER DEFAULT 5")
-                    logger.info("Поле max_members добавлено в таблицу teams (по умолчанию 5)")
+                    logger.info("Column max_members added to teams (default 5)")
+
+                if 'invite_join_mode' not in columns:
+                    cur.execute(
+                        "ALTER TABLE teams ADD COLUMN invite_join_mode TEXT DEFAULT 'request'")
+                    logger.info("Column invite_join_mode added to teams (default request)")
+
+                if 'invite_enabled' not in columns:
+                    cur.execute(
+                        "ALTER TABLE teams ADD COLUMN invite_enabled INTEGER DEFAULT 1")
+                    logger.info("Column invite_enabled added to teams (default 1)")
 
                 # Добавляем поле required_team_size в tournaments
                 cur.execute("PRAGMA table_info(tournaments)")
@@ -419,7 +432,31 @@ def init_db():
                     cur.execute(
                         "ALTER TABLE tournaments ADD COLUMN required_team_size INTEGER DEFAULT 2")
                     logger.info(
-                        "Поле required_team_size добавлено в таблицу tournaments (по умолчанию 2)")
+                        "Column required_team_size added to tournaments (default 2)")
+
+                # Инвайт-ссылки: токены команд и турниров
+                cur.execute("PRAGMA table_info(teams)")
+                columns = [col[1] for col in cur.fetchall()]
+                if 'invite_token' not in columns:
+                    cur.execute("ALTER TABLE teams ADD COLUMN invite_token TEXT")
+                    logger.info("Поле invite_token добавлено в таблицу teams")
+
+                cur.execute("PRAGMA table_info(tournaments)")
+                columns = [col[1] for col in cur.fetchall()]
+                if 'invite_token' not in columns:
+                    cur.execute("ALTER TABLE tournaments ADD COLUMN invite_token TEXT")
+                    logger.info("Поле invite_token добавлено в таблицу tournaments")
+
+                cur.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_teams_invite_token_unique
+                    ON teams(invite_token)
+                    WHERE invite_token IS NOT NULL AND TRIM(invite_token) <> ''
+                """)
+                cur.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_tournaments_invite_token_unique
+                    ON tournaments(invite_token)
+                    WHERE invite_token IS NOT NULL AND TRIM(invite_token) <> ''
+                """)
                 # Добавляем поле updated_at в team_invites (если нет)
                 cur.execute("PRAGMA table_info(team_invites)")
                 columns = [col[1] for col in cur.fetchall()]

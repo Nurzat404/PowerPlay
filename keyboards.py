@@ -59,6 +59,8 @@ def team_management_extended_keyboard(team_id, is_captain, is_open, notify_enabl
                        callback_data=f"rename_team_{team_id}")
         builder.button(text="👥 Добавить игроков",
                        callback_data=f"add_player_{team_id}")
+        builder.button(text="🔗 Ссылка приглашения",
+                       callback_data=f"team_invite_menu_{team_id}")
         builder.button(text="🗑 Удалить команду",
                        callback_data=f"delete_team_{team_id}")
         builder.button(text="📋 Заявки в команду",
@@ -162,8 +164,10 @@ def admin_menu_keyboard():
                               callback_data="admin_tournaments_list")],
         [InlineKeyboardButton(
             text="👥 Управление пользователями", callback_data="admin_users")],
-        [InlineKeyboardButton(text="🏆 Управление рейтингом",
+        [InlineKeyboardButton(text="📊 Управление рейтингом",
                               callback_data="admin_rating")],
+        [InlineKeyboardButton(text="📢 Рассылка",
+                              callback_data="admin_broadcast_start")],
         [InlineKeyboardButton(text="⚙️ Управление командами",
                               callback_data="admin_teams")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
@@ -383,3 +387,12 @@ def sports_choice_keyboard_single(sports_list):
     builder.adjust(2)
     return builder.as_markup()
 
+
+
+def subscription_required_keyboard(channel_username: str):
+    channel = (channel_username or "razryadarena").strip().lstrip("@")
+    kb = [
+        [InlineKeyboardButton(text="📢 Подписаться", url=f"https://t.me/{channel}")],
+        [InlineKeyboardButton(text="✅ Проверить подписку", callback_data="check_subscription")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)

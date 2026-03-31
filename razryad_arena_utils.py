@@ -1,5 +1,6 @@
 import json
 import os
+import secrets
 import sqlite3
 from database import get_connection
 import datetime
@@ -298,7 +299,7 @@ def exclude_team_from_tournament(app_id):
 
         cur.execute("""
             UPDATE tournament_applications
-            SET status='rejected', updated_at=CURRENT_TIMESTAMP
+            SET status='excluded', updated_at=CURRENT_TIMESTAMP
             WHERE id=? AND status='approved'
         """, (app_id,))
         if cur.rowcount == 0:
@@ -2477,3 +2478,280 @@ def finish_tournament_with_awards(tournament_id: int) -> tuple:
         return (None, None, None)
     finally:
         conn.close()
+
+
+
+def allow_reapply_excluded_application(app_id: int):
+    """Действие админа: вернуть исключённую заявку в pending."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute("""
+            SELECT a.id, a.tournament_id, a.status AS app_status, t.status AS tournament_status
+            FROM tournament_applications a
+            JOIN tournaments t ON t.id = a.tournament_id
+            WHERE a.id=?
+        """, (app_id,))
+        row = cur.fetchone()
+        if not row:
+            conn.rollback()
+            return {"ok": False, "reason": "not_found"}
+
+        tournament_id = row['tournament_id']
+        if row['tournament_status'] != 'registration':
+            conn.rollback()
+            return {"ok": False, "reason": "not_registration", "tournament_id": tournament_id}
+
+        if row['app_status'] != 'excluded':
+            conn.rollback()
+            return {"ok": False, "reason": "not_excluded", "tournament_id": tournament_id, "app_status": row['app_status']}
+
+        cur.execute("""
+            UPDATE tournament_applications
+            SET status='pending', updated_at=CURRENT_TIMESTAMP
+            WHERE id=? AND status='excluded'
+        """, (app_id,))
+        if cur.rowcount == 0:
+            conn.rollback()
+            return {"ok": False, "reason": "already_processed", "tournament_id": tournament_id}
+
+        conn.commit()
+        return {"ok": True, "tournament_id": tournament_id}
+    except sqlite3.Error:
+        conn.rollback()
+        return {"ok": False, "reason": "db_error"}
+    finally:
+        conn.close()
+
+
+def can_create_third_place_match(tournament_id: int):
+    """Проверяет, можно ли создать матч за 3-е место."""
+    matches = get_bracket_matches(tournament_id)
+    if any(m['round_number'] == 5 for m in matches):
+        return {"ok": False, "reason": "already_exists"}
+
+    semifinals = get_semifinal_matches(tournament_id)
+    if len(semifinals) < 2:
+        return {"ok": False, "reason": "not_enough_semifinals"}
+
+    for match in semifinals:
+        if match['status'] not in ('completed', 'bye'):
+            return {"ok": False, "reason": "semifinals_not_completed"}
+
+    # Локальный импорт, чтобы избежать циклического импорта при загрузке модуля
+    from utils.bracket_utils import get_semifinal_losers
+    losers = get_semifinal_losers(semifinals)
+    if len(losers) != 2:
+        return {"ok": False, "reason": "not_enough_losers", "losers": losers}
+
+    return {"ok": True, "losers": losers}
+
+
+def auto_create_third_place_if_ready(tournament_id: int):
+    """Автоматически создаёт матч за 3-е место, когда условия выполнены."""
+    check = can_create_third_place_match(tournament_id)
+    if not check.get('ok'):
+        return {"ok": False, "created": False, "reason": check.get('reason')}
+
+    losers = check['losers']
+    create_third_place_bracket_match(tournament_id, losers[0], losers[1])
+    return {"ok": True, "created": True, "losers": losers}
+
+
+def clear_bracket_related_data(tournament_id: int):
+    """Удаляет данные старой сетки турнира перед перегенерацией."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+
+        bracket_match_ids_query = "SELECT id FROM tournament_brackets WHERE tournament_id=?"
+
+        cur.execute(f"""
+            DELETE FROM player_match_stats
+            WHERE COALESCE(NULLIF(TRIM(match_source), ''), 'bracket')='bracket'
+              AND match_id IN ({bracket_match_ids_query})
+        """, (tournament_id,))
+
+        cur.execute(f"""
+            DELETE FROM match_map_results
+            WHERE COALESCE(NULLIF(TRIM(match_source), ''), 'bracket')='bracket'
+              AND match_id IN ({bracket_match_ids_query})
+        """, (tournament_id,))
+
+        cur.execute(f"""
+            DELETE FROM football_player_stats
+            WHERE COALESCE(NULLIF(TRIM(match_source), ''), 'bracket')='bracket'
+              AND match_id IN ({bracket_match_ids_query})
+        """, (tournament_id,))
+
+        cur.execute(f"""
+            DELETE FROM basketball_player_stats
+            WHERE COALESCE(NULLIF(TRIM(match_source), ''), 'bracket')='bracket'
+              AND match_id IN ({bracket_match_ids_query})
+        """, (tournament_id,))
+
+        cur.execute(f"""
+            DELETE FROM volleyball_player_stats
+            WHERE COALESCE(NULLIF(TRIM(match_source), ''), 'bracket')='bracket'
+              AND match_id IN ({bracket_match_ids_query})
+        """, (tournament_id,))
+
+        cur.execute(f"""
+            DELETE FROM volleyball_set_scores
+            WHERE COALESCE(NULLIF(TRIM(match_source), ''), 'bracket')='bracket'
+              AND match_id IN ({bracket_match_ids_query})
+        """, (tournament_id,))
+
+        conn.commit()
+        return {"ok": True}
+    except sqlite3.Error:
+        conn.rollback()
+        return {"ok": False, "reason": "db_error"}
+    finally:
+        conn.close()
+
+
+def _generate_unique_token(table_name: str, length: int = 22):
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        while True:
+            token = secrets.token_urlsafe(length)[:length]
+            cur.execute(f"SELECT id FROM {table_name} WHERE invite_token=? LIMIT 1", (token,))
+            if not cur.fetchone():
+                return token
+    finally:
+        conn.close()
+
+
+def set_team_invite_join_mode(team_id: int, mode: str):
+    """Устанавливает режим ссылки команды: request или direct."""
+    normalized = 'direct' if (mode or '').strip().lower() == 'direct' else 'request'
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE teams SET invite_join_mode=? WHERE id=?", (normalized, team_id))
+    conn.commit()
+    updated = cur.rowcount > 0
+    conn.close()
+    return updated
+
+
+def get_team_invite_join_mode(team_id: int):
+    """Возвращает режим ссылки команды: request (по умолчанию) или direct."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT invite_join_mode FROM teams WHERE id=?", (team_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return 'request'
+    value = (row['invite_join_mode'] or '').strip().lower()
+    return 'direct' if value == 'direct' else 'request'
+
+
+
+def set_team_invite_enabled(team_id: int, enabled: bool):
+    """Включает или отключает работу инвайт-ссылки команды без удаления токена."""
+    value = 1 if enabled else 0
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE teams SET invite_enabled=? WHERE id=?", (value, team_id))
+    conn.commit()
+    updated = cur.rowcount > 0
+    conn.close()
+    return updated
+
+
+def is_team_invite_enabled(team_id: int):
+    """Возвращает статус инвайт-ссылки команды (по умолчанию включена)."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT invite_enabled FROM teams WHERE id=?", (team_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return False
+    value = row['invite_enabled']
+    if value is None:
+        return True
+    return int(value) == 1
+
+def ensure_team_invite_token(team_id: int, regenerate: bool = False):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT invite_token FROM teams WHERE id=?", (team_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return None
+
+    current = (row['invite_token'] or '').strip()
+    if current and not regenerate:
+        conn.close()
+        return current
+
+    token = _generate_unique_token('teams')
+    cur.execute("UPDATE teams SET invite_token=? WHERE id=?", (token, team_id))
+    conn.commit()
+    conn.close()
+    return token
+
+
+def clear_team_invite_token(team_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE teams SET invite_token=NULL WHERE id=?", (team_id,))
+    changed = cur.rowcount
+    conn.commit()
+    conn.close()
+    return changed > 0
+
+
+def get_team_by_invite_token(token: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM teams WHERE invite_token=? AND COALESCE(invite_enabled, 1)=1", ((token or '').strip(),))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def ensure_tournament_invite_token(tournament_id: int, regenerate: bool = False):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT invite_token FROM tournaments WHERE id=?", (tournament_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return None
+
+    current = (row['invite_token'] or '').strip()
+    if current and not regenerate:
+        conn.close()
+        return current
+
+    token = _generate_unique_token('tournaments')
+    cur.execute("UPDATE tournaments SET invite_token=? WHERE id=?", (token, tournament_id))
+    conn.commit()
+    conn.close()
+    return token
+
+
+def get_tournament_by_invite_token(token: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM tournaments WHERE invite_token=?", ((token or '').strip(),))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def get_active_user_telegram_ids():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT telegram_id FROM users WHERE COALESCE(is_banned, 0)=0")
+    rows = [r['telegram_id'] for r in cur.fetchall()]
+    conn.close()
+    return rows

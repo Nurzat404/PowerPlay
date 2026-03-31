@@ -18,7 +18,8 @@ from razryad_arena_utils import (
     get_team_members_count, get_team_max_members, get_team_settings, is_captain,
     get_sport_display_name, upsert_football_player_stat, upsert_basketball_player_stat,
     upsert_volleyball_player_stat, replace_volleyball_set_scores, map_sports_to_display,
-    normalize_sport_name
+    normalize_sport_name, allow_reapply_excluded_application, ensure_tournament_invite_token,
+    get_active_user_telegram_ids
 )
 from keyboards import (
     admin_menu_keyboard, back_to_main_keyboard,
@@ -30,7 +31,6 @@ from datetime import datetime, timezone
 import logging
 
 logger = logging.getLogger(__name__)
-
 
 async def send_tournament_info(bot: Bot, chat_id: int, tournament_id: int, user_id: int):
     """Отправляет актуальную карточку турнира."""
@@ -59,6 +59,14 @@ async def send_tournament_info(bot: Bot, chat_id: int, tournament_id: int, user_
         'finished': 'Завершён'
     }
     status_display = status_map.get(tournament['status'], tournament['status'])
+    invite_token = ensure_tournament_invite_token(tournament_id, regenerate=False)
+    bot_username = ""
+    try:
+        me = await bot.get_me()
+        bot_username = me.username or ""
+    except Exception:
+        bot_username = ""
+    invite_url = f"https://t.me/{bot_username}?start=tournament_invite_{invite_token}" if (invite_token and bot_username) else "недоступно"
 
     # Возрастные ограничения
     age_text = ""
@@ -79,6 +87,7 @@ async def send_tournament_info(bot: Bot, chat_id: int, tournament_id: int, user_
 Даты: {tournament['start_date']} - {tournament['end_date']}
 Макс. команд: {tournament['max_teams']}
 Статус: {status_display}
+Инвайт-ссылка: {invite_url}
 """
     if tournament['description'] and tournament['description'] != 'нет':
         text += f"\n📝 Описание: {tournament['description']}"
@@ -108,7 +117,6 @@ async def send_tournament_info(bot: Bot, chat_id: int, tournament_id: int, user_
 router = Router()
 PAGE_SIZE = 10
 
-
 def _build_team_members_block(members):
     if not members:
         return "—"
@@ -121,7 +129,6 @@ def _build_team_members_block(members):
         lines.append(
             f"{idx}. {member['first_name']} ({username}) | возраст: {age} | steam: {steam}")
     return "\n".join(lines)
-
 
 def _build_tournament_compliance_block(tournament: dict, members: list[dict]) -> tuple[str, bool]:
     """Возвращает текст проверки и флаг полного соответствия."""
@@ -175,7 +182,6 @@ def _build_tournament_compliance_block(tournament: dict, members: list[dict]) ->
         checks.append("✅ Команда соответствует требованиям турнира")
 
     return "\n".join(checks), (not has_errors)
-
 
 def _build_admin_team_card_text(team_id: int, tournament: dict | None = None, app_status: str | None = None) -> str | None:
     team = get_team_by_id(team_id)
@@ -238,7 +244,6 @@ def _build_admin_team_card_text(team_id: int, tournament: dict | None = None, ap
 
     return text
 
-
 def _get_tournament_application_details(app_id: int):
     conn = get_connection()
     cur = conn.cursor()
@@ -254,7 +259,6 @@ def _get_tournament_application_details(app_id: int):
     conn.close()
     return app
 
-
 def _admin_team_manage_card_keyboard(team_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="🗑 Удалить",
@@ -262,7 +266,6 @@ def _admin_team_manage_card_keyboard(team_id: int) -> InlineKeyboardMarkup:
     builder.button(text="🔙 К списку", callback_data="admin_teams")
     builder.adjust(1)
     return builder.as_markup()
-
 
 def _get_tournament_capacity_info(tournament_id: int) -> tuple[int, int | None]:
     conn = get_connection()
@@ -281,7 +284,6 @@ def _get_tournament_capacity_info(tournament_id: int) -> tuple[int, int | None]:
     approved_count = cur.fetchone()[0]
     conn.close()
     return approved_count, tournament['max_teams']
-
 
 def _get_overbooked_tournaments_map(tournament_ids: list[int]) -> dict[int, dict]:
     if not tournament_ids:
@@ -316,7 +318,6 @@ def _get_overbooked_tournaments_map(tournament_ids: list[int]) -> dict[int, dict
             }
     return overbooked
 
-
 def _build_approve_error_text(result: dict) -> str:
     reason = result.get("reason")
     if reason == "limit_reached":
@@ -333,7 +334,6 @@ def _build_approve_error_text(result: dict) -> str:
         return "Заявка не найдена."
     return "Не удалось одобрить заявку. Попробуйте ещё раз."
 
-
 def _build_exclude_error_text(result: dict) -> str:
     reason = result.get("reason")
     if reason == "not_registration":
@@ -348,7 +348,6 @@ def _build_exclude_error_text(result: dict) -> str:
 
 # ---------- Создание турнира ----------
 
-
 class CreateTournament(StatesGroup):
     name = State()
     sport = State()
@@ -361,7 +360,6 @@ class CreateTournament(StatesGroup):
     max_age = State()
     description = State()
 
-
 @router.callback_query(F.data == "admin_create_tournament")
 async def admin_create_tournament_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -371,14 +369,12 @@ async def admin_create_tournament_start(callback: CallbackQuery, state: FSMConte
     await state.set_state(CreateTournament.name)
     await callback.message.edit_text("Введите название турнира:")
 
-
 @router.message(CreateTournament.name)
 async def create_tournament_name(message: Message, state: FSMContext):
     await state.update_data(name=message.text)
     await state.set_state(CreateTournament.sport)
     sports = get_all_sports()
     await message.answer("Выберите вид спорта:", reply_markup=sports_choice_keyboard_single(sports))
-
 
 @router.callback_query(CreateTournament.sport, F.data.startswith("admin_tourn_sport_"))
 async def create_tournament_sport_chosen(callback: CallbackQuery, state: FSMContext):
@@ -388,13 +384,11 @@ async def create_tournament_sport_chosen(callback: CallbackQuery, state: FSMCont
     await state.set_state(CreateTournament.city)
     await callback.message.edit_text("Введите город проведения:")
 
-
 @router.message(CreateTournament.city)
 async def create_tournament_city(message: Message, state: FSMContext):
     await state.update_data(city=message.text)
     await state.set_state(CreateTournament.start_date)
     await message.answer("Введите дату начала турнира (в формате: день и сокращённое название месяца с точкой, например : 1 янв.):")
-
 
 @router.message(CreateTournament.start_date)
 async def create_tournament_start(message: Message, state: FSMContext):
@@ -409,7 +403,6 @@ async def create_tournament_start(message: Message, state: FSMContext):
     await state.set_state(CreateTournament.end_date)
     await message.answer("Введите дату окончания турнира (в формате: день и сокращённое название месяца с точкой, например: 2 февр.):")
 
-
 @router.message(CreateTournament.end_date)
 async def create_tournament_end(message: Message, state: FSMContext):
     date_str = message.text.strip()
@@ -423,7 +416,6 @@ async def create_tournament_end(message: Message, state: FSMContext):
     await state.set_state(CreateTournament.max_teams)
     await message.answer("Введите максимальное количество команд (число):")
 
-
 @router.message(CreateTournament.max_teams)
 async def create_tournament_max(message: Message, state: FSMContext):
     try:
@@ -434,7 +426,6 @@ async def create_tournament_max(message: Message, state: FSMContext):
     await state.update_data(max_teams=max_teams)
     await state.set_state(CreateTournament.required_team_size)
     await message.answer("Введите требуемое количество игроков в команде для участия в турнире (от 1 до 10):")
-
 
 @router.message(CreateTournament.required_team_size)
 async def create_tournament_required_size(message: Message, state: FSMContext):
@@ -449,7 +440,6 @@ async def create_tournament_required_size(message: Message, state: FSMContext):
     await state.set_state(CreateTournament.min_age)
     await message.answer("Введите минимальный возраст участников (или 0, если нет ограничений):")
 
-
 @router.message(CreateTournament.min_age)
 async def create_tournament_min_age(message: Message, state: FSMContext):
     try:
@@ -462,7 +452,6 @@ async def create_tournament_min_age(message: Message, state: FSMContext):
     await state.update_data(min_age=min_age)
     await state.set_state(CreateTournament.max_age)
     await message.answer("Введите максимальный возраст участников (или 100, если нет ограничений):")
-
 
 @router.message(CreateTournament.max_age)
 async def create_tournament_max_age(message: Message, state: FSMContext):
@@ -482,7 +471,6 @@ async def create_tournament_max_age(message: Message, state: FSMContext):
     await state.set_state(CreateTournament.description)
     await message.answer("Введите описание турнира (можно отправить 'нет', чтобы пропустить):")
 
-
 @router.message(CreateTournament.description)
 async def create_tournament_description(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -496,6 +484,7 @@ async def create_tournament_description(message: Message, state: FSMContext):
     tournament_id = cur.lastrowid
     conn.commit()
     conn.close()
+    ensure_tournament_invite_token(tournament_id, regenerate=False)
     await state.clear()
     await message.answer("✅ Турнир создан!")
     # Отправляем отдельное сообщение с управлением
@@ -508,12 +497,13 @@ async def create_tournament_description(message: Message, state: FSMContext):
 
 # ---------- Редактирование турнира ----------
 
-
 class EditTournament(StatesGroup):
     field = State()
     value = State()
     sport_choice = State()
 
+class AdminBroadcast(StatesGroup):
+    text = State()
 
 @router.callback_query(F.data.startswith("admin_edit_tournament_"))
 async def edit_tournament_start(callback: CallbackQuery, state: FSMContext):
@@ -524,16 +514,25 @@ async def edit_tournament_start(callback: CallbackQuery, state: FSMContext):
     tournament_id = int(callback.data.split("_")[3])
     await state.update_data(tournament_id=tournament_id)
     builder = InlineKeyboardBuilder()
-    fields = ["name", "sport", "city", "start_date", "end_date",
-              "max_teams", "required_team_size", "min_age", "max_age", "description"]
-    for f in fields:
-        builder.button(text=f, callback_data=f"edit_field_{f}")
+    fields = [
+        ("name", "Название"),
+        ("sport", "Вид спорта"),
+        ("city", "Город"),
+        ("start_date", "Дата начала"),
+        ("end_date", "Дата конца"),
+        ("max_teams", "Макс. команд"),
+        ("required_team_size", "Размер команды"),
+        ("min_age", "Мин. возраст"),
+        ("max_age", "Макс. возраст"),
+        ("description", "Описание"),
+    ]
+    for field_key, field_label in fields:
+        builder.button(text=field_label, callback_data=f"edit_field_{field_key}")
     builder.button(
         text="🔙 Назад", callback_data=f"admin_tournament_manage_{tournament_id}")
     builder.adjust(2)
     await callback.message.edit_text("Выберите поле для редактирования:", reply_markup=builder.as_markup())
     await state.set_state(EditTournament.field)
-
 
 @router.callback_query(EditTournament.field, F.data.startswith("edit_field_"))
 async def edit_tournament_field(callback: CallbackQuery, state: FSMContext):
@@ -546,8 +545,20 @@ async def edit_tournament_field(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text("Выберите новый вид спорта:", reply_markup=sports_choice_keyboard_single(sports))
     else:
         await state.set_state(EditTournament.value)
-        await callback.message.edit_text(f"Введите новое значение для поля '{field}':")
-
+        field_titles = {
+            "name": "Название",
+            "city": "Город",
+            "start_date": "Дата начала",
+            "end_date": "Дата конца",
+            "max_teams": "Макс. команд",
+            "required_team_size": "Размер команды",
+            "min_age": "Мин. возраст",
+            "max_age": "Макс. возраст",
+            "description": "Описание",
+        }
+        await callback.message.edit_text(
+            f"Введите новое значение для поля «{field_titles.get(field, field)}»:"
+        )
 
 @router.message(EditTournament.value)
 async def edit_tournament_value(message: Message, state: FSMContext):
@@ -608,7 +619,6 @@ async def edit_tournament_value(message: Message, state: FSMContext):
     ])
     await message.answer("Нажмите кнопку ниже для управления:", reply_markup=kb)
 
-
 @router.callback_query(EditTournament.sport_choice, F.data.startswith("admin_tourn_sport_"))
 async def edit_tournament_sport_chosen(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -624,9 +634,7 @@ async def edit_tournament_sport_chosen(callback: CallbackQuery, state: FSMContex
     await state.clear()
     await send_tournament_info(callback.bot, callback.message.chat.id, tournament_id, callback.from_user.id)
 
-
 # ---------- Заявки на турниры ----------
-
 
 # ---------- Управление турнирами (список) ----------
 
@@ -639,7 +647,6 @@ async def admin_tournaments_list(callback: CallbackQuery, state: FSMContext):
 
     await state.clear()
     await show_tournaments_page(callback, 0)
-
 
 async def show_tournaments_page(callback: CallbackQuery | None, offset: int, message=None):
     """Показывает страницу списка турниров."""
@@ -704,13 +711,11 @@ async def show_tournaments_page(callback: CallbackQuery | None, offset: int, mes
     else:
         await message.answer(text, reply_markup=builder.as_markup())
 
-
 @router.callback_query(F.data.startswith("admin_tournaments_page_"))
 async def admin_tournaments_page_callback(callback: CallbackQuery):
     """Переключение страницы списка турниров."""
     offset = int(callback.data.split("_")[3])
     await show_tournaments_page(callback, offset)
-
 
 # ---------- Управление конкретным турниром ----------
 
@@ -754,6 +759,14 @@ async def admin_tournament_manage(callback: CallbackQuery):
         'finished': 'Завершён'
     }
     status_display = status_map.get(tournament['status'], tournament['status'])
+    invite_token = ensure_tournament_invite_token(tournament_id, regenerate=False)
+    bot_username = ""
+    try:
+        me = await callback.bot.get_me()
+        bot_username = me.username or ""
+    except Exception:
+        bot_username = ""
+    invite_url = f"https://t.me/{bot_username}?start=tournament_invite_{invite_token}" if (invite_token and bot_username) else "недоступно"
 
     # Возрастные ограничения
     age_text = ""
@@ -806,6 +819,8 @@ async def admin_tournament_manage(callback: CallbackQuery):
     # Редактирование турнира
     builder.button(text="✏️ Редактировать турнир",
                    callback_data=f"admin_edit_tournament_{tournament_id}")
+    builder.button(text="🔗 Ссылка-приглашение",
+                   callback_data=f"admin_tournament_invite_menu_{tournament_id}")
 
     # Удаление турнира
     builder.button(text="🗑 Удалить турнир",
@@ -827,8 +842,95 @@ async def admin_tournament_manage(callback: CallbackQuery):
     await callback.answer()
 
 
-# ---------- Завершение турнира ----------
+@router.callback_query(F.data.startswith("admin_tournament_invite_menu_"))
+async def admin_tournament_invite_menu(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
 
+    tournament_id = int(callback.data.split("_")[4])
+    token = ensure_tournament_invite_token(tournament_id, regenerate=False)
+    if not token:
+        await callback.answer("Не удалось получить ссылку.", show_alert=True)
+        return
+
+    bot_username = ""
+    try:
+        me = await callback.bot.get_me()
+        bot_username = me.username or ""
+    except Exception:
+        bot_username = ""
+
+    link = f"https://t.me/{bot_username}?start=tournament_invite_{token}" if bot_username else "недоступна"
+
+    text = (
+        "🔗 Ссылка-приглашение турнира\n\n"
+        f"Текущая ссылка:\n{link}\n\n"
+        "Вы можете показать ссылку отдельным сообщением или обновить её."
+    )
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📋 Показать ссылку", callback_data=f"admin_tournament_invite_show_{tournament_id}")
+    builder.button(text="♻️ Обновить ссылку", callback_data=f"admin_tournament_invite_reset_{tournament_id}")
+    builder.button(text="🔙 Назад к турниру", callback_data=f"admin_tournament_manage_{tournament_id}")
+    builder.adjust(1)
+
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("admin_tournament_invite_show_"))
+async def admin_tournament_invite_show(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+
+    tournament_id = int(callback.data.split("_")[4])
+    token = ensure_tournament_invite_token(tournament_id, regenerate=False)
+    if not token:
+        await callback.answer("Не удалось получить ссылку.", show_alert=True)
+        return
+
+    bot_username = ""
+    try:
+        me = await callback.bot.get_me()
+        bot_username = me.username or ""
+    except Exception:
+        bot_username = ""
+    if not bot_username:
+        await callback.answer("Не удалось определить username бота.", show_alert=True)
+        return
+
+    link = f"https://t.me/{bot_username}?start=tournament_invite_{token}"
+    await callback.answer()
+    await callback.message.answer(f"Ссылка-приглашение в турнир:\n{link}")
+
+@router.callback_query(F.data.startswith("admin_tournament_invite_reset_"))
+async def admin_tournament_invite_reset(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+
+    tournament_id = int(callback.data.split("_")[4])
+    token = ensure_tournament_invite_token(tournament_id, regenerate=True)
+    if not token:
+        await callback.answer("Не удалось обновить ссылку.", show_alert=True)
+        return
+
+    bot_username = ""
+    try:
+        me = await callback.bot.get_me()
+        bot_username = me.username or ""
+    except Exception:
+        bot_username = ""
+    if not bot_username:
+        await callback.answer("Ссылка обновлена, но username бота не определён.", show_alert=True)
+        return
+
+    link = f"https://t.me/{bot_username}?start=tournament_invite_{token}"
+    await callback.answer("Ссылка турнира обновлена.", show_alert=True)
+    await callback.message.answer(f"Новая ссылка турнира:\n{link}")
+
+# ---------- Завершение турнира ----------
 @router.callback_query(F.data.startswith("admin_finish_tournament_"))
 async def admin_finish_tournament_confirm(callback: CallbackQuery):
     """Подтверждение завершения турнира."""
@@ -860,7 +962,6 @@ async def admin_finish_tournament_confirm(callback: CallbackQuery):
         reply_markup=kb.as_markup()
     )
     await callback.answer()
-
 
 @router.callback_query(F.data.startswith("confirm_finish_tournament_"))
 async def confirm_finish_tournament(callback: CallbackQuery):
@@ -898,7 +999,6 @@ async def confirm_finish_tournament(callback: CallbackQuery):
         f"🥉 3 место: {third_name} (+10 очков)"
     )
 
-
 # ---------- Заявки на турниры (общие) ----------
 
 @router.callback_query(F.data == "admin_applications")
@@ -908,7 +1008,6 @@ async def admin_applications(callback: CallbackQuery):
         await callback.answer("Нет прав", show_alert=True)
         return
     await show_admin_applications_list(callback.message)
-
 
 async def show_admin_applications_list(message):
     """Показывает общий список pending-заявок на турниры."""
@@ -944,7 +1043,6 @@ async def show_admin_applications_list(message):
     builder.adjust(3)
     await message.edit_text(text, reply_markup=builder.as_markup())
 
-
 @router.callback_query(F.data.startswith("admin_pending_team_info_"))
 async def admin_pending_team_info(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -978,7 +1076,6 @@ async def admin_pending_team_info(callback: CallbackQuery):
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
 
-
 @router.callback_query(F.data.regexp(r"^approve_\d+(?:_\d+)?(?:_\d+)?$"))
 async def approve_app(callback: CallbackQuery):
     """Одобрение заявки."""
@@ -1003,7 +1100,6 @@ async def approve_app(callback: CallbackQuery):
     else:
         await show_admin_applications_list(callback.message)
 
-
 @router.callback_query(F.data.regexp(r"^reject_\d+(?:_\d+)?(?:_\d+)?$"))
 async def reject_app(callback: CallbackQuery):
     """Отклонение заявки."""
@@ -1025,7 +1121,6 @@ async def reject_app(callback: CallbackQuery):
     else:
         await show_admin_applications_list(callback.message)
 
-
 @router.callback_query(F.data.regexp(r"^exclude_\d+_\d+$"))
 async def exclude_app(callback: CallbackQuery):
     """Legacy callback: запрашивает подтверждение исключения."""
@@ -1038,7 +1133,6 @@ async def exclude_app(callback: CallbackQuery):
     tournament_id = int(parts[2])
     await show_exclusion_confirm(callback.message, tournament_id, app_id, offset=0)
     await callback.answer()
-
 
 # ---------- Заявки на конкретный турнир ----------
 
@@ -1071,6 +1165,7 @@ async def show_tournament_teams_list(message, tournament_id, offset: int = 0):
                 WHEN 'approved' THEN 1
                 WHEN 'pending' THEN 2
                 WHEN 'rejected' THEN 3
+                WHEN 'excluded' THEN 4
             END,
             a.applied_at DESC
         LIMIT ? OFFSET ?
@@ -1101,12 +1196,14 @@ async def show_tournament_teams_list(message, tournament_id, offset: int = 0):
         status_map = {
             'approved': '✅',
             'pending': '⏳',
-            'rejected': '❌'
+            'rejected': '❌',
+            'excluded': '🚫'
         }
         status_text = {
             'approved': 'Одобрено',
             'pending': 'На рассмотрении',
-            'rejected': 'Отклонено'
+            'rejected': 'Отклонено',
+            'excluded': 'Исключено'
         }
         icon = status_map.get(app['status'], '❓')
         text += f"{icon} {app['team_name']} ({status_text.get(app['status'], app['status'])})\n"
@@ -1119,6 +1216,9 @@ async def show_tournament_teams_list(message, tournament_id, offset: int = 0):
                            callback_data=f"approve_{app['id']}_{tournament_id}_{offset}")
             builder.button(text=f"❌ Отклонить",
                            callback_data=f"reject_{app['id']}_{tournament_id}_{offset}")
+        elif app['status'] == 'excluded':
+            builder.button(text=f"♻️ Разрешить повторную ({app['team_name']})",
+                           callback_data=f"admin_tournament_allow_reapply_{tournament_id}_{app['id']}_{offset}")
 
     nav_buttons = []
     if offset > 0:
@@ -1139,7 +1239,6 @@ async def show_tournament_teams_list(message, tournament_id, offset: int = 0):
 
     await message.edit_text(text, reply_markup=builder.as_markup())
 
-
 @router.callback_query(F.data.startswith("admin_tournament_teams_page_"))
 async def admin_tournament_teams_page(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -1152,7 +1251,6 @@ async def admin_tournament_teams_page(callback: CallbackQuery):
     await show_tournament_teams_list(callback.message, tournament_id, offset=offset)
     await callback.answer()
 
-
 @router.callback_query(F.data.regexp(r"^admin_tournament_teams_\d+$"))
 async def admin_tournament_teams(callback: CallbackQuery):
     """Список команд и заявок на конкретный турнир."""
@@ -1163,7 +1261,6 @@ async def admin_tournament_teams(callback: CallbackQuery):
     tournament_id = int(callback.data.split("_")[3])
     await show_tournament_teams_list(callback.message, tournament_id, offset=0)
     await callback.answer()
-
 
 async def show_tournament_exclusions_list(message, tournament_id, offset: int = 0):
     tournament = get_tournament_by_id(tournament_id)
@@ -1243,7 +1340,6 @@ async def show_tournament_exclusions_list(message, tournament_id, offset: int = 
     builder.adjust(1)
     await message.edit_text(text, reply_markup=builder.as_markup())
 
-
 async def show_exclusion_confirm(message, tournament_id: int, app_id: int, offset: int):
     app = _get_tournament_application_details(app_id)
     tournament = get_tournament_by_id(tournament_id)
@@ -1258,7 +1354,7 @@ async def show_exclusion_confirm(message, tournament_id: int, app_id: int, offse
         f"⚠️ Подтвердите исключение\n\n"
         f"Турнир: {tournament['name']}\n"
         f"Команда: {app['team_name']}\n\n"
-        "Команда будет исключена из турнира (статус заявки станет «Отклонено»)."
+        "Команда будет исключена из турнира (статус заявки станет «Исключено»)."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Да, исключить",
@@ -1268,7 +1364,6 @@ async def show_exclusion_confirm(message, tournament_id: int, app_id: int, offse
     ])
     await message.edit_text(text, reply_markup=kb)
 
-
 @router.callback_query(F.data.regexp(r"^admin_tournament_exclusions_\d+$"))
 async def admin_tournament_exclusions(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -1277,7 +1372,6 @@ async def admin_tournament_exclusions(callback: CallbackQuery):
     tournament_id = int(callback.data.split("_")[3])
     await show_tournament_exclusions_list(callback.message, tournament_id, offset=0)
     await callback.answer()
-
 
 @router.callback_query(F.data.startswith("admin_tournament_exclusions_page_"))
 async def admin_tournament_exclusions_page(callback: CallbackQuery):
@@ -1290,7 +1384,6 @@ async def admin_tournament_exclusions_page(callback: CallbackQuery):
     await show_tournament_exclusions_list(callback.message, tournament_id, offset=offset)
     await callback.answer()
 
-
 @router.callback_query(F.data.startswith("admin_tournament_exclude_pick_"))
 async def admin_tournament_exclude_pick(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -1302,7 +1395,6 @@ async def admin_tournament_exclude_pick(callback: CallbackQuery):
     offset = int(parts[6])
     await show_exclusion_confirm(callback.message, tournament_id, app_id, offset)
     await callback.answer()
-
 
 @router.callback_query(F.data.startswith("admin_tournament_exclude_confirm_"))
 async def admin_tournament_exclude_confirm(callback: CallbackQuery):
@@ -1322,6 +1414,34 @@ async def admin_tournament_exclude_confirm(callback: CallbackQuery):
 
     await show_tournament_exclusions_list(callback.message, tournament_id, offset=offset)
 
+@router.callback_query(F.data.startswith("admin_tournament_allow_reapply_"))
+async def admin_tournament_allow_reapply(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+
+    parts = callback.data.split("_")
+    tournament_id = int(parts[4])
+    app_id = int(parts[5])
+    offset = int(parts[6])
+
+    result = allow_reapply_excluded_application(app_id)
+    if result.get("ok"):
+        await callback.answer("Повторная заявка разрешена: статус переведён в pending.")
+    else:
+        reason = result.get("reason")
+        if reason == "not_registration":
+            await callback.answer("Разрешение повторной заявки доступно только на этапе регистрации.", show_alert=True)
+        elif reason == "not_excluded":
+            await callback.answer("Это действие доступно только для статуса excluded.", show_alert=True)
+        elif reason == "not_found":
+            await callback.answer("Заявка не найдена.", show_alert=True)
+        elif reason == "already_processed":
+            await callback.answer("Заявка уже была изменена другим админом.", show_alert=True)
+        else:
+            await callback.answer("Не удалось изменить статус заявки.", show_alert=True)
+
+    await show_tournament_teams_list(callback.message, tournament_id, offset=offset)
 
 @router.callback_query(F.data.startswith("admin_tournament_team_info_"))
 async def admin_tournament_team_info(callback: CallbackQuery):
@@ -1364,7 +1484,6 @@ async def admin_tournament_team_info(callback: CallbackQuery):
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
 
-
 @router.callback_query(F.data.startswith("admin_tournament_applications_"))
 async def admin_tournament_applications(callback: CallbackQuery):
     """Заявки на конкретный турнир (устаревшее, перенаправляет на teams)."""
@@ -1373,9 +1492,7 @@ async def admin_tournament_applications(callback: CallbackQuery):
     await show_tournament_teams_list(callback.message, tournament_id)
     await callback.answer()
 
-
 # ---------- Создание матча ----------
-
 
 class CreateMatch(StatesGroup):
     tournament = State()
@@ -1383,7 +1500,6 @@ class CreateMatch(StatesGroup):
     team2 = State()
     date = State()
     location = State()
-
 
 @router.callback_query(F.data == "admin_create_match")
 async def admin_create_match_start(callback: CallbackQuery, state: FSMContext):
@@ -1412,7 +1528,6 @@ async def admin_create_match_start(callback: CallbackQuery, state: FSMContext):
     builder.button(text="🔙 Назад", callback_data="admin_menu")
     builder.adjust(1)
     await callback.message.edit_text("Выберите турнир:", reply_markup=builder.as_markup())
-
 
 @router.callback_query(F.data.startswith("match_tournament_"))
 async def match_choose_tournament(callback: CallbackQuery, state: FSMContext):
@@ -1444,7 +1559,6 @@ async def match_choose_tournament(callback: CallbackQuery, state: FSMContext):
     builder.adjust(1)
     await callback.message.edit_text("Выберите ПЕРВУЮ команду:", reply_markup=builder.as_markup())
     await state.set_state(CreateMatch.team1)
-
 
 @router.callback_query(CreateMatch.team1, F.data.startswith("match_team1_"))
 async def match_choose_team1(callback: CallbackQuery, state: FSMContext):
@@ -1479,7 +1593,6 @@ async def match_choose_team1(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Выберите ВТОРУЮ команду:", reply_markup=builder.as_markup())
     await state.set_state(CreateMatch.team2)
 
-
 @router.callback_query(CreateMatch.team2, F.data.startswith("match_team2_"))
 async def match_choose_team2(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -1487,7 +1600,6 @@ async def match_choose_team2(callback: CallbackQuery, state: FSMContext):
     await state.update_data(team2_id=team2_id)
     await state.set_state(CreateMatch.date)
     await callback.message.edit_text("Введите дату и время матча (например, 1 янв. 18:00):")
-
 
 @router.message(CreateMatch.date)
 async def match_enter_date(message: Message, state: FSMContext):
@@ -1502,7 +1614,6 @@ async def match_enter_date(message: Message, state: FSMContext):
     await state.update_data(date=datetime_str)
     await state.set_state(CreateMatch.location)
     await message.answer("Введите место проведения:")
-
 
 @router.message(CreateMatch.location)
 async def match_enter_location(message: Message, state: FSMContext):
@@ -1538,7 +1649,6 @@ async def match_enter_location(message: Message, state: FSMContext):
 
 # ---------- Ввод результата матча ----------
 
-
 class EnterResult(StatesGroup):
     match = State()
     score1 = State()
@@ -1546,10 +1656,8 @@ class EnterResult(StatesGroup):
     volleyball_sets = State()
     player_stats = State()
 
-
 # Обработчик admin_enter_result больше не используется
 # Ввод результата теперь через brackets.py → match_input.py
-
 
 def _load_legacy_match_for_stats(match_id: int):
     conn = get_connection()
@@ -1567,7 +1675,6 @@ def _load_legacy_match_for_stats(match_id: int):
     conn.close()
     return row
 
-
 def _fetch_players(team1_id: int, team2_id: int) -> list[dict]:
     conn = get_connection()
     cur = conn.cursor()
@@ -1584,7 +1691,6 @@ def _fetch_players(team1_id: int, team2_id: int) -> list[dict]:
     rows = [dict(r) for r in cur.fetchall()]
     conn.close()
     return rows
-
 
 async def _prompt_next_legacy_player(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -1612,7 +1718,6 @@ async def _prompt_next_legacy_player(message: Message, state: FSMContext):
         f"Игрок: {player['first_name']} (@{player['username'] or 'без_username'})\n\n"
         f"{prompt}"
     )
-
 
 async def _save_legacy_player_stats_and_finish(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -1655,7 +1760,6 @@ async def _save_legacy_player_stats_and_finish(message: Message, state: FSMConte
     await state.clear()
     await message.answer("Результат и персональная статистика сохранены!", reply_markup=admin_menu_keyboard())
 
-
 @router.callback_query(F.data.startswith("result_match_"))
 async def result_choose_match(callback: CallbackQuery, state: FSMContext):
     match_id = int(callback.data.split("_")[2])
@@ -1663,7 +1767,6 @@ async def result_choose_match(callback: CallbackQuery, state: FSMContext):
     await state.set_state(EnterResult.score1)
     await callback.message.edit_text("Введите счёт первой команды (число):")
     await callback.answer()
-
 
 @router.message(EnterResult.score1)
 async def result_enter_score1(message: Message, state: FSMContext):
@@ -1675,7 +1778,6 @@ async def result_enter_score1(message: Message, state: FSMContext):
     await state.update_data(score1=score1)
     await state.set_state(EnterResult.score2)
     await message.answer("Введите счёт второй команды (число):")
-
 
 @router.message(EnterResult.score2)
 async def result_enter_score2(message: Message, state: FSMContext):
@@ -1774,7 +1876,6 @@ async def result_enter_score2(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Результат сохранён!", reply_markup=admin_menu_keyboard())
 
-
 @router.message(EnterResult.volleyball_sets)
 async def result_enter_volleyball_sets(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -1810,7 +1911,6 @@ async def result_enter_volleyball_sets(message: Message, state: FSMContext):
     await state.update_data(volleyball_sets=parsed)
     await state.set_state(EnterResult.player_stats)
     await _prompt_next_legacy_player(message, state)
-
 
 @router.message(EnterResult.player_stats)
 async def result_enter_player_stats(message: Message, state: FSMContext):
@@ -1858,10 +1958,8 @@ async def result_enter_player_stats(message: Message, state: FSMContext):
 
 # ---------- Управление пользователями ----------
 
-
 class UserManagement(StatesGroup):
     searching = State()
-
 
 @router.callback_query(F.data == "admin_users")
 async def admin_users_menu(callback: CallbackQuery):
@@ -1877,7 +1975,6 @@ async def admin_users_menu(callback: CallbackQuery):
     builder.adjust(1)
     await callback.message.edit_text("Управление пользователями:", reply_markup=builder.as_markup())
 
-
 @router.callback_query(F.data == "admin_user_list")
 async def admin_user_list(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -1887,7 +1984,6 @@ async def admin_user_list(callback: CallbackQuery):
     total = get_all_users_count()  # нужно добавить функцию в utils
     await show_user_list(callback.message, users, 0, total)
     await callback.answer()
-
 
 async def show_user_list(message, users, offset, total):
     """
@@ -1927,7 +2023,6 @@ async def show_user_list(message, users, offset, total):
 
     await message.edit_text("Список пользователей:", reply_markup=builder.as_markup())
 
-
 @router.callback_query(F.data.startswith("admin_user_page_"))
 async def admin_user_page(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -1938,7 +2033,6 @@ async def admin_user_page(callback: CallbackQuery):
     total = get_all_users_count()
     await show_user_list(callback.message, users, offset, total)
     await callback.answer()
-
 
 @router.callback_query(F.data.startswith("admin_user_view_"))
 async def admin_user_view(callback: CallbackQuery):
@@ -1976,6 +2070,7 @@ Username: @{user['username']}
 Email: {user['email']}
 Город: {user['city']}
 Возраст: {age_str}
+Steam: {user['steam_id'] if user['steam_id'] else "не указан"}
 Любимые виды спорта: {favorite_sports_display}
 Роль: {user['role']}
 Статус: {'🔴 Забанен' if user['is_banned'] else '🟢 Активен'}
@@ -2001,7 +2096,6 @@ Email: {user['email']}
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
 
-
 @router.callback_query(F.data.startswith("admin_user_changerole_"))
 async def admin_user_changerole(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -2022,7 +2116,6 @@ async def admin_user_changerole(callback: CallbackQuery):
     await callback.message.edit_text(f"Выберите новую роль для {user['first_name']}:", reply_markup=builder.as_markup())
     await callback.answer()
 
-
 @router.callback_query(F.data.startswith("admin_user_setrole_"))
 async def admin_user_setrole(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -2035,7 +2128,6 @@ async def admin_user_setrole(callback: CallbackQuery):
     await callback.answer(f"Роль изменена на {new_role}")
     await admin_user_view(callback)
 
-
 @router.callback_query(F.data.startswith("admin_user_toggleban_"))
 async def admin_user_toggleban(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -2047,7 +2139,6 @@ async def admin_user_toggleban(callback: CallbackQuery):
     await callback.answer(f"Пользователь {status_text}")
     await admin_user_view(callback)
 
-
 @router.callback_query(F.data == "admin_user_search")
 async def admin_user_search_start(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
@@ -2057,7 +2148,6 @@ async def admin_user_search_start(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Введите имя, username или Telegram ID для поиска:")
     await callback.answer()
 
-
 @router.message(UserManagement.searching)
 async def admin_user_search_results(message: Message, state: FSMContext):
     query = message.text.strip()
@@ -2065,7 +2155,6 @@ async def admin_user_search_results(message: Message, state: FSMContext):
     users = search_users(query)
     total = search_users_count(query)  # нужно добавить в utils
     await show_search_results(message, query, users, 0, total)
-
 
 async def show_search_results(message, query, users, offset, total):
     if not users:
@@ -2097,7 +2186,6 @@ async def show_search_results(message, query, users, offset, total):
 
     await message.answer(f"Результаты поиска по запросу «{query}»:", reply_markup=builder.as_markup())
 
-
 @router.callback_query(F.data.startswith("admin_search_page_"))
 async def admin_search_page(callback: CallbackQuery):
     await callback.answer()
@@ -2112,9 +2200,7 @@ async def admin_search_page(callback: CallbackQuery):
     total = search_users_count(query)
     await show_search_results(callback.message, query, users, offset, total)
 
-
 # ---------- Удаление турнира (кнопка в карточке турнира) ----------
-
 
 @router.callback_query(F.data.startswith("admin_delete_tournament_"))
 async def admin_delete_tournament_confirm(callback: CallbackQuery, state: FSMContext):
@@ -2136,7 +2222,6 @@ async def admin_delete_tournament_confirm(callback: CallbackQuery, state: FSMCon
     ])
     await callback.message.edit_text(f"Вы уверены, что хотите удалить турнир «{tournament['name']}»? Это действие нельзя отменить.", reply_markup=kb)
     await state.update_data(tournament_id=tournament_id, sport=tournament['sport'])
-
 
 @router.callback_query(F.data == "admin_confirm_delete_tournament")
 async def admin_delete_tournament_execute(callback: CallbackQuery, state: FSMContext):
@@ -2165,7 +2250,6 @@ async def admin_delete_tournament_execute(callback: CallbackQuery, state: FSMCon
 
 # ---------- Управление рейтингом ----------
 
-
 @router.callback_query(F.data == "admin_rating")
 async def admin_rating_menu(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -2174,7 +2258,6 @@ async def admin_rating_menu(callback: CallbackQuery):
     sports = get_all_sports()
     await callback.message.edit_text("Выберите вид спорта:", reply_markup=admin_rating_menu_keyboard(sports))
     await callback.answer()
-
 
 @router.callback_query(F.data.startswith("admin_rating_sport_"))
 async def admin_rating_sport_actions(callback: CallbackQuery):
@@ -2188,7 +2271,6 @@ async def admin_rating_sport_actions(callback: CallbackQuery):
         reply_markup=admin_rating_sport_actions_keyboard(sport),
     )
 
-
 @router.callback_query(F.data.startswith("admin_rating_reset_all_"))
 async def admin_rating_reset_all(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -2198,7 +2280,6 @@ async def admin_rating_reset_all(callback: CallbackQuery):
     reset_sport_rating(sport)
     await callback.answer(f"Рейтинг по {get_sport_display_name(sport)} обнулён!", show_alert=True)
     await admin_rating_menu(callback)
-
 
 @router.callback_query(F.data.startswith("admin_rating_list_teams_"))
 async def admin_rating_list_teams(callback: CallbackQuery):
@@ -2220,7 +2301,6 @@ async def admin_rating_list_teams(callback: CallbackQuery):
         reply_markup=admin_rating_teams_list_keyboard(teams, sport),
     )
 
-
 @router.callback_query(F.data.startswith("admin_rating_team_"))
 async def admin_rating_team_actions(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
@@ -2232,7 +2312,6 @@ async def admin_rating_team_actions(callback: CallbackQuery, state: FSMContext):
     sport = parts[4]
     await state.update_data(team_id=team_id, sport=sport)
     await callback.message.edit_text(f"Действия для команды:", reply_markup=admin_rating_team_actions_keyboard(team_id, sport))
-
 
 @router.callback_query(F.data.startswith("admin_rating_reset_team_"))
 async def admin_rating_reset_team(callback: CallbackQuery):
@@ -2252,10 +2331,8 @@ async def admin_rating_reset_team(callback: CallbackQuery):
         reply_markup=admin_rating_teams_list_keyboard(teams, sport),
     )
 
-
 class DeductPoints(StatesGroup):
     points = State()
-
 
 @router.callback_query(F.data.startswith("admin_rating_deduct_"))
 async def admin_rating_deduct_start(callback: CallbackQuery, state: FSMContext):
@@ -2269,7 +2346,6 @@ async def admin_rating_deduct_start(callback: CallbackQuery, state: FSMContext):
     await state.update_data(team_id=team_id, sport=sport)
     await state.set_state(DeductPoints.points)
     await callback.message.edit_text("Введите количество очков для снятия:")
-
 
 @router.message(DeductPoints.points)
 async def admin_rating_deduct_execute(message: Message, state: FSMContext):
@@ -2292,7 +2368,6 @@ async def admin_rating_deduct_execute(message: Message, state: FSMContext):
 
 # ---------- Управление командами ----------
 
-
 @router.callback_query(F.data == "admin_teams")
 async def admin_teams_list(callback: CallbackQuery):
     await callback.answer()
@@ -2300,7 +2375,6 @@ async def admin_teams_list(callback: CallbackQuery):
         await callback.answer("Нет прав", show_alert=True)
         return
     await show_admin_teams_page(callback.message, 0)
-
 
 async def show_admin_teams_page(message, offset: int):
     conn = get_connection()
@@ -2351,7 +2425,6 @@ async def show_admin_teams_page(message, offset: int):
     builder.adjust(1)
     await message.edit_text(text, reply_markup=builder.as_markup())
 
-
 @router.callback_query(F.data.startswith("admin_teams_page_"))
 async def admin_teams_page(callback: CallbackQuery):
     await callback.answer()
@@ -2360,7 +2433,6 @@ async def admin_teams_page(callback: CallbackQuery):
         return
     offset = int(callback.data.split("_")[3])
     await show_admin_teams_page(callback.message, offset)
-
 
 @router.callback_query(F.data.startswith("admin_team_manage_"))
 async def admin_team_manage_card(callback: CallbackQuery):
@@ -2376,7 +2448,6 @@ async def admin_team_manage_card(callback: CallbackQuery):
         return
 
     await callback.message.edit_text(text, reply_markup=_admin_team_manage_card_keyboard(team_id))
-
 
 @router.callback_query(F.data.startswith("admin_team_delete_confirm_"))
 async def admin_team_delete_confirm(callback: CallbackQuery):
@@ -2399,7 +2470,6 @@ async def admin_team_delete_confirm(callback: CallbackQuery):
     ])
     await callback.message.edit_text(f"Вы уверены, что хотите удалить команду «{team['name']}»? Это действие нельзя отменить.", reply_markup=kb)
 
-
 @router.callback_query(F.data.startswith("admin_team_delete_execute_"))
 async def admin_team_delete_execute(callback: CallbackQuery):
     await callback.answer()
@@ -2417,7 +2487,6 @@ async def admin_team_delete_execute(callback: CallbackQuery):
     ])
     await callback.message.edit_text("✅ Команда удалена.", reply_markup=kb)
 
-
 @router.callback_query(F.data.startswith("admin_delete_team_"))
 async def admin_delete_team_legacy_redirect(callback: CallbackQuery):
     """Legacy callback: перенаправляем старые кнопки в новый поток карточки команды."""
@@ -2433,7 +2502,6 @@ async def admin_delete_team_legacy_redirect(callback: CallbackQuery):
         return
 
     await callback.message.edit_text(text, reply_markup=_admin_team_manage_card_keyboard(team_id))
-
 
 @router.callback_query(F.data == "admin_confirm_delete_team")
 async def admin_delete_team_execute_legacy(callback: CallbackQuery, state: FSMContext):
@@ -2459,6 +2527,85 @@ async def admin_delete_team_execute_legacy(callback: CallbackQuery, state: FSMCo
     ])
     await callback.message.edit_text("✅ Команда удалена.", reply_markup=kb)
 
+@router.callback_query(F.data == "admin_broadcast_start")
+async def admin_broadcast_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+
+    await state.set_state(AdminBroadcast.text)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcast_cancel")]
+    ])
+    await callback.message.edit_text(
+        "📢 Введите текст рассылки для всех активных пользователей:",
+        reply_markup=kb
+    )
+
+@router.message(AdminBroadcast.text)
+async def admin_broadcast_preview(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет прав")
+        return
+
+    broadcast_text = (message.text or "").strip()
+    if not broadcast_text:
+        await message.answer("Текст рассылки не должен быть пустым.")
+        return
+
+    await state.update_data(broadcast_text=broadcast_text)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Отправить", callback_data="admin_broadcast_confirm")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_broadcast_cancel")],
+    ])
+    await message.answer(
+        "Предпросмотр рассылки:\n\n"
+        f"{broadcast_text}\n\n"
+        "Отправить это сообщение всем активным пользователям?",
+        reply_markup=kb,
+    )
+
+@router.callback_query(F.data == "admin_broadcast_confirm")
+async def admin_broadcast_confirm(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+
+    data = await state.get_data()
+    broadcast_text = (data.get("broadcast_text") or "").strip()
+    if not broadcast_text:
+        await callback.answer("Нет текста рассылки.", show_alert=True)
+        return
+
+    user_ids = get_active_user_telegram_ids()
+    ok_count = 0
+    fail_count = 0
+
+    for telegram_id in user_ids:
+        try:
+            await callback.bot.send_message(telegram_id, broadcast_text)
+            ok_count += 1
+        except Exception:
+            fail_count += 1
+
+    await state.clear()
+    await callback.message.answer(
+        f"📢 Рассылка завершена.\n"
+        f"Успешно: {ok_count}\n"
+        f"Ошибок: {fail_count}"
+    )
+    await callback.message.answer("Панель администратора:", reply_markup=admin_menu_keyboard())
+
+@router.callback_query(F.data == "admin_broadcast_cancel")
+async def admin_broadcast_cancel(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.clear()
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    await callback.message.edit_text("Панель администратора:", reply_markup=admin_menu_keyboard())
 
 @router.callback_query(F.data == "admin_menu")
 async def back_to_admin_menu(callback: CallbackQuery):

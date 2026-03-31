@@ -18,7 +18,8 @@ from razryad_arena_utils import (
     accept_request, reject_request,
     search_teams_by_name, search_teams_count, get_team_invite_status,
     get_teams_by_sport, get_teams_count_by_sport, get_team_members_count, get_team_max_members, update_team_max_members,
-    get_sport_display_name, map_sports_to_display
+    get_sport_display_name, map_sports_to_display,
+    ensure_team_invite_token, set_team_invite_join_mode, set_team_invite_enabled
 )
 from keyboards import (
     teams_list_keyboard, team_management_extended_keyboard, main_menu_keyboard,
@@ -31,8 +32,8 @@ from keyboards import (
 logger = logging.getLogger(__name__)
 
 
-async def get_team_card_data(team_id: int, user_id: int):
-    """Возвращает текст и клавиатуру для карточки команды."""
+async def get_team_card_data(team_id: int, user_id: int, bot: Bot | None = None):
+    """Returns team card text and keyboard."""
     team = get_team_by_id(team_id)
     if not team:
         return None, None
@@ -43,8 +44,7 @@ async def get_team_card_data(team_id: int, user_id: int):
     members_list_lines = []
     for m in members:
         age_str = f"[{m['age']} лет]" if m['age'] else "[возраст не указан]"
-        members_list_lines.append(
-            f"- {m['first_name']} (@{m['username']}) {age_str}")
+        members_list_lines.append(f"- {m['first_name']} (@{m['username']}) {age_str}")
     members_list = "\n".join(members_list_lines)
 
     captain = get_user_by_id(team['captain_id'])
@@ -52,21 +52,37 @@ async def get_team_card_data(team_id: int, user_id: int):
     settings = get_team_settings(team_id)
     sport_display = get_sport_display_name(team['sport'])
 
+    token = (team['invite_token'] or '').strip() if 'invite_token' in team.keys() else ''
+    invite_enabled_raw = team['invite_enabled'] if 'invite_enabled' in team.keys() else 1
+    invite_enabled = int(invite_enabled_raw or 0) == 1
+    if invite_enabled and not token:
+        token = ensure_team_invite_token(team_id, regenerate=False) or ''
+
+    invite_link_text = ""
+    if invite_enabled and token and bot:
+        try:
+            invite_link = await _team_invite_link(bot, token)
+            invite_link_text = f"\nСсылка приглашения: {invite_link}"
+        except Exception:
+            invite_link_text = ""
+
     text = f"""
 Команда: {team['name']}
 Вид спорта: {sport_display}
 Город: {team['city']}
 Капитан: {captain_name}
 Участников: {members_count} / {max_members}
-Набор: {"🔓 Открыт" if settings['is_open'] else "🔒 Закрыт"}
+Набор: {"📔 Открыт" if settings['is_open'] else "🔒 Закрыт"}
 Состав:
 {members_list}
     """
 
+    if invite_link_text:
+        text += invite_link_text
+
     user = get_user(user_id)
     is_capt = user and is_captain(user['id'], team_id)
-    kb = team_management_extended_keyboard(
-        team_id, is_capt, settings['is_open'], settings['notify'], max_members)
+    kb = team_management_extended_keyboard(team_id, is_capt, settings['is_open'], settings['notify'], max_members)
     return text, kb
 
 
@@ -203,7 +219,7 @@ async def finish_create_team(user_id, message, state: FSMContext, max_members):
     conn.close()
     await state.clear()
     await message.answer(f"Команда '{team_name}' создана! Лимит участников: {max_members}.")
-    text, kb = await get_team_card_data(team_id, user_id)
+    text, kb = await get_team_card_data(team_id, user_id, bot=message.bot)
     await message.answer(text, reply_markup=kb)
 
 # ВАЖНО: обработчик team_requests_ должен идти до общего team_
@@ -217,18 +233,225 @@ async def team_requests_menu(callback: CallbackQuery):
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("team_"))
+@router.callback_query(F.data.regexp(r"^team_\d+$"))
 async def view_team(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    team_id = int(callback.data.split("_")[1])
-    text, kb = await get_team_card_data(team_id, callback.from_user.id)
+    parts = (callback.data or "").split("_")
+    if len(parts) != 2 or not parts[1].isdigit():
+        await callback.answer("Некорректная команда", show_alert=True)
+        return
+
+    team_id = int(parts[1])
+    text, kb = await get_team_card_data(team_id, callback.from_user.id, bot=callback.bot)
     if text is None:
         await callback.answer("Команда не найдена", show_alert=True)
         return
     await callback.message.edit_text(text, reply_markup=kb)
     await callback.answer()
 
-# ---------- Управление командой (rename, delete, add_player, accept_invite, reject_invite) ----------
+# ---------- Управление командой (переименование, удаление, добавление игрока, принятие/отклонение инвайта) ----------
+
+
+async def _team_invite_link(bot: Bot, token: str) -> str:
+    me = await bot.get_me()
+    return f"https://t.me/{me.username}?start=team_invite_{token}"
+
+
+async def _render_team_invite_menu(callback: CallbackQuery, team_id: int, notice: str | None = None):
+    user = get_user(callback.from_user.id)
+    if not user or not is_captain(user['id'], team_id):
+        await callback.answer("Только капитан может управлять ссылкой команды.", show_alert=True)
+        return
+
+    team = get_team_by_id(team_id)
+    if not team:
+        await callback.answer("Команда не найдена", show_alert=True)
+        return
+
+    token = (team['invite_token'] or '').strip() if 'invite_token' in team.keys() else ''
+    invite_enabled_raw = team['invite_enabled'] if 'invite_enabled' in team.keys() else 1
+    enabled = int(invite_enabled_raw or 0) == 1
+    if enabled and not token:
+        token = ensure_team_invite_token(team_id, regenerate=False) or ''
+
+    mode_value = (team['invite_join_mode'] or 'request').strip().lower() if 'invite_join_mode' in team.keys() else 'request'
+    is_direct_mode = mode_value == 'direct'
+    mode_text = "Сразу вступление" if is_direct_mode else "По заявке"
+
+    if enabled and token:
+        link = await _team_invite_link(callback.bot, token)
+        status_text = "Включена"
+        link_text = f"Текущая ссылка:\n{link}"
+        toggle_text = "🔕 Отключить ссылку"
+    else:
+        status_text = "Отключена"
+        link_text = "Ссылка отключена. Включите её, чтобы приглашать в команду."
+        toggle_text = "🔔 Включить ссылку"
+
+    mode_help = "По ссылке пользователь вступает сразу." if is_direct_mode else "По ссылке пользователь отправляет заявку капитану."
+
+    text = (
+        "🔗 Ссылка-приглашение\n\n"
+        f"Статус: {status_text}\n"
+        f"Режим: {mode_text}\n\n"
+        f"{link_text}\n\n"
+        f"{mode_help}"
+    )
+    if notice:
+        text = f"{notice}\n\n{text}"
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="♻️ Перегенерировать ссылку", callback_data=f"team_invite_regen_{team_id}")
+    builder.button(text="⚙️ Сменить режим", callback_data=f"team_invite_mode_{team_id}")
+    builder.button(text=toggle_text, callback_data=f"team_invite_toggle_{team_id}")
+    builder.button(text="🔙 Назад к команде", callback_data=f"team_{team_id}")
+    builder.adjust(1)
+
+    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+
+def _team_id_from_callback(callback_data: str) -> int | None:
+    parts = (callback_data or "").split("_")
+    if not parts:
+        return None
+    last = parts[-1]
+    if not last.isdigit():
+        return None
+    return int(last)
+
+
+@router.callback_query(F.data.startswith("team_invite_menu_"))
+async def team_invite_menu(callback: CallbackQuery):
+    team_id = _team_id_from_callback(callback.data)
+    if team_id is None:
+        await callback.answer("Некорректная команда", show_alert=True)
+        return
+    await _render_team_invite_menu(callback, team_id)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("team_invite_regen_"))
+async def team_invite_regen(callback: CallbackQuery):
+    team_id = _team_id_from_callback(callback.data)
+    if team_id is None:
+        await callback.answer("Некорректная команда", show_alert=True)
+        return
+
+    user = get_user(callback.from_user.id)
+    if not user or not is_captain(user['id'], team_id):
+        await callback.answer("Только капитан может управлять ссылкой команды.", show_alert=True)
+        return
+
+    token = ensure_team_invite_token(team_id, regenerate=True)
+    if not token:
+        await callback.answer("Не удалось обновить ссылку.", show_alert=True)
+        return
+
+    await _render_team_invite_menu(callback, team_id, notice="✅ Ссылка обновлена")
+    await callback.answer("Ссылка обновлена")
+
+
+@router.callback_query(F.data.startswith("team_invite_toggle_"))
+async def team_invite_toggle(callback: CallbackQuery):
+    team_id = _team_id_from_callback(callback.data)
+    if team_id is None:
+        await callback.answer("Некорректная команда", show_alert=True)
+        return
+
+    user = get_user(callback.from_user.id)
+    if not user or not is_captain(user['id'], team_id):
+        await callback.answer("Только капитан может управлять ссылкой команды.", show_alert=True)
+        return
+
+    team = get_team_by_id(team_id)
+    if not team:
+        await callback.answer("Команда не найдена", show_alert=True)
+        return
+
+    invite_enabled_raw = team['invite_enabled'] if 'invite_enabled' in team.keys() else 1
+    enabled = int(invite_enabled_raw or 0) == 1
+
+    if enabled:
+        set_team_invite_enabled(team_id, False)
+        notice = "Ссылка отключена"
+        answer_text = "Ссылка отключена"
+    else:
+        token = ensure_team_invite_token(team_id, regenerate=False)
+        if not token:
+            await callback.answer("Не удалось включить ссылку.", show_alert=True)
+            return
+        set_team_invite_enabled(team_id, True)
+        notice = "Ссылка включена"
+        answer_text = "Ссылка включена"
+
+    await _render_team_invite_menu(callback, team_id, notice=notice)
+    await callback.answer(answer_text)
+
+@router.callback_query(F.data.startswith("team_invite_mode_"))
+async def team_invite_mode_toggle(callback: CallbackQuery):
+    team_id = _team_id_from_callback(callback.data)
+    if team_id is None:
+        await callback.answer("Некорректная команда", show_alert=True)
+        return
+
+    user = get_user(callback.from_user.id)
+    if not user or not is_captain(user['id'], team_id):
+        await callback.answer("Только капитан может управлять ссылкой команды.", show_alert=True)
+        return
+
+    team = get_team_by_id(team_id)
+    if not team:
+        await callback.answer("Команда не найдена", show_alert=True)
+        return
+
+    current_mode = (team['invite_join_mode'] or 'request').strip().lower() if 'invite_join_mode' in team.keys() else 'request'
+    new_mode = 'request' if current_mode == 'direct' else 'direct'
+    set_team_invite_join_mode(team_id, new_mode)
+
+    notice = "✅ Режим ссылки: сразу вступать" if new_mode == 'direct' else "✅ Режим ссылки: по заявке"
+    await _render_team_invite_menu(callback, team_id, notice=notice)
+    await callback.answer("Режим обновлён")
+
+
+# Совместимость для уже отправленных старых кнопок
+@router.callback_query(F.data.startswith("team_invite_generate_"))
+async def team_invite_generate_legacy(callback: CallbackQuery):
+    team_id = _team_id_from_callback(callback.data)
+    if team_id is None:
+        await callback.answer("Некорректная команда", show_alert=True)
+        return
+    token = ensure_team_invite_token(team_id, regenerate=True)
+    if not token:
+        await callback.answer("Не удалось обновить ссылку.", show_alert=True)
+        return
+    await _render_team_invite_menu(callback, team_id, notice="✅ Ссылка обновлена")
+    await callback.answer("Ссылка обновлена")
+
+
+@router.callback_query(F.data.startswith("team_invite_show_"))
+async def team_invite_show_legacy(callback: CallbackQuery):
+    team_id = _team_id_from_callback(callback.data)
+    if team_id is None:
+        await callback.answer("Некорректная команда", show_alert=True)
+        return
+    await _render_team_invite_menu(callback, team_id)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("team_invite_delete_"))
+async def team_invite_delete_legacy(callback: CallbackQuery):
+    team_id = _team_id_from_callback(callback.data)
+    if team_id is None:
+        await callback.answer("Некорректная команда", show_alert=True)
+        return
+
+    user = get_user(callback.from_user.id)
+    if not user or not is_captain(user['id'], team_id):
+        await callback.answer("Только капитан может управлять ссылкой команды.", show_alert=True)
+        return
+
+    set_team_invite_enabled(team_id, False)
+    await _render_team_invite_menu(callback, team_id, notice="✅ Ссылка отключена")
+    await callback.answer("Ссылка отключена")
 
 
 @router.callback_query(F.data.startswith("leave_team_"))
@@ -306,7 +529,7 @@ async def confirm_leave_handler(callback: CallbackQuery, state: FSMContext):
         team_id = data.get('team_id')
         await state.clear()
         if team_id:
-            text, kb = await get_team_card_data(team_id, callback.from_user.id)
+            text, kb = await get_team_card_data(team_id, callback.from_user.id, bot=callback.bot)
             if text:
                 await callback.message.edit_text(text, reply_markup=kb)
             else:
@@ -470,7 +693,7 @@ async def rename_team_name(message: Message, state: FSMContext):
     conn.close()
     await state.clear()
     await message.answer("Название изменено!")
-    text, kb = await get_team_card_data(team_id, message.from_user.id)
+    text, kb = await get_team_card_data(team_id, message.from_user.id, bot=message.bot)
     await message.answer(text, reply_markup=kb)
 
 
@@ -586,7 +809,7 @@ async def add_player_username(message: Message, state: FSMContext):
             reply_markup=invite_keyboard(team_id)
         )
         await message.answer(f"Приглашение отправлено пользователю @{username}.")
-        text, kb = await get_team_card_data(team_id, message.from_user.id)
+        text, kb = await get_team_card_data(team_id, message.from_user.id, bot=message.bot)
         await message.answer(text, reply_markup=kb)
     except Exception as e:
         logger.info(f"Ошибка отправки сообщения: {e}")
@@ -796,6 +1019,20 @@ async def view_all_team(callback: CallbackQuery):
     settings = get_team_settings(team_id)
     sport = team['sport']
     sport_display = get_sport_display_name(sport)
+    token = (team['invite_token'] or '').strip() if 'invite_token' in team.keys() else ''
+    invite_enabled_raw = team['invite_enabled'] if 'invite_enabled' in team.keys() else 1
+    invite_enabled = int(invite_enabled_raw or 0) == 1
+    if invite_enabled and not token:
+        token = ensure_team_invite_token(team_id, regenerate=False) or ''
+
+    invite_link_text = ""
+    if invite_enabled and token and callback.bot:
+        try:
+            invite_link = await _team_invite_link(callback.bot, token)
+            invite_link_text = f"\nСсылка приглашения: {invite_link}"
+        except Exception:
+            invite_link_text = ""
+
     text = f"""
 Команда: {team['name']}
 Вид спорта: {sport_display}
@@ -806,6 +1043,8 @@ async def view_all_team(callback: CallbackQuery):
 Состав:
 {members_list}
     """
+    if invite_link_text:
+        text += invite_link_text
     await callback.message.edit_text(text, reply_markup=team_view_only_keyboard(team_id, sport))
     await callback.answer()
 
@@ -842,6 +1081,19 @@ async def view_open_team(callback: CallbackQuery):
     has_request = has_pending_request(user['id'], team_id)
     can_apply = not is_member and not has_request and settings['is_open']
     sport_display = get_sport_display_name(team['sport'])
+    token = (team['invite_token'] or '').strip() if 'invite_token' in team.keys() else ''
+    invite_enabled_raw = team['invite_enabled'] if 'invite_enabled' in team.keys() else 1
+    invite_enabled = int(invite_enabled_raw or 0) == 1
+    if invite_enabled and not token:
+        token = ensure_team_invite_token(team_id, regenerate=False) or ''
+
+    invite_link_text = ""
+    if invite_enabled and token and callback.bot:
+        try:
+            invite_link = await _team_invite_link(callback.bot, token)
+            invite_link_text = f"\nСсылка приглашения: {invite_link}"
+        except Exception:
+            invite_link_text = ""
 
     text = f"""
 Команда: {team['name']}
@@ -853,6 +1105,8 @@ async def view_open_team(callback: CallbackQuery):
 Состав:
 {members_list}
     """
+    if invite_link_text:
+        text += invite_link_text
     sport = team['sport']
     await callback.message.edit_text(text, reply_markup=team_view_join_keyboard(team_id, can_apply, sport))
     await callback.answer()
@@ -947,6 +1201,19 @@ async def view_search_team(callback: CallbackQuery):
     has_request = has_pending_request(user['id'], team_id)
     can_apply = not is_member and not has_request and settings['is_open']
     sport_display = get_sport_display_name(team['sport'])
+    token = (team['invite_token'] or '').strip() if 'invite_token' in team.keys() else ''
+    invite_enabled_raw = team['invite_enabled'] if 'invite_enabled' in team.keys() else 1
+    invite_enabled = int(invite_enabled_raw or 0) == 1
+    if invite_enabled and not token:
+        token = ensure_team_invite_token(team_id, regenerate=False) or ''
+
+    invite_link_text = ""
+    if invite_enabled and token and callback.bot:
+        try:
+            invite_link = await _team_invite_link(callback.bot, token)
+            invite_link_text = f"\nСсылка приглашения: {invite_link}"
+        except Exception:
+            invite_link_text = ""
 
     text = f"""
 Команда: {team['name']}
@@ -958,10 +1225,77 @@ async def view_search_team(callback: CallbackQuery):
 Состав:
 {members_list}
     """
+    if invite_link_text:
+        text += invite_link_text
     await callback.message.edit_text(text, reply_markup=team_view_search_keyboard(team_id, can_apply, query))
     await callback.answer()
 
 # --- Обработчики подачи заявки и уведомления ---
+
+
+@router.callback_query(F.data.startswith("team_join_direct_"))
+async def team_join_direct(callback: CallbackQuery):
+    team_id = _team_id_from_callback(callback.data)
+    if team_id is None:
+        await callback.answer("Некорректная команда", show_alert=True)
+        return
+
+    user = get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("Сначала зарегистрируйтесь", show_alert=True)
+        return
+
+    team = get_team_by_id(team_id)
+    if not team:
+        await callback.answer("Команда не найдена", show_alert=True)
+        return
+
+    token = (team['invite_token'] or '').strip() if 'invite_token' in team.keys() else ''
+    invite_enabled_raw = team['invite_enabled'] if 'invite_enabled' in team.keys() else 1
+    invite_enabled = int(invite_enabled_raw or 0) == 1
+    mode_value = (team['invite_join_mode'] or 'request').strip().lower() if 'invite_join_mode' in team.keys() else 'request'
+    if not invite_enabled or not token:
+        await callback.answer("Ссылка приглашения отключена капитаном.", show_alert=True)
+        return
+    if mode_value != 'direct':
+        await callback.answer("Для этой команды по ссылке доступна только подача заявки.", show_alert=True)
+        return
+
+    if is_team_member(user['id'], team_id):
+        await callback.answer("Вы уже в этой команде", show_alert=True)
+        return
+
+    current_count = get_team_members_count(team_id)
+    max_members = get_team_max_members(team_id)
+    if current_count >= max_members:
+        await callback.answer("❌ В команде уже максимальное количество участников.", show_alert=True)
+        return
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute("INSERT OR IGNORE INTO team_members (team_id, user_id) VALUES (?, ?)", (team_id, user['id']))
+        cur.execute(
+            """
+            INSERT INTO team_invites (team_id, user_id, status, type)
+            VALUES (?, ?, 'accepted', 'request')
+            ON CONFLICT(team_id, user_id) DO UPDATE SET status='accepted', type='request'
+            """,
+            (team_id, user['id'])
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        await callback.answer("Не удалось вступить в команду. Попробуйте позже.", show_alert=True)
+        return
+    finally:
+        conn.close()
+
+    await callback.answer("✅ Вы вступили в команду", show_alert=True)
+    text_card, kb_card = await get_team_card_data(team_id, callback.from_user.id, bot=callback.bot)
+    if text_card and kb_card:
+        await callback.message.edit_text(text_card, reply_markup=kb_card)
 
 
 @router.callback_query(F.data.startswith("apply_team_"))
@@ -1238,5 +1572,5 @@ async def finish_edit_max_members(user_id, message, state: FSMContext, new_max):
     update_team_max_members(team_id, new_max)
     await state.clear()
     await message.answer("Лимит изменен!")
-    text, kb = await get_team_card_data(team_id, user_id)
+    text, kb = await get_team_card_data(team_id, user_id, bot=message.bot)
     await message.answer(text, reply_markup=kb)

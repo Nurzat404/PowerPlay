@@ -1,13 +1,21 @@
 from aiogram import Router, F
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 import json
-from razryad_arena_utils import get_all_sports, get_user, get_or_create_user, update_user
-from keyboards import main_menu_keyboard, sports_choice_keyboard
+import os
+from razryad_arena_utils import (
+    get_all_sports, get_user, get_or_create_user, update_user,
+    get_team_by_invite_token, get_tournament_by_invite_token,
+    get_team_members_count, get_team_max_members, get_team_settings,
+    get_user_by_id, get_sport_display_name
+)
+from keyboards import main_menu_keyboard, sports_choice_keyboard, subscription_required_keyboard
 
 router = Router()
+
+REQUIRED_CHANNEL_USERNAME = os.getenv("REQUIRED_CHANNEL_USERNAME", "razryadarena").strip().lstrip("@")
 
 
 class Registration(StatesGroup):
@@ -18,20 +26,149 @@ class Registration(StatesGroup):
     sports = State()
 
 
+async def _handle_team_invite(message: Message, token: str) -> bool:
+    team = get_team_by_invite_token(token)
+    if not team:
+        await message.answer("Ссылка приглашения в команду недействительна или устарела.")
+        return True
+
+    captain = get_user_by_id(team['captain_id'])
+    captain_name = "Неизвестно"
+    if captain:
+        captain_name = f"{captain['first_name']} (@{captain['username']})"
+
+    settings = get_team_settings(team['id'])
+    members_count = get_team_members_count(team['id'])
+    max_members = get_team_max_members(team['id'])
+
+    invite_mode = (team['invite_join_mode'] or 'request').strip().lower() if 'invite_join_mode' in team.keys() else 'request'
+    mode_text = "⚡ Сразу вступать" if invite_mode == 'direct' else "📝 По заявке"
+
+    text = (
+        f"Приглашение в команду\n\n"
+        f"Команда: {team['name']}\n"
+        f"Вид спорта: {get_sport_display_name(team['sport'])}\n"
+        f"Город: {team['city']}\n"
+        f"Капитан: {captain_name}\n"
+        f"Участников: {members_count}/{max_members}\n"
+        f"Набор: {'Открыт' if settings and settings['is_open'] else 'Закрыт'}\n"
+    )
+
+    action_text = "⚡ Вступить в команду" if invite_mode == 'direct' else "📝 Подать заявку"
+    action_callback = f"team_join_direct_{team['id']}" if invite_mode == 'direct' else f"apply_team_{team['id']}"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=action_text, callback_data=action_callback)],
+        [InlineKeyboardButton(text="👤 К командам", callback_data="teams_menu")],
+    ])
+    await message.answer(text, reply_markup=kb)
+    return True
+
+
+async def _handle_tournament_invite(message: Message, token: str) -> bool:
+    tournament = get_tournament_by_invite_token(token)
+    if not tournament:
+        await message.answer("Ссылка приглашения в турнир недействительна или устарела.")
+        return True
+
+    status_map = {
+        'registration': 'Регистрация',
+        'active': 'Идёт',
+        'finished': 'Завершён',
+    }
+    status_display = status_map.get(tournament['status'], tournament['status'])
+
+    text = (
+        f"Приглашение в турнир\n\n"
+        f"Турнир: {tournament['name']}\n"
+        f"Вид спорта: {get_sport_display_name(tournament['sport'])}\n"
+        f"Город: {tournament['city']}\n"
+        f"Даты: {tournament['start_date']} - {tournament['end_date']}\n"
+        f"Статус: {status_display}"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏆 Открыть турнир", callback_data=f"tournament_{tournament['id']}")],
+        [InlineKeyboardButton(text="🏆 К турнирам", callback_data="tournaments")],
+    ])
+    await message.answer(text, reply_markup=kb)
+    return True
+
+
+async def _handle_start_payload(message: Message, payload: str) -> bool:
+    if payload.startswith("team_invite_"):
+        token = payload[len("team_invite_"):].strip()
+        if token:
+            return await _handle_team_invite(message, token)
+        await message.answer("Некорректная ссылка приглашения в команду.")
+        return True
+
+    if payload.startswith("tournament_invite_"):
+        token = payload[len("tournament_invite_"):].strip()
+        if token:
+            return await _handle_tournament_invite(message, token)
+        await message.answer("Некорректная ссылка приглашения в турнир.")
+        return True
+
+    return False
+
+
 @router.message(Command("start"))
-async def cmd_start(message: Message, state: FSMContext):
+async def cmd_start(message: Message, state: FSMContext, command: CommandObject):
     telegram_id = message.from_user.id
     first_name = message.from_user.first_name or ""
     last_name = message.from_user.last_name or ""
     username = message.from_user.username or ""
 
+    payload = (command.args or "").strip() if command else ""
     user = get_or_create_user(telegram_id, first_name, last_name, username)
+
+    if user and user['email'] and payload:
+        handled = await _handle_start_payload(message, payload)
+        if handled:
+            return
 
     if not user['email']:
         await state.set_state(Registration.name)
+        if payload:
+            await message.answer(
+                "Для перехода по ссылке сначала завершите регистрацию. "
+                "После регистрации снова откройте ссылку."
+            )
         await message.answer("Добро пожаловать в Разряд-Арена! Давай зарегистрируемся.\nКак тебя зовут?")
     else:
         await message.answer("Главное меню:", reply_markup=main_menu_keyboard())
+
+
+@router.callback_query(F.data == "check_subscription")
+async def check_subscription(callback: CallbackQuery, state: FSMContext):
+    channel = f"@{REQUIRED_CHANNEL_USERNAME}"
+    try:
+        member = await callback.bot.get_chat_member(channel, callback.from_user.id)
+    except Exception:
+        member = None
+
+    if member and getattr(member, 'status', None) in {'member', 'administrator', 'creator'}:
+        await callback.answer("Подписка подтверждена")
+
+        telegram_id = callback.from_user.id
+        first_name = callback.from_user.first_name or ""
+        last_name = callback.from_user.last_name or ""
+        username = callback.from_user.username or ""
+        user = get_or_create_user(telegram_id, first_name, last_name, username)
+
+        if not user or not user['email']:
+            await state.set_state(Registration.name)
+            await callback.message.answer("Добро пожаловать в Разряд-Арена! Давай зарегистрируемся.\nКак тебя зовут?")
+        else:
+            await callback.message.answer("Главное меню:", reply_markup=main_menu_keyboard())
+        return
+
+    await callback.answer("Подписка пока не найдена", show_alert=True)
+    await callback.message.answer(
+        f"Для использования бота подпишитесь на канал @{REQUIRED_CHANNEL_USERNAME} и нажмите проверку.",
+        reply_markup=subscription_required_keyboard(REQUIRED_CHANNEL_USERNAME)
+    )
 
 
 @router.message(Registration.name)

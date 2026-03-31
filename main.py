@@ -8,7 +8,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 from database import init_db
 from handlers import start, menu, teams, tournaments, ratings, admin, brackets, stats, match_manual
-from middlewares import BanCheckMiddleware
+from middlewares import BanCheckMiddleware, RequiredSubscriptionMiddleware
 from utils.notifications import dispatch_due_match_reminders
 
 logging.basicConfig(level=logging.INFO)
@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 STEAM_API_KEY = os.getenv("STEAM_API_KEY")
+REQUIRED_CHANNEL_USERNAME = os.getenv("REQUIRED_CHANNEL_USERNAME", "razryadarena")
 
 
 def _validate_required_env() -> None:
@@ -56,6 +57,8 @@ async def main():
 
     dp.message.middleware(BanCheckMiddleware())
     dp.callback_query.middleware(BanCheckMiddleware())
+    dp.message.middleware(RequiredSubscriptionMiddleware(REQUIRED_CHANNEL_USERNAME))
+    dp.callback_query.middleware(RequiredSubscriptionMiddleware(REQUIRED_CHANNEL_USERNAME))
 
     await bot.delete_webhook(drop_pending_updates=True)
     reminder_task = asyncio.create_task(reminder_worker(bot))

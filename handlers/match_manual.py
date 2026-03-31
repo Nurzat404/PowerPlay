@@ -23,6 +23,7 @@ from razryad_arena_utils import (
     replace_volleyball_set_scores,
     get_sport_display_name,
     normalize_sport_name,
+    auto_create_third_place_if_ready,
 )
 from utils.bracket_utils import advance_winner
 from utils.bracket_visualizer import generate_bracket_png
@@ -808,6 +809,8 @@ async def _finalize_non_cs2_match(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Ошибка обновления сетки", show_alert=True)
         return
 
+    third_place_result = auto_create_third_place_if_ready(tournament_id)
+
     match = _fetch_bracket_match(match_id)
     round_number = match["round_number"] if match else 0
     tournament = get_tournament_by_id(tournament_id)
@@ -820,6 +823,8 @@ async def _finalize_non_cs2_match(callback: CallbackQuery, state: FSMContext):
     os.makedirs(temp_dir, exist_ok=True)
     png_path = os.path.join(temp_dir, f"bracket_{tournament_id}.png")
     png_result = generate_bracket_png(tournament_id, png_path)
+
+    third_place_note = "\n🥉 Матч за 3-е место создан автоматически." if third_place_result.get("created") else ""
 
     summary = (
         "✅ Результат матча сохранен!\n"
@@ -878,6 +883,8 @@ async def _finalize_series(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Ошибка обновления сетки", show_alert=True)
         return
 
+    third_place_result = auto_create_third_place_if_ready(tournament_id)
+
     match = _fetch_bracket_match(match_id)
     round_number = match["round_number"] if match else 0
     tournament = get_tournament_by_id(tournament_id)
@@ -890,6 +897,8 @@ async def _finalize_series(callback: CallbackQuery, state: FSMContext):
     os.makedirs(temp_dir, exist_ok=True)
     png_path = os.path.join(temp_dir, f"bracket_{tournament_id}.png")
     png_result = generate_bracket_png(tournament_id, png_path)
+
+    third_place_note = "\n🥉 Матч за 3-е место создан автоматически." if third_place_result.get("created") else ""
 
     summary = (
         "✅ Результат матча сохранен!\n"

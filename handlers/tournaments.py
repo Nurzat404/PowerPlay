@@ -6,7 +6,7 @@ from razryad_arena_utils import (
     get_user, get_user_teams, get_tournaments_by_sport, get_tournament_by_id,
     add_tournament_application, get_all_sports, get_team_application,
     get_approved_teams_count, get_tournament_teams, is_admin, get_team_members_count, can_retry_tournament_application, get_team_by_id, get_team_members, is_captain,
-    get_sport_display_name, normalize_sport_name
+    get_sport_display_name, normalize_sport_name, ensure_tournament_invite_token
 )
 from keyboards import (
     tournaments_main_keyboard, tournaments_list_keyboard,
@@ -81,6 +81,14 @@ async def view_tournament(callback: CallbackQuery):
         'finished': 'Завершён'
     }
     status_display = status_map.get(tournament['status'], tournament['status'])
+    invite_token = ensure_tournament_invite_token(tournament_id, regenerate=False)
+    bot_username = ""
+    try:
+        me = await callback.bot.get_me()
+        bot_username = me.username or ""
+    except Exception:
+        bot_username = ""
+    invite_url = f"https://t.me/{bot_username}?start=tournament_invite_{invite_token}" if (invite_token and bot_username) else "недоступна"
     age_restriction = ""
     if tournament['min_age'] is not None and tournament['max_age'] is not None:
         age_restriction = f"\nВозраст: {tournament['min_age']}–{tournament['max_age']} лет"
@@ -94,6 +102,7 @@ async def view_tournament(callback: CallbackQuery):
 Макс. команд: {tournament['max_teams']}
 {age_restriction}
 Статус: {status_display}
+Ссылка-приглашение: {invite_url}
 """
     if tournament['description']:
         text += f"\n📝 Описание: {tournament['description']}"
@@ -179,6 +188,12 @@ async def apply_with_team(callback: CallbackQuery):
             return
         elif status == 'pending':
             await callback.answer("⏳ Заявка уже отправлена, ожидайте решения.", show_alert=True)
+            return
+        elif status == 'excluded':
+            await callback.answer(
+                "❌ Команда исключена из этого турнира. Повторная заявка возможна только после решения администратора.",
+                show_alert=True
+            )
             return
         elif status == 'rejected':
             # Проверяем, можно ли подать повторно
