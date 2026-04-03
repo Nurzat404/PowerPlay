@@ -9,6 +9,15 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+STEAM_PROFILES_URL_RE = re.compile(
+    r'^(?:https?://)?(?:www\.)?steamcommunity\.com/profiles/(\d{17,})(?:[/?#].*)?$',
+    re.IGNORECASE,
+)
+STEAM_CUSTOM_URL_RE = re.compile(
+    r'^(?:https?://)?(?:www\.)?steamcommunity\.com/id/([^/?#\s]+)(?:[/?#].*)?$',
+    re.IGNORECASE,
+)
+
 
 def _steam_api_key() -> str:
     return (os.getenv("STEAM_API_KEY") or "").strip()
@@ -30,13 +39,13 @@ def parse_steam_link(link: str) -> Optional[str]:
     if validate_steam_id64(link):
         return link
 
-    match = re.match(r'https?://steamcommunity\.com/profiles/(\d+)', link)
+    match = STEAM_PROFILES_URL_RE.match(link)
     if match:
         steam_id = match.group(1)
         if validate_steam_id64(steam_id):
             return steam_id
 
-    match = re.match(r'https?://steamcommunity\.com/id/([^/\s?]+)', link)
+    match = STEAM_CUSTOM_URL_RE.match(link)
     if match:
         return get_steam_id64_from_custom_url(match.group(1))
 
