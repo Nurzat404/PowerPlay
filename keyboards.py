@@ -354,6 +354,7 @@ def edit_profile_menu_keyboard():
         [InlineKeyboardButton(text="✏️ Возраст", callback_data="edit_age")],
         [InlineKeyboardButton(text="✏️ Любимые виды спорта",
                               callback_data="edit_sports")],
+        [InlineKeyboardButton(text="✏️ Профиль steam", callback_data="edit_steam_id")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="profile")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
