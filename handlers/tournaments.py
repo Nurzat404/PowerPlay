@@ -6,7 +6,8 @@ from razryad_arena_utils import (
     get_user, get_user_teams, get_tournaments_by_sport, get_tournament_by_id,
     add_tournament_application, get_all_sports, get_team_application,
     get_approved_teams_count, get_tournament_teams, is_admin, get_team_members_count, can_retry_tournament_application, get_team_by_id, get_team_members, is_captain,
-    get_sport_display_name, normalize_sport_name, ensure_tournament_invite_token
+    get_sport_display_name, normalize_sport_name, ensure_tournament_invite_token,
+    get_tournament_member_application_conflicts,
 )
 from keyboards import (
     tournaments_main_keyboard, tournaments_list_keyboard,
@@ -14,6 +15,32 @@ from keyboards import (
 )
 
 router = Router()
+
+
+CONFLICT_STATUS_TEXT = {
+    "pending": "заявка на рассмотрении",
+    "approved": "заявка уже одобрена",
+}
+
+
+def _format_member_display(member: dict) -> str:
+    username = member.get("username")
+    if username:
+        return f"{member.get('first_name', 'Участник')} (@{username})"
+    return member.get("first_name", "Участник")
+
+
+def _format_tournament_member_conflicts(conflicts: list[dict]) -> str:
+    lines = [
+        "❌ Нельзя подать заявку: некоторые участники уже заявлены в другой команде этого турнира.",
+        "",
+    ]
+    for conflict in conflicts:
+        status_text = CONFLICT_STATUS_TEXT.get(conflict["conflict_status"], conflict["conflict_status"])
+        lines.append(
+            f"• {_format_member_display(conflict)} — команда «{conflict['conflict_team_name']}», {status_text}."
+        )
+    return "\n".join(lines)
 
 
 @router.callback_query(F.data == "tournaments")
@@ -172,6 +199,16 @@ async def apply_with_team(callback: CallbackQuery):
         await callback.answer("❌ Подать заявку может только капитан команды.", show_alert=True)
         return
 
+    conflicts = get_tournament_member_application_conflicts(
+        tournament_id,
+        team_id,
+        statuses=("pending", "approved"),
+    )
+    if conflicts:
+        await callback.answer("❌ Есть участники, уже заявленные в другой команде.", show_alert=True)
+        await callback.message.answer(_format_tournament_member_conflicts(conflicts))
+        return
+
     # Проверка лимита команд (должна выполняться в любом случае)
     approved_count = get_approved_teams_count(tournament_id)
     if approved_count >= tournament['max_teams']:
@@ -201,6 +238,16 @@ async def apply_with_team(callback: CallbackQuery):
                 tournament_id, team_id)
             if not ok:
                 await callback.answer(f"⏱ Повторная подача будет доступна через {minutes} мин.", show_alert=True)
+                return
+
+            conflicts = get_tournament_member_application_conflicts(
+                tournament_id,
+                team_id,
+                statuses=("pending", "approved"),
+            )
+            if conflicts:
+                await callback.answer("❌ Есть участники, уже заявленные в другой команде.", show_alert=True)
+                await callback.message.answer(_format_tournament_member_conflicts(conflicts))
                 return
             # Обновляем статус
             conn = get_connection()

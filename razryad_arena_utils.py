@@ -135,6 +135,60 @@ def add_tournament_application(tournament_id, team_id):
     conn.close()
 
 
+def get_tournament_member_application_conflicts(tournament_id, team_id, statuses=None):
+    """
+    Возвращает список конфликтов по участникам команды в рамках турнира.
+
+    Конфликтом считается ситуация, когда участник команды уже состоит в другой команде
+    этого же турнира с одной из указанных заявок.
+    """
+    normalized_statuses = tuple(statuses or ("pending", "approved"))
+    if not normalized_statuses:
+        return []
+
+    placeholders = ",".join(["?"] * len(normalized_statuses))
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(f"""
+        SELECT
+            u.id AS user_id,
+            u.first_name,
+            u.username,
+            a.team_id AS conflict_team_id,
+            t.name AS conflict_team_name,
+            a.status AS conflict_status
+        FROM team_members tm_current
+        JOIN users u ON u.id = tm_current.user_id
+        JOIN team_members tm_other ON tm_other.user_id = tm_current.user_id
+        JOIN tournament_applications a ON a.team_id = tm_other.team_id
+        JOIN teams t ON t.id = a.team_id
+        WHERE tm_current.team_id=?
+          AND tm_other.team_id<>?
+          AND a.tournament_id=?
+          AND a.status IN ({placeholders})
+        ORDER BY u.first_name, t.name, a.status
+    """, (team_id, team_id, tournament_id, *normalized_statuses))
+    rows = cur.fetchall()
+    conn.close()
+
+    conflicts = []
+    seen = set()
+    for row in rows:
+        key = (row["user_id"], row["conflict_team_id"], row["conflict_status"])
+        if key in seen:
+            continue
+        seen.add(key)
+        conflicts.append({
+            "user_id": row["user_id"],
+            "first_name": row["first_name"],
+            "username": row["username"],
+            "conflict_team_id": row["conflict_team_id"],
+            "conflict_team_name": row["conflict_team_name"],
+            "conflict_status": row["conflict_status"],
+        })
+    return conflicts
+
+
 def get_pending_applications():
     conn = get_connection()
     cur = conn.cursor()
@@ -229,6 +283,29 @@ def approve_application(app_id):
                 "tournament_id": tournament_id,
                 "approved": approved_count,
                 "max_teams": max_teams
+            }
+
+        cur.execute(
+            "SELECT team_id FROM tournament_applications WHERE id=?",
+            (app_id,)
+        )
+        team_row = cur.fetchone()
+        if not team_row:
+            conn.rollback()
+            return {"ok": False, "reason": "not_found", "tournament_id": tournament_id}
+
+        conflicts = get_tournament_member_application_conflicts(
+            tournament_id,
+            team_row["team_id"],
+            statuses=("approved",),
+        )
+        if conflicts:
+            conn.rollback()
+            return {
+                "ok": False,
+                "reason": "member_conflict",
+                "tournament_id": tournament_id,
+                "conflicts": conflicts,
             }
 
         cur.execute(

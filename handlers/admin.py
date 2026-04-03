@@ -117,6 +117,59 @@ async def send_tournament_info(bot: Bot, chat_id: int, tournament_id: int, user_
 router = Router()
 PAGE_SIZE = 10
 
+
+def _build_team_roster_for_notification(members: list[dict]) -> str:
+    if not members:
+        return "—"
+
+    lines = []
+    for idx, member in enumerate(members, 1):
+        username = member['username'] if 'username' in member.keys() and member['username'] else None
+        first_name = member['first_name'] if 'first_name' in member.keys() and member['first_name'] else "Участник"
+        username_text = f"@{username}" if username else "без username"
+        lines.append(f"{idx}. {first_name} ({username_text})")
+    return "\n".join(lines)
+
+
+async def _notify_tournament_application_status(
+    bot: Bot,
+    tournament_id: int,
+    team_id: int,
+    action: str,
+):
+    tournament = get_tournament_by_id(tournament_id)
+    team = get_team_by_id(team_id)
+    members = get_team_members(team_id)
+    if not tournament or not team:
+        return
+
+    action_text = {
+        "approved": "✅ Заявка на турнир принята",
+        "rejected": "❌ Заявка на турнир отклонена",
+        "excluded": "🚫 Команда исключена из турнира",
+    }.get(action, "ℹ️ Статус заявки на турнир изменён")
+
+    text = (
+        f"{action_text}\n\n"
+        f"Турнир: {tournament['name']}\n"
+        f"Команда: {team['name']}\n\n"
+        "Состав:\n"
+        f"{_build_team_roster_for_notification(members)}"
+    )
+
+    captain = get_user_by_id(team['captain_id']) if team['captain_id'] else None
+    captain_chat_id = captain['telegram_id'] if captain and 'telegram_id' in captain.keys() else None
+    if not captain_chat_id:
+        return
+
+    try:
+        await bot.send_message(int(captain_chat_id), text)
+    except Exception as exc:
+        logger.warning(
+            "Не удалось отправить уведомление капитану team_id=%s tournament_id=%s captain_chat_id=%s: %s",
+            team_id, tournament_id, captain_chat_id, exc
+        )
+
 def _build_team_members_block(members):
     if not members:
         return "—"
@@ -318,6 +371,94 @@ def _get_overbooked_tournaments_map(tournament_ids: list[int]) -> dict[int, dict
             }
     return overbooked
 
+TOURNAMENT_APPLICATION_SECTIONS = {
+    "approved": {
+        "title": "✅ Участники турнира",
+        "status": "approved",
+        "empty": "В этом турнире пока нет одобренных команд.",
+        "description": "Здесь команды, которые уже допущены к турниру.",
+        "action_hint": "Откройте карточку команды, чтобы посмотреть состав и при необходимости исключить её из турнира.",
+        "order": "a.updated_at DESC, a.id DESC",
+    },
+    "pending": {
+        "title": "⏳ Новые заявки",
+        "status": "pending",
+        "empty": "Новых заявок сейчас нет.",
+        "description": "Здесь заявки, которые ждут решения администратора.",
+        "action_hint": "Откройте карточку команды, чтобы проверить соответствие турниру и принять решение.",
+        "order": "a.applied_at DESC, a.id DESC",
+    },
+    "excluded": {
+        "title": "🚫 Исключенные",
+        "status": "excluded",
+        "empty": "Исключенных команд нет.",
+        "description": "Здесь команды, исключенные из турнира после одобрения.",
+        "action_hint": "Откройте карточку команды, если нужно вернуть ей право на повторную заявку.",
+        "order": "a.updated_at DESC, a.id DESC",
+    },
+    "rejected": {
+        "title": "📚 Отклоненные",
+        "status": "rejected",
+        "empty": "Отклоненных заявок пока нет.",
+        "description": "Это архив отклоненных заявок без рабочих действий.",
+        "action_hint": "Раздел только для просмотра истории решений.",
+        "order": "a.updated_at DESC, a.id DESC",
+    },
+}
+
+
+def _get_tournament_application_status_counts(tournament_id: int) -> dict[str, int]:
+    counts = {key: 0 for key in TOURNAMENT_APPLICATION_SECTIONS}
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT status, COUNT(*) AS total
+        FROM tournament_applications
+        WHERE tournament_id=?
+        GROUP BY status
+    """, (tournament_id,))
+    rows = cur.fetchall()
+    conn.close()
+
+    for row in rows:
+        status = row["status"]
+        if status in counts:
+            counts[status] = row["total"]
+    return counts
+
+
+def _section_label(section: str) -> str:
+    config = TOURNAMENT_APPLICATION_SECTIONS.get(section, {})
+    return config.get("title", section)
+
+
+def _section_back_callback(section: str, tournament_id: int, offset: int) -> str:
+    return f"admin_tournament_section_page_{section}_{tournament_id}_{offset}"
+
+
+def _build_tournament_hub_keyboard(tournament_id: int, counts: dict[str, int]):
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text=f"✅ Участники ({counts['approved']})",
+        callback_data=f"admin_tournament_section_approved_{tournament_id}"
+    )
+    builder.button(
+        text=f"⏳ Новые заявки ({counts['pending']})",
+        callback_data=f"admin_tournament_section_pending_{tournament_id}"
+    )
+    builder.button(
+        text=f"🚫 Исключенные ({counts['excluded']})",
+        callback_data=f"admin_tournament_section_excluded_{tournament_id}"
+    )
+    builder.button(
+        text=f"📚 Отклоненные ({counts['rejected']})",
+        callback_data=f"admin_tournament_section_rejected_{tournament_id}"
+    )
+    builder.button(text="🔙 Назад к турниру",
+                   callback_data=f"admin_tournament_manage_{tournament_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
 def _build_approve_error_text(result: dict) -> str:
     reason = result.get("reason")
     if reason == "limit_reached":
@@ -330,6 +471,17 @@ def _build_approve_error_text(result: dict) -> str:
         return "Одобрение доступно только на этапе регистрации."
     if reason == "already_processed":
         return "Заявка уже обработана другим админом."
+    if reason == "member_conflict":
+        conflicts = result.get("conflicts") or []
+        if not conflicts:
+            return "Участники команды уже есть в другой одобренной команде этого турнира."
+        lines = ["Нельзя одобрить заявку: участники уже есть в другой одобренной команде:"]
+        for conflict in conflicts[:5]:
+            username = f"@{conflict['username']}" if conflict.get("username") else "без username"
+            lines.append(
+                f"- {conflict.get('first_name', 'Участник')} ({username}) -> «{conflict['conflict_team_name']}»"
+            )
+        return "\n".join(lines)
     if reason == "not_found":
         return "Заявка не найдена."
     return "Не удалось одобрить заявку. Попробуйте ещё раз."
@@ -748,6 +900,18 @@ async def admin_tournament_manage(callback: CallbackQuery):
     """, (tournament_id,))
     pending_count = cur.fetchone()[0]
 
+    cur.execute("""
+        SELECT COUNT(*) FROM tournament_applications
+        WHERE tournament_id=? AND status='excluded'
+    """, (tournament_id,))
+    excluded_count = cur.fetchone()[0]
+
+    cur.execute("""
+        SELECT COUNT(*) FROM tournament_applications
+        WHERE tournament_id=? AND status='rejected'
+    """, (tournament_id,))
+    rejected_count = cur.fetchone()[0]
+
     conn.close()
 
     # Показываем только принятые команды (approved)
@@ -788,6 +952,9 @@ async def admin_tournament_manage(callback: CallbackQuery):
 Возраст: {age_text}
 Даты: {tournament['start_date']} - {tournament['end_date']}
 {teams_text}
+Новые заявки: {pending_count}
+Исключенные: {excluded_count}
+Отклоненные: {rejected_count}
 Сетка: {'✅ Сгенерирована' if tournament['bracket_generated'] else '❌ Не сгенерирована'}
 Статус: {status_display}
 """
@@ -812,8 +979,8 @@ async def admin_tournament_manage(callback: CallbackQuery):
         builder.button(text="🏆 Завершить турнир",
                        callback_data=f"admin_finish_tournament_{tournament_id}")
 
-    # Список команд и заявок (объединяем)
-    builder.button(text="📋 Список команд и заявок",
+    # Команды и заявки открываются через отдельный хаб со статусами.
+    builder.button(text="👥 Команды и заявки",
                    callback_data=f"admin_tournament_teams_{tournament_id}")
 
     # Редактирование турнира
@@ -1076,7 +1243,7 @@ async def admin_pending_team_info(callback: CallbackQuery):
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
 
-@router.callback_query(F.data.regexp(r"^approve_\d+(?:_\d+)?(?:_\d+)?$"))
+@router.callback_query(F.data.regexp(r"^approve_\d+(?:_\d+)?(?:_\d+)?(?:_[a-z]+)?$"))
 async def approve_app(callback: CallbackQuery):
     """Одобрение заявки."""
     if not is_admin(callback.from_user.id):
@@ -1087,20 +1254,31 @@ async def approve_app(callback: CallbackQuery):
     app_id = int(parts[1])
     tournament_id = int(parts[2]) if len(parts) > 2 else None
     page_offset = int(parts[3]) if len(parts) > 3 else 0
+    section = parts[4] if len(parts) > 4 else None
+    app = _get_tournament_application_details(app_id)
 
     result = approve_application(app_id)
     if result.get("ok"):
+        if app:
+            await _notify_tournament_application_status(
+                callback.bot,
+                app['tournament_id'],
+                app['team_id'],
+                "approved",
+            )
         await callback.answer("Заявка одобрена!")
     else:
         await callback.answer(_build_approve_error_text(result), show_alert=True)
 
-    # Возврат к списку команд турнира
     if tournament_id:
-        await show_tournament_teams_list(callback.message, tournament_id, offset=page_offset)
+        if section in TOURNAMENT_APPLICATION_SECTIONS:
+            await show_tournament_application_section(callback.message, tournament_id, section, offset=page_offset)
+        else:
+            await show_tournament_applications_hub(callback.message, tournament_id)
     else:
         await show_admin_applications_list(callback.message)
 
-@router.callback_query(F.data.regexp(r"^reject_\d+(?:_\d+)?(?:_\d+)?$"))
+@router.callback_query(F.data.regexp(r"^reject_\d+(?:_\d+)?(?:_\d+)?(?:_[a-z]+)?$"))
 async def reject_app(callback: CallbackQuery):
     """Отклонение заявки."""
     if not is_admin(callback.from_user.id):
@@ -1111,13 +1289,24 @@ async def reject_app(callback: CallbackQuery):
     app_id = int(parts[1])
     tournament_id = int(parts[2]) if len(parts) > 2 else None
     page_offset = int(parts[3]) if len(parts) > 3 else 0
+    section = parts[4] if len(parts) > 4 else None
+    app = _get_tournament_application_details(app_id)
 
     reject_application(app_id)
+    if app:
+        await _notify_tournament_application_status(
+            callback.bot,
+            app['tournament_id'],
+            app['team_id'],
+            "rejected",
+        )
     await callback.answer("Заявка отклонена!")
 
-    # Возврат к списку команд турнира
     if tournament_id:
-        await show_tournament_teams_list(callback.message, tournament_id, offset=page_offset)
+        if section in TOURNAMENT_APPLICATION_SECTIONS:
+            await show_tournament_application_section(callback.message, tournament_id, section, offset=page_offset)
+        else:
+            await show_tournament_applications_hub(callback.message, tournament_id)
     else:
         await show_admin_applications_list(callback.message)
 
@@ -1136,18 +1325,53 @@ async def exclude_app(callback: CallbackQuery):
 
 # ---------- Заявки на конкретный турнир ----------
 
-async def show_tournament_teams_list(message, tournament_id, offset: int = 0):
-    """Показывает список команд и заявок на турнир."""
+async def show_tournament_applications_hub(message, tournament_id: int):
     tournament = get_tournament_by_id(tournament_id)
-
     if not tournament:
         await message.answer("Турнир не найден.")
         return
 
+    counts = _get_tournament_application_status_counts(tournament_id)
+    approved_count, max_teams = _get_tournament_capacity_info(tournament_id)
+
+    text = (
+        "👥 Команды и заявки турнира\n\n"
+        f"Турнир: {tournament['name']}\n"
+        f"✅ Участники: {counts['approved']}"
+    )
+    if max_teams is not None:
+        text += f" из {max_teams}"
+    text += (
+        f"\n⏳ Новые заявки: {counts['pending']}\n"
+        f"🚫 Исключенные: {counts['excluded']}\n"
+        f"📚 Отклоненные: {counts['rejected']}"
+    )
+
+    if max_teams is not None and max_teams > 0 and approved_count > max_teams:
+        text += f"\n\n⚠️ Переполнение: одобрено {approved_count}/{max_teams}"
+
+    text += "\n\nВыберите раздел:"
+    await message.edit_text(
+        text,
+        reply_markup=_build_tournament_hub_keyboard(tournament_id, counts)
+    )
+
+
+async def show_tournament_application_section(message, tournament_id: int, section: str, offset: int = 0):
+    config = TOURNAMENT_APPLICATION_SECTIONS.get(section)
+    tournament = get_tournament_by_id(tournament_id)
+
+    if not config or not tournament:
+        await message.answer("Турнир или раздел не найден.")
+        return
+
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute(
-        "SELECT COUNT(*) FROM tournament_applications WHERE tournament_id=?", (tournament_id,))
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM tournament_applications
+        WHERE tournament_id=? AND status=?
+    """, (tournament_id, config["status"]))
     total = cur.fetchone()[0]
 
     if total > 0 and offset >= total:
@@ -1155,111 +1379,116 @@ async def show_tournament_teams_list(message, tournament_id, offset: int = 0):
     if offset < 0:
         offset = 0
 
-    cur.execute("""
-        SELECT a.id, a.team_id, a.status, t.name as team_name, t.captain_id
+    cur.execute(f"""
+        SELECT a.id, a.team_id, a.status, t.name AS team_name
         FROM tournament_applications a
         JOIN teams t ON a.team_id = t.id
-        WHERE a.tournament_id=?
-        ORDER BY
-            CASE a.status
-                WHEN 'approved' THEN 1
-                WHEN 'pending' THEN 2
-                WHEN 'rejected' THEN 3
-                WHEN 'excluded' THEN 4
-            END,
-            a.applied_at DESC
+        WHERE a.tournament_id=? AND a.status=?
+        ORDER BY {config["order"]}
         LIMIT ? OFFSET ?
-    """, (tournament_id, PAGE_SIZE, offset))
+    """, (tournament_id, config["status"], PAGE_SIZE, offset))
     apps = cur.fetchall()
     conn.close()
 
     if not apps:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 Назад",
-                                  callback_data=f"admin_tournament_manage_{tournament_id}")]
-        ])
+        builder = InlineKeyboardBuilder()
+        builder.button(text="🔙 Назад к разделам",
+                       callback_data=f"admin_tournament_teams_{tournament_id}")
+        builder.adjust(1)
         await message.edit_text(
-            f"Нет команд в турнире «{tournament['name']}».",
-            reply_markup=kb
+            f"{config['title']}\n\nТурнир: {tournament['name']}\n\n{config['empty']}",
+            reply_markup=builder.as_markup()
         )
         return
 
     end_pos = min(offset + PAGE_SIZE, total)
-    text = f"📋 Список команд и заявок ({offset + 1}-{end_pos} из {total})\nТурнир: {tournament['name']}\n\n"
+    text = (
+        f"{config['title']} ({offset + 1}-{end_pos} из {total})\n"
+        f"Турнир: {tournament['name']}\n\n"
+        f"{config['description']}\n\n"
+    )
+
+    for index, app in enumerate(apps, start=offset + 1):
+        text += f"{index}. {app['team_name']}\n"
+
+    text += f"\n{config['action_hint']}"
+
+    if section == "approved" and (tournament['status'] != 'registration' or tournament['bracket_generated']):
+        text += "\n\nℹ️ Исключение недоступно: турнир уже не на этапе регистрации или сетка уже сгенерирована."
+
     builder = InlineKeyboardBuilder()
-
-    approved_count, max_teams = _get_tournament_capacity_info(tournament_id)
-    if max_teams is not None and max_teams > 0 and approved_count > max_teams:
-        text += f"⚠️ Переполнение: одобрено {approved_count}/{max_teams}\n\n"
-
     for app in apps:
-        status_map = {
-            'approved': '✅',
-            'pending': '⏳',
-            'rejected': '❌',
-            'excluded': '🚫'
-        }
-        status_text = {
-            'approved': 'Одобрено',
-            'pending': 'На рассмотрении',
-            'rejected': 'Отклонено',
-            'excluded': 'Исключено'
-        }
-        icon = status_map.get(app['status'], '❓')
-        text += f"{icon} {app['team_name']} ({status_text.get(app['status'], app['status'])})\n"
-
-        # Кнопки только для pending
-        if app['status'] == 'pending':
-            builder.button(text=f"ℹ️ {app['team_name']}",
-                           callback_data=f"admin_tournament_team_info_{tournament_id}_{app['team_id']}_{app['id']}_{offset}")
-            builder.button(text=f"✅ Одобрить",
-                           callback_data=f"approve_{app['id']}_{tournament_id}_{offset}")
-            builder.button(text=f"❌ Отклонить",
-                           callback_data=f"reject_{app['id']}_{tournament_id}_{offset}")
-        elif app['status'] == 'excluded':
-            builder.button(text=f"♻️ Разрешить повторную ({app['team_name']})",
-                           callback_data=f"admin_tournament_allow_reapply_{tournament_id}_{app['id']}_{offset}")
+        builder.button(
+            text=f"ℹ️ {app['team_name']}",
+            callback_data=f"admin_tournament_team_info_{section}_{tournament_id}_{app['team_id']}_{app['id']}_{offset}"
+        )
 
     nav_buttons = []
     if offset > 0:
         nav_buttons.append(InlineKeyboardButton(
-            text="◀️", callback_data=f"admin_tournament_teams_page_{tournament_id}_{offset-PAGE_SIZE}"))
+            text="◀️", callback_data=f"admin_tournament_section_page_{section}_{tournament_id}_{offset-PAGE_SIZE}"))
     if offset + PAGE_SIZE < total:
         nav_buttons.append(InlineKeyboardButton(
-            text="▶️", callback_data=f"admin_tournament_teams_page_{tournament_id}_{offset+PAGE_SIZE}"))
+            text="▶️", callback_data=f"admin_tournament_section_page_{section}_{tournament_id}_{offset+PAGE_SIZE}"))
     if nav_buttons:
         builder.row(*nav_buttons)
 
-    if tournament['status'] == 'registration' and not tournament['bracket_generated']:
-        builder.button(text="🚫 Исключение команд из турнира",
-                       callback_data=f"admin_tournament_exclusions_{tournament_id}")
-    builder.button(text="🔙 Назад",
-                   callback_data=f"admin_tournament_manage_{tournament_id}")
-    builder.adjust(3)
+    builder.button(text="🔙 Назад к разделам",
+                   callback_data=f"admin_tournament_teams_{tournament_id}")
+    builder.adjust(1)
 
     await message.edit_text(text, reply_markup=builder.as_markup())
 
+
+@router.callback_query(F.data.startswith("admin_tournament_section_page_"))
+async def admin_tournament_section_page(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+
+    parts = callback.data.split("_")
+    section = parts[4]
+    tournament_id = int(parts[5])
+    offset = int(parts[6])
+    await show_tournament_application_section(callback.message, tournament_id, section, offset=offset)
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^admin_tournament_section_(approved|pending|excluded|rejected)_\d+$"))
+async def admin_tournament_section(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+
+    parts = callback.data.split("_")
+    section = parts[3]
+    tournament_id = int(parts[4])
+    await show_tournament_application_section(callback.message, tournament_id, section, offset=0)
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^admin_tournament_teams_\d+$"))
+async def admin_tournament_teams(callback: CallbackQuery):
+    """Хаб раздела команд и заявок конкретного турнира."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+
+    tournament_id = int(callback.data.split("_")[3])
+    await show_tournament_applications_hub(callback.message, tournament_id)
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("admin_tournament_teams_page_"))
-async def admin_tournament_teams_page(callback: CallbackQuery):
+async def admin_tournament_teams_page_legacy(callback: CallbackQuery):
+    """Устаревшая пагинация общего списка: перенаправляет в новый хаб."""
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
 
     parts = callback.data.split("_")
     tournament_id = int(parts[4])
-    offset = int(parts[5])
-    await show_tournament_teams_list(callback.message, tournament_id, offset=offset)
-    await callback.answer()
-
-@router.callback_query(F.data.regexp(r"^admin_tournament_teams_\d+$"))
-async def admin_tournament_teams(callback: CallbackQuery):
-    """Список команд и заявок на конкретный турнир."""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-
-    tournament_id = int(callback.data.split("_")[3])
-    await show_tournament_teams_list(callback.message, tournament_id, offset=0)
+    await show_tournament_applications_hub(callback.message, tournament_id)
     await callback.answer()
 
 async def show_tournament_exclusions_list(message, tournament_id, offset: int = 0):
@@ -1269,7 +1498,7 @@ async def show_tournament_exclusions_list(message, tournament_id, offset: int = 
         return
     if tournament['status'] != 'registration' or tournament['bracket_generated']:
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 К списку заявок",
+            [InlineKeyboardButton(text="🔙 К разделам",
                                   callback_data=f"admin_tournament_teams_{tournament_id}")]
         ])
         await message.edit_text(
@@ -1305,8 +1534,8 @@ async def show_tournament_exclusions_list(message, tournament_id, offset: int = 
 
     if not apps:
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 К списку заявок",
-                                  callback_data=f"admin_tournament_teams_{tournament_id}")]
+            [InlineKeyboardButton(text="🔙 К участникам",
+                                  callback_data=f"admin_tournament_section_approved_{tournament_id}")]
         ])
         await message.edit_text("Нет одобренных команд для исключения.", reply_markup=kb)
         return
@@ -1335,18 +1564,20 @@ async def show_tournament_exclusions_list(message, tournament_id, offset: int = 
     if nav_buttons:
         builder.row(*nav_buttons)
 
-    builder.button(text="🔙 К списку заявок",
-                   callback_data=f"admin_tournament_teams_{tournament_id}")
+    builder.button(text="🔙 К участникам",
+                   callback_data=f"admin_tournament_section_approved_{tournament_id}")
     builder.adjust(1)
     await message.edit_text(text, reply_markup=builder.as_markup())
 
-async def show_exclusion_confirm(message, tournament_id: int, app_id: int, offset: int):
+async def show_exclusion_confirm(message, tournament_id: int, app_id: int, offset: int, return_callback: str | None = None):
     app = _get_tournament_application_details(app_id)
     tournament = get_tournament_by_id(tournament_id)
+    if return_callback is None:
+        return_callback = f"admin_tournament_exclusions_page_{tournament_id}_{offset}"
     if not app or not tournament or app['tournament_id'] != tournament_id:
         await message.edit_text("Заявка не найдена.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔙 К исключению команд",
-                                  callback_data=f"admin_tournament_exclusions_{tournament_id}")]
+            [InlineKeyboardButton(text="🔙 Назад",
+                                  callback_data=return_callback)]
         ]))
         return
 
@@ -1358,9 +1589,9 @@ async def show_exclusion_confirm(message, tournament_id: int, app_id: int, offse
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Да, исключить",
-                              callback_data=f"admin_tournament_exclude_confirm_{tournament_id}_{app_id}_{offset}")],
+                              callback_data=f"admin_tournament_exclude_confirm_{tournament_id}_{app_id}_{offset}_approved")],
         [InlineKeyboardButton(text="❌ Нет",
-                              callback_data=f"admin_tournament_exclusions_page_{tournament_id}_{offset}")]
+                              callback_data=return_callback)]
     ])
     await message.edit_text(text, reply_markup=kb)
 
@@ -1370,7 +1601,7 @@ async def admin_tournament_exclusions(callback: CallbackQuery):
         await callback.answer("Нет прав", show_alert=True)
         return
     tournament_id = int(callback.data.split("_")[3])
-    await show_tournament_exclusions_list(callback.message, tournament_id, offset=0)
+    await show_tournament_application_section(callback.message, tournament_id, "approved", offset=0)
     await callback.answer()
 
 @router.callback_query(F.data.startswith("admin_tournament_exclusions_page_"))
@@ -1393,7 +1624,13 @@ async def admin_tournament_exclude_pick(callback: CallbackQuery):
     tournament_id = int(parts[4])
     app_id = int(parts[5])
     offset = int(parts[6])
-    await show_exclusion_confirm(callback.message, tournament_id, app_id, offset)
+    await show_exclusion_confirm(
+        callback.message,
+        tournament_id,
+        app_id,
+        offset,
+        return_callback=f"admin_tournament_section_page_approved_{tournament_id}_{offset}"
+    )
     await callback.answer()
 
 @router.callback_query(F.data.startswith("admin_tournament_exclude_confirm_"))
@@ -1405,14 +1642,26 @@ async def admin_tournament_exclude_confirm(callback: CallbackQuery):
     tournament_id = int(parts[4])
     app_id = int(parts[5])
     offset = int(parts[6])
+    section = parts[7] if len(parts) > 7 else None
+    app = _get_tournament_application_details(app_id)
 
     result = exclude_team_from_tournament(app_id)
     if result.get("ok"):
+        if app:
+            await _notify_tournament_application_status(
+                callback.bot,
+                app['tournament_id'],
+                app['team_id'],
+                "excluded",
+            )
         await callback.answer("Команда исключена из турнира.")
     else:
         await callback.answer(_build_exclude_error_text(result), show_alert=True)
 
-    await show_tournament_exclusions_list(callback.message, tournament_id, offset=offset)
+    if section in TOURNAMENT_APPLICATION_SECTIONS:
+        await show_tournament_application_section(callback.message, tournament_id, section, offset=offset)
+    else:
+        await show_tournament_exclusions_list(callback.message, tournament_id, offset=offset)
 
 @router.callback_query(F.data.startswith("admin_tournament_allow_reapply_"))
 async def admin_tournament_allow_reapply(callback: CallbackQuery):
@@ -1424,6 +1673,7 @@ async def admin_tournament_allow_reapply(callback: CallbackQuery):
     tournament_id = int(parts[4])
     app_id = int(parts[5])
     offset = int(parts[6])
+    section = parts[7] if len(parts) > 7 else None
 
     result = allow_reapply_excluded_application(app_id)
     if result.get("ok"):
@@ -1441,7 +1691,10 @@ async def admin_tournament_allow_reapply(callback: CallbackQuery):
         else:
             await callback.answer("Не удалось изменить статус заявки.", show_alert=True)
 
-    await show_tournament_teams_list(callback.message, tournament_id, offset=offset)
+    if section in TOURNAMENT_APPLICATION_SECTIONS:
+        await show_tournament_application_section(callback.message, tournament_id, section, offset=offset)
+    else:
+        await show_tournament_applications_hub(callback.message, tournament_id)
 
 @router.callback_query(F.data.startswith("admin_tournament_team_info_"))
 async def admin_tournament_team_info(callback: CallbackQuery):
@@ -1451,10 +1704,19 @@ async def admin_tournament_team_info(callback: CallbackQuery):
         return
 
     parts = callback.data.split("_")
-    tournament_id = int(parts[4])
-    team_id = int(parts[5])
-    app_id = int(parts[6])
-    offset = int(parts[7]) if len(parts) > 7 else 0
+    if len(parts) > 8 and parts[4] in TOURNAMENT_APPLICATION_SECTIONS:
+        section = parts[4]
+        tournament_id = int(parts[5])
+        team_id = int(parts[6])
+        app_id = int(parts[7])
+        offset = int(parts[8]) if len(parts) > 8 else 0
+    else:
+        tournament_id = int(parts[4])
+        team_id = int(parts[5])
+        app_id = int(parts[6])
+        offset = int(parts[7]) if len(parts) > 7 else 0
+        app = _get_tournament_application_details(app_id)
+        section = app['status'] if app and app['status'] in TOURNAMENT_APPLICATION_SECTIONS else 'pending'
 
     tournament = get_tournament_by_id(tournament_id)
     app = _get_tournament_application_details(app_id)
@@ -1472,13 +1734,22 @@ async def admin_tournament_team_info(callback: CallbackQuery):
         return
 
     builder = InlineKeyboardBuilder()
-    if app['status'] == 'pending':
+    can_exclude = tournament['status'] == 'registration' and not tournament['bracket_generated']
+
+    if section == 'pending' and app['status'] == 'pending':
         builder.button(text="✅ Одобрить",
-                       callback_data=f"approve_{app_id}_{tournament_id}_{offset}")
+                       callback_data=f"approve_{app_id}_{tournament_id}_{offset}_{section}")
         builder.button(text="❌ Отклонить",
-                       callback_data=f"reject_{app_id}_{tournament_id}_{offset}")
-    builder.button(text="🔙 Назад к заявкам",
-                   callback_data=f"admin_tournament_teams_page_{tournament_id}_{offset}")
+                       callback_data=f"reject_{app_id}_{tournament_id}_{offset}_{section}")
+    elif section == 'approved' and app['status'] == 'approved' and can_exclude:
+        builder.button(text="🚫 Исключить из турнира",
+                       callback_data=f"admin_tournament_exclude_pick_{tournament_id}_{app_id}_{offset}")
+    elif section == 'excluded' and app['status'] == 'excluded':
+        builder.button(text="♻️ Разрешить повторную заявку",
+                       callback_data=f"admin_tournament_allow_reapply_{tournament_id}_{app_id}_{offset}_{section}")
+
+    builder.button(text=f"🔙 Назад в раздел: {_section_label(section)}",
+                   callback_data=_section_back_callback(section, tournament_id, offset))
     builder.adjust(2)
 
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
@@ -1486,10 +1757,9 @@ async def admin_tournament_team_info(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("admin_tournament_applications_"))
 async def admin_tournament_applications(callback: CallbackQuery):
-    """Заявки на конкретный турнир (устаревшее, перенаправляет на teams)."""
-    # Перенаправляем на новый обработчик teams
+    """Устаревший callback: открывает новый хаб раздела турнира."""
     tournament_id = int(callback.data.split("_")[3])
-    await show_tournament_teams_list(callback.message, tournament_id)
+    await show_tournament_applications_hub(callback.message, tournament_id)
     await callback.answer()
 
 # ---------- Создание матча ----------

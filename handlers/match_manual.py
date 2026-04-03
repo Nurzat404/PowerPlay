@@ -36,10 +36,11 @@ CS2_MAPS = [
     ("de_inferno", "Inferno"),
     ("de_nuke", "Nuke"),
     ("de_overpass", "Overpass"),
-    ("de_vertigo", "Vertigo"),
+    ("de_dust2", "Dust2"),
     ("de_ancient", "Ancient"),
     ("de_anubis", "Anubis"),
 ]
+CUSTOM_CS2_MAP_TOKEN = "custom"
 
 
 def _is_cancel(text: str) -> bool:
@@ -69,6 +70,7 @@ def _map_keyboard(tournament_id: int):
     builder = InlineKeyboardBuilder()
     for map_id, map_name in CS2_MAPS:
         builder.button(text=map_name, callback_data=f"manual_map_{map_id}")
+    builder.button(text="✍️ Своя карта", callback_data=f"manual_map_{CUSTOM_CS2_MAP_TOKEN}")
     builder.button(text="❌ Отмена", callback_data=f"view_bracket_{tournament_id}")
     builder.adjust(3)
     return builder.as_markup()
@@ -137,6 +139,23 @@ def _get_steam_label(steam_id: str | None) -> str:
         return "Steam: ❌"
     profile_name = get_steam_profile_name(steam_id)
     return f"Steam: {profile_name}" if profile_name else "Steam: [профиль]"
+
+
+async def _prompt_map_score_input(target: Message | CallbackQuery, state: FSMContext, map_name: str):
+    data = await state.get_data()
+    await state.update_data(current_map=map_name)
+
+    text = (
+        f"🗺 Карта {data.get('current_map_number', 1)}/{data.get('total_maps', 1)}: {map_name}\n\n"
+        f"🔵 {data.get('team1_name')} vs 🔴 {data.get('team2_name')}\n\n"
+        "Введите счет в формате team1:team2\n"
+        "Пример: 16:14"
+    )
+    await state.set_state(ManualMatchInput.score_input)
+    if isinstance(target, CallbackQuery):
+        await target.message.answer(text, reply_markup=_cancel_keyboard(data.get("tournament_id")))
+    else:
+        await target.answer(text, reply_markup=_cancel_keyboard(data.get("tournament_id")))
 
 
 async def _show_map_selection(target: Message | CallbackQuery, state: FSMContext):
@@ -392,18 +411,36 @@ async def select_format(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(ManualMatchInput.map_select, F.data.startswith("manual_map_"))
 async def select_map(callback: CallbackQuery, state: FSMContext):
     map_name = callback.data.split("_", 2)[2]
-    data = await state.get_data()
-    await state.update_data(current_map=map_name)
+    if map_name == CUSTOM_CS2_MAP_TOKEN:
+        await state.set_state(ManualMatchInput.custom_map_input)
+        await callback.message.answer(
+            "✍️ Введите название карты вручную.\n\n"
+            "Например: Train, Cache или любая другая карта.",
+            reply_markup=_cancel_keyboard((await state.get_data()).get("tournament_id"))
+        )
+        await callback.answer()
+        return
 
-    text = (
-        f"🗺 Карта {data.get('current_map_number', 1)}/{data.get('total_maps', 1)}: {map_name}\n\n"
-        f"🔵 {data.get('team1_name')} vs 🔴 {data.get('team2_name')}\n\n"
-        "Введите счет в формате team1:team2\n"
-        "Пример: 16:14"
-    )
-    await state.set_state(ManualMatchInput.score_input)
-    await callback.message.answer(text, reply_markup=_cancel_keyboard(data.get("tournament_id")))
+    await _prompt_map_score_input(callback, state, map_name)
     await callback.answer()
+
+
+@router.message(ManualMatchInput.custom_map_input)
+async def input_custom_map_name(message: Message, state: FSMContext):
+    map_name = (message.text or "").strip()
+    if _is_cancel(map_name):
+        await _show_map_selection(message, state)
+        return
+
+    if not map_name:
+        await message.answer("❌ Название карты не может быть пустым. Введите название карты.")
+        return
+
+    if len(map_name) > 50:
+        await message.answer("❌ Название карты слишком длинное. Используйте до 50 символов.")
+        return
+
+    await _prompt_map_score_input(message, state, map_name)
 
 
 @router.message(ManualMatchInput.score_input)
@@ -928,4 +965,3 @@ async def _finalize_series(callback: CallbackQuery, state: FSMContext):
         return_callback=f"view_bracket_{tournament_id}",
     )
     await callback.answer()
-
