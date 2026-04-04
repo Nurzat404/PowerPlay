@@ -4,6 +4,7 @@ import logging
 import os
 import re
 from typing import Optional
+from xml.etree import ElementTree
 
 import requests
 
@@ -21,6 +22,13 @@ STEAM_CUSTOM_URL_RE = re.compile(
 
 def _steam_api_key() -> str:
     return (os.getenv("STEAM_API_KEY") or "").strip()
+
+
+def _steam_headers() -> dict:
+    return {
+        "User-Agent": "RazryadArenaBot/1.0",
+        "Accept": "application/json, text/xml, application/xml, text/plain, */*",
+    }
 
 
 def validate_steam_id64(steam_id: str) -> bool:
@@ -53,29 +61,56 @@ def parse_steam_link(link: str) -> Optional[str]:
 
 
 def get_steam_id64_from_custom_url(custom_url: str) -> Optional[str]:
-    """Resolve custom Steam URL to SteamID64 via Steam Web API."""
-    steam_api_key = _steam_api_key()
-    if not steam_api_key:
-        logger.warning("STEAM_API_KEY is not configured")
+    """Resolve custom Steam URL to SteamID64 via Steam Web API or profile XML fallback."""
+    custom_url = (custom_url or "").strip().strip("/")
+    if not custom_url:
         return None
+
+    steam_api_key = _steam_api_key()
+
+    if steam_api_key:
+        try:
+            response = requests.get(
+                "https://api.steampowered.com/ISteamUser/ResolveVanityURL/v0001/",
+                params={"key": steam_api_key, "vanityurl": custom_url},
+                headers=_steam_headers(),
+                timeout=5,
+            )
+            response.raise_for_status()
+            try:
+                data = response.json()
+            except ValueError:
+                logger.warning(
+                    "ResolveVanityURL returned non-JSON response: status=%s content_type=%s body=%r",
+                    response.status_code,
+                    response.headers.get("Content-Type"),
+                    response.text[:200],
+                )
+            else:
+                if data.get('response', {}).get('success') == 1:
+                    steam_id = data['response'].get('steamid')
+                    if steam_id and validate_steam_id64(steam_id):
+                        return steam_id
+        except Exception:
+            logger.exception("ResolveVanityURL request failed")
+    else:
+        logger.warning("STEAM_API_KEY is not configured, using Steam community XML fallback")
 
     try:
         response = requests.get(
-            "https://api.steampowered.com/ISteamUser/ResolveVanityURL/v0001/",
-            params={"key": steam_api_key, "vanityurl": custom_url},
+            f"https://steamcommunity.com/id/{custom_url}/?xml=1",
+            headers=_steam_headers(),
             timeout=5,
         )
-        data = response.json()
-
-        if data.get('response', {}).get('success') == 1:
-            steam_id = data['response'].get('steamid')
-            if steam_id and validate_steam_id64(steam_id):
-                return steam_id
-
-        return None
+        response.raise_for_status()
+        root = ElementTree.fromstring(response.text)
+        steam_id = (root.findtext("steamID64") or "").strip()
+        if validate_steam_id64(steam_id):
+            return steam_id
     except Exception:
-        logger.exception("ResolveVanityURL request failed")
-        return None
+        logger.exception("Steam community XML fallback failed for custom URL %s", custom_url)
+
+    return None
 
 
 def get_steam_profile_url(steam_id: str) -> str:
