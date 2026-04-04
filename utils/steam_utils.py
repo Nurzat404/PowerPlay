@@ -21,7 +21,17 @@ STEAM_CUSTOM_URL_RE = re.compile(
 
 
 def _steam_api_key() -> str:
-    return (os.getenv("STEAM_API_KEY") or "").strip()
+    value = (os.getenv("STEAM_API_KEY") or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1].strip()
+    return value
+
+
+def _steam_headers() -> dict:
+    return {
+        "User-Agent": "RazryadArenaBot/1.0",
+        "Accept": "application/json, text/xml, application/xml, text/plain, */*",
+    }
 
 
 def _steam_headers() -> dict:
@@ -93,6 +103,11 @@ def get_steam_id64_from_custom_url(custom_url: str) -> Optional[str]:
                         return steam_id
         except Exception:
             logger.exception("ResolveVanityURL request failed")
+        except requests.HTTPError as exc:
+            status_code = exc.response.status_code if exc.response is not None else "unknown"
+            logger.debug("ResolveVanityURL returned HTTP %s for custom URL %s", status_code, custom_url)
+        except requests.RequestException as exc:
+            logger.debug("ResolveVanityURL request failed for %s: %s", custom_url, exc)
     else:
         logger.warning("STEAM_API_KEY is not configured, using Steam community XML fallback")
 
@@ -109,6 +124,10 @@ def get_steam_id64_from_custom_url(custom_url: str) -> Optional[str]:
             return steam_id
     except Exception:
         logger.exception("Steam community XML fallback failed for custom URL %s", custom_url)
+    except requests.RequestException as exc:
+        logger.debug("Steam community XML fallback request failed for %s: %s", custom_url, exc)
+    except ElementTree.ParseError as exc:
+        logger.debug("Steam community XML fallback parse failed for %s: %s", custom_url, exc)
 
     return None
 

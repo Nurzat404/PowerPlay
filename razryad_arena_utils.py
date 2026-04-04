@@ -1561,58 +1561,77 @@ def get_steam_profile_name(steam_url: str) -> str:
     if not steam_url:
         return None
 
-    import urllib.request
-    import json
+    from xml.etree import ElementTree
+    import requests
+    from utils.steam_utils import get_steam_id64_from_custom_url
 
-    steam_api_key = os.getenv("STEAM_API_KEY")
-    if not steam_api_key:
-        logger.info("Steam API key is not configured. Set STEAM_API_KEY in environment.")
-        return None
+    steam_url = steam_url.strip().rstrip('/')
 
     # Извлекаем SteamID64 из ссылки или используем как есть
     steam_id64 = None
+    profile_xml_url = None
 
     # Проверяем это ли просто числовой ID
     if steam_url.isdigit() and len(steam_url) >= 17:
         steam_id64 = steam_url[:17]  # Берём первые 17 цифр
+        profile_xml_url = f"https://steamcommunity.com/profiles/{steam_id64}/?xml=1"
     elif '/profiles/' in steam_url:
         # Числовой URL
         parts = steam_url.split('/profiles/')
         if len(parts) > 1:
             steam_id64 = parts[1].split('/')[0]
+            profile_xml_url = f"https://steamcommunity.com/profiles/{steam_id64}/?xml=1"
     elif '/id/' in steam_url:
         # Кастомный URL - нужно resolve через API
         custom_name = steam_url.split('/id/')[1].split('/')[0]
-        # Делаем запрос к ResolveVanityURL
+        profile_xml_url = f"https://steamcommunity.com/id/{custom_name}/?xml=1"
+        steam_id64 = get_steam_id64_from_custom_url(custom_name)
+
+    headers = {
+        "User-Agent": "RazryadArenaBot/1.0",
+        "Accept": "application/json, text/xml, application/xml, text/plain, */*",
+    }
+
+    if profile_xml_url:
         try:
-            resolve_url = (
-                "https://api.steampowered.com/ISteamUser/ResolveVanityURL/v0001/"
-                f"?key={steam_api_key}&vanityurl={custom_name}"
-            )
-            with urllib.request.urlopen(resolve_url, timeout=5) as response:
-                data = json.loads(response.read().decode())
-                if data.get('response', {}).get('success') == 1:
-                    steam_id64 = data['response'].get('steamid')
-        except Exception as e:
-            logger.info(f"Ошибка ResolveVanityURL: {e}")
-            return None
+            response = requests.get(profile_xml_url, headers=headers, timeout=5)
+            response.raise_for_status()
+            root = ElementTree.fromstring(response.text)
+            persona_name = (root.findtext('steamID') or '').strip()
+            if persona_name:
+                return persona_name
+        except requests.RequestException as e:
+            logger.debug(f"Ошибка Steam XML profile lookup: {e}")
+        except ElementTree.ParseError as e:
+            logger.debug(f"Ошибка парсинга Steam XML profile: {e}")
 
     if not steam_id64 or not steam_id64.isdigit():
         return None
 
-    # Получаем информацию о игроке через GetPlayerSummaries
+    steam_api_key = (os.getenv("STEAM_API_KEY") or "").strip()
+    if len(steam_api_key) >= 2 and steam_api_key[0] == steam_api_key[-1] and steam_api_key[0] in {"'", '"'}:
+        steam_api_key = steam_api_key[1:-1].strip()
+    if not steam_api_key:
+        return None
+
+    # Фоллбек через GetPlayerSummaries, если XML профиль не отдал имя.
     try:
-        url = (
-            "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/"
-            f"?key={steam_api_key}&steamids={steam_id64}"
+        response = requests.get(
+            "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/",
+            params={"key": steam_api_key, "steamids": steam_id64},
+            headers=headers,
+            timeout=5,
         )
-        with urllib.request.urlopen(url, timeout=5) as response:
-            data = json.loads(response.read().decode())
-            players = data.get('response', {}).get('players', [])
-            if players:
-                return players[0].get('personaname')  # Имя профиля
-    except Exception as e:
-        logger.info(f"Ошибка GetPlayerSummaries: {e}")
+        response.raise_for_status()
+        data = response.json()
+        players = data.get('response', {}).get('players', [])
+        if players:
+            return players[0].get('personaname')
+    except requests.HTTPError as e:
+        status_code = e.response.status_code if e.response is not None else "unknown"
+        logger.debug(f"GetPlayerSummaries returned HTTP {status_code}")
+    except (requests.RequestException, ValueError) as e:
+        logger.debug(f"Ошибка GetPlayerSummaries: {e}")
 
     return None
 
