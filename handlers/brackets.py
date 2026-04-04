@@ -24,6 +24,7 @@ from database import get_connection
 from handlers.states import ManualMatchInput, BracketScheduleInput
 from handlers.match_manual import start_manual_input_by_match
 from utils.notifications import notify_bracket_match_scheduled, notify_bracket_match_reminder
+from utils.site_sync import request_site_sync
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -309,6 +310,7 @@ async def confirm_generate_bracket(callback: CallbackQuery, state: FSMContext):
             "UPDATE tournaments SET bracket_generated=1, status='active' WHERE id=?", (tournament_id,))
         conn.commit()
         conn.close()
+        request_site_sync(f"bracket_generated:{tournament_id}")
 
         await state.clear()
         await callback.answer("✅ Сетка сгенерирована! Статус турнира изменён на 'Идёт'.", show_alert=True)
@@ -397,6 +399,7 @@ async def confirm_regenerate_bracket(callback: CallbackQuery, state: FSMContext)
         await callback.answer("❌ Ошибка при перегенерации сетки", show_alert=True)
         return
 
+    request_site_sync(f"bracket_regenerated:{tournament_id}")
     await callback.answer("✅ Сетка перегенерирована.", show_alert=True)
     await callback.message.answer("Назначьте время и место для новых пар после перегенерации.")
     started = await start_schedule_wizard_for_tournament(
@@ -771,4 +774,3 @@ async def show_bracket_svg(callback: CallbackQuery):
             await callback.answer("❌ Ошибка при генерации SVG", show_alert=True)
     else:
         await callback.answer("❌ Ошибка при генерации SVG", show_alert=True)
-

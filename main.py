@@ -7,9 +7,18 @@ from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from database import init_db
-from handlers import start, menu, teams, tournaments, ratings, admin, brackets, stats, match_manual
+import handlers.start as start
+import handlers.menu as menu
+import handlers.teams as teams
+import handlers.tournaments as tournaments
+import handlers.ratings as ratings
+import handlers.admin as admin
+import handlers.brackets as brackets
+import handlers.stats as stats
+import handlers.match_manual as match_manual
 from middlewares import BanCheckMiddleware, RequiredSubscriptionMiddleware
 from utils.notifications import dispatch_due_match_reminders
+from utils.site_sync import site_sync_enabled, site_sync_worker
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -62,14 +71,22 @@ async def main():
 
     await bot.delete_webhook(drop_pending_updates=True)
     reminder_task = asyncio.create_task(reminder_worker(bot))
+    sync_task = asyncio.create_task(site_sync_worker()) if site_sync_enabled() else None
     try:
         await dp.start_polling(bot)
     finally:
         reminder_task.cancel()
+        if sync_task:
+            sync_task.cancel()
         try:
             await reminder_task
         except asyncio.CancelledError:
             pass
+        if sync_task:
+            try:
+                await sync_task
+            except asyncio.CancelledError:
+                pass
 
 
 if __name__ == "__main__":

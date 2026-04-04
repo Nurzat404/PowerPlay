@@ -28,6 +28,7 @@ from razryad_arena_utils import (
 from utils.bracket_utils import advance_winner
 from utils.bracket_visualizer import generate_bracket_png
 from utils.notifications import notify_bracket_match_result
+from utils.site_sync import request_site_sync
 
 router = Router()
 
@@ -860,6 +861,7 @@ async def _finalize_non_cs2_match(callback: CallbackQuery, state: FSMContext):
     os.makedirs(temp_dir, exist_ok=True)
     png_path = os.path.join(temp_dir, f"bracket_{tournament_id}.png")
     png_result = generate_bracket_png(tournament_id, png_path)
+    request_site_sync(f"match_result_saved:{tournament_id}:{match_id}")
 
     third_place_note = "\n🥉 Матч за 3-е место создан автоматически." if third_place_result.get("created") else ""
 
@@ -934,6 +936,7 @@ async def _finalize_series(callback: CallbackQuery, state: FSMContext):
     os.makedirs(temp_dir, exist_ok=True)
     png_path = os.path.join(temp_dir, f"bracket_{tournament_id}.png")
     png_result = generate_bracket_png(tournament_id, png_path)
+    request_site_sync(f"match_series_saved:{tournament_id}:{match_id}")
 
     third_place_note = "\n🥉 Матч за 3-е место создан автоматически." if third_place_result.get("created") else ""
 

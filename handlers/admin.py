@@ -29,6 +29,7 @@ from keyboards import (
 )
 from datetime import datetime, timezone
 import logging
+from utils.site_sync import request_site_sync
 
 logger = logging.getLogger(__name__)
 
@@ -637,6 +638,7 @@ async def create_tournament_description(message: Message, state: FSMContext):
     conn.commit()
     conn.close()
     ensure_tournament_invite_token(tournament_id, regenerate=False)
+    request_site_sync(f"tournament_created:{tournament_id}")
     await state.clear()
     await message.answer("✅ Турнир создан!")
     # Отправляем отдельное сообщение с управлением
@@ -761,6 +763,7 @@ async def edit_tournament_value(message: Message, state: FSMContext):
         f"UPDATE tournaments SET {field}=? WHERE id=?", (new_value, tournament_id))
     conn.commit()
     conn.close()
+    request_site_sync(f"tournament_updated:{tournament_id}:{field}")
     await state.clear()
     await message.answer("✅ Турнир обновлён!")
     # Отправляем отдельное сообщение с управлением
@@ -783,6 +786,7 @@ async def edit_tournament_sport_chosen(callback: CallbackQuery, state: FSMContex
                 (new_sport, tournament_id))
     conn.commit()
     conn.close()
+    request_site_sync(f"tournament_updated:{tournament_id}:sport")
     await state.clear()
     await send_tournament_info(callback.bot, callback.message.chat.id, tournament_id, callback.from_user.id)
 
@@ -1259,6 +1263,7 @@ async def approve_app(callback: CallbackQuery):
 
     result = approve_application(app_id)
     if result.get("ok"):
+        request_site_sync(f"application_approved:{app_id}")
         if app:
             await _notify_tournament_application_status(
                 callback.bot,
@@ -1293,6 +1298,7 @@ async def reject_app(callback: CallbackQuery):
     app = _get_tournament_application_details(app_id)
 
     reject_application(app_id)
+    request_site_sync(f"application_rejected:{app_id}")
     if app:
         await _notify_tournament_application_status(
             callback.bot,
@@ -1647,6 +1653,7 @@ async def admin_tournament_exclude_confirm(callback: CallbackQuery):
 
     result = exclude_team_from_tournament(app_id)
     if result.get("ok"):
+        request_site_sync(f"application_excluded:{app_id}")
         if app:
             await _notify_tournament_application_status(
                 callback.bot,
@@ -1677,6 +1684,7 @@ async def admin_tournament_allow_reapply(callback: CallbackQuery):
 
     result = allow_reapply_excluded_application(app_id)
     if result.get("ok"):
+        request_site_sync(f"application_reapply_allowed:{app_id}")
         await callback.answer("Повторная заявка разрешена: статус переведён в pending.")
     else:
         reason = result.get("reason")
@@ -2508,6 +2516,7 @@ async def admin_delete_tournament_execute(callback: CallbackQuery, state: FSMCon
     sport = tournament['sport'] if tournament else None
 
     delete_tournament(tournament_id)
+    request_site_sync(f"tournament_deleted:{tournament_id}")
     await state.clear()
 
     await callback.message.answer("✅ Турнир удалён.")
@@ -2548,6 +2557,7 @@ async def admin_rating_reset_all(callback: CallbackQuery):
         return
     sport = callback.data.replace("admin_rating_reset_all_", "")
     reset_sport_rating(sport)
+    request_site_sync(f"rating_reset_all:{sport}")
     await callback.answer(f"Рейтинг по {get_sport_display_name(sport)} обнулён!", show_alert=True)
     await admin_rating_menu(callback)
 
@@ -2593,6 +2603,7 @@ async def admin_rating_reset_team(callback: CallbackQuery):
     team_id = int(parts[4])
     sport = parts[5]
     reset_team_rating(team_id, sport)
+    request_site_sync(f"rating_reset_team:{sport}:{team_id}")
     await callback.answer("Рейтинг команды обнулён!", show_alert=True)
     # Вернуться к списку команд этого спорта
     teams = get_teams_with_rating(sport)
@@ -2631,6 +2642,7 @@ async def admin_rating_deduct_execute(message: Message, state: FSMContext):
     team_id = data['team_id']
     sport = data['sport']
     deduct_team_points(team_id, sport, points)
+    request_site_sync(f"rating_deduct:{sport}:{team_id}")
     await state.clear()
     await message.answer(f"С команды снято {points} очков.")
     # Вернуться в меню рейтинга
