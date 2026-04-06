@@ -124,6 +124,312 @@ def get_tournament_by_id(tournament_id):
     return tournament
 
 
+def _resolve_internal_user_id(candidate_id):
+    if candidate_id is None:
+        return None
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM users WHERE id=?", (candidate_id,))
+    row = cur.fetchone()
+    if row:
+        conn.close()
+        return row["id"]
+
+    cur.execute("SELECT id FROM users WHERE telegram_id=?", (candidate_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row["id"] if row else None
+
+
+def is_tournament_creator_or_global_admin(telegram_id, tournament_id):
+    if is_admin(telegram_id):
+        return True
+
+    tournament = get_tournament_by_id(tournament_id)
+    user = get_user(telegram_id)
+    if not tournament or not user:
+        return False
+
+    created_by = tournament["created_by"]
+    return created_by in (telegram_id, user["id"])
+
+
+def get_tournament_manager_users(tournament_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT u.*
+        FROM tournament_managers tm
+        JOIN users u ON u.id = tm.user_id
+        WHERE tm.tournament_id=?
+        ORDER BY u.first_name, u.username, u.id
+    """, (tournament_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_tournament_manager_chat_ids(tournament_id):
+    chat_ids: list[int] = []
+    for user in get_tournament_manager_users(tournament_id):
+        if user["telegram_id"]:
+            chat_ids.append(int(user["telegram_id"]))
+    return chat_ids
+
+
+def add_tournament_manager(tournament_id: int, user_id: int, assigned_by: int | None = None) -> bool:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR IGNORE INTO tournament_managers (tournament_id, user_id, assigned_by)
+        VALUES (?, ?, ?)
+    """, (tournament_id, user_id, assigned_by))
+    conn.commit()
+    added = cur.rowcount > 0
+    conn.close()
+    return added
+
+
+def remove_tournament_manager(tournament_id: int, user_id: int) -> bool:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        DELETE FROM tournament_managers
+        WHERE tournament_id=? AND user_id=?
+    """, (tournament_id, user_id))
+    conn.commit()
+    removed = cur.rowcount > 0
+    conn.close()
+    return removed
+
+
+def can_manage_tournament(telegram_id, tournament_id):
+    if is_tournament_creator_or_global_admin(telegram_id, tournament_id):
+        return True
+
+    user = get_user(telegram_id)
+    if not user:
+        return False
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT 1
+        FROM tournament_managers
+        WHERE tournament_id=? AND user_id=?
+        LIMIT 1
+    """, (tournament_id, user["id"]))
+    row = cur.fetchone()
+    conn.close()
+    return bool(row)
+
+
+def can_manage_bracket_match(telegram_id, match_id):
+    match = get_bracket_match_by_id(match_id)
+    if not match:
+        return False
+    return can_manage_tournament(telegram_id, match["tournament_id"])
+
+
+def get_tournament_map_pool(tournament_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT tournament_id, map_key, map_name, sort_order
+        FROM tournament_map_pool
+        WHERE tournament_id=?
+        ORDER BY sort_order, map_name
+    """, (tournament_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def replace_tournament_map_pool(tournament_id: int, maps: list[tuple[str, str]]):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM tournament_map_pool WHERE tournament_id=?", (tournament_id,))
+    for idx, (map_key, map_name) in enumerate(maps, 1):
+        cur.execute("""
+            INSERT INTO tournament_map_pool (tournament_id, map_key, map_name, sort_order)
+            VALUES (?, ?, ?, ?)
+        """, (tournament_id, map_key, map_name, idx))
+    conn.commit()
+    conn.close()
+
+
+def _normalize_match_format_value(match_format: str | None) -> str:
+    value = (match_format or "bo3").strip().lower()
+    return value if value in {"bo1", "bo3", "bo5"} else "bo3"
+
+
+def _calculate_total_rounds_for_bracket_size(num_teams: int | None) -> int:
+    try:
+        teams = int(num_teams or 0)
+    except (TypeError, ValueError):
+        teams = 0
+    if teams <= 1:
+        return 1
+    bracket_size = 1
+    rounds = 0
+    while bracket_size < teams:
+        bracket_size *= 2
+        rounds += 1
+    return max(rounds, 1)
+
+
+def expand_stage_formats_to_round_rules(
+    total_rounds: int,
+    early_round_format: str,
+    semifinal_format: str,
+    final_format: str,
+) -> list[tuple[int, str]]:
+    total = max(int(total_rounds or 1), 1)
+    early = _normalize_match_format_value(early_round_format)
+    semifinal = _normalize_match_format_value(semifinal_format)
+    final = _normalize_match_format_value(final_format)
+
+    rules: list[tuple[int, str]] = []
+    if total == 1:
+        return [(1, final)]
+    if total == 2:
+        return [(1, semifinal), (2, final)]
+
+    for round_number in range(1, total - 1):
+        rules.append((round_number, early))
+    rules.append((total - 1, semifinal))
+    rules.append((total, final))
+    return rules
+
+
+def get_tournament_match_format_rules(tournament_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT tournament_id, round_number, match_format, created_at, updated_at
+        FROM tournament_match_format_rules
+        WHERE tournament_id=?
+        ORDER BY round_number
+    """, (tournament_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def replace_tournament_match_format_rules(tournament_id: int, rules: list[tuple[int, str]]):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM tournament_match_format_rules WHERE tournament_id=?", (tournament_id,))
+    for round_number, match_format in rules:
+        cur.execute("""
+            INSERT INTO tournament_match_format_rules (
+                tournament_id, round_number, match_format, created_at, updated_at
+            )
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        """, (
+            tournament_id,
+            int(round_number),
+            _normalize_match_format_value(match_format),
+        ))
+    conn.commit()
+    conn.close()
+
+
+def get_tournament_main_round_count(tournament_id: int) -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT MAX(round_number)
+        FROM tournament_brackets
+        WHERE tournament_id=? AND round_number < 5
+    """, (tournament_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row and row[0]:
+        return int(row[0])
+
+    rules = list(get_tournament_match_format_rules(tournament_id))
+    if rules:
+        return max(int(row["round_number"]) for row in rules)
+
+    tournament = get_tournament_by_id(tournament_id)
+    return _calculate_total_rounds_for_bracket_size(tournament["max_teams"] if tournament else 0)
+
+
+def get_tournament_stage_formats(tournament_id: int) -> dict:
+    tournament = get_tournament_by_id(tournament_id)
+    fallback = _normalize_match_format_value(tournament["match_format"] if tournament else "bo3")
+    rules = list(get_tournament_match_format_rules(tournament_id))
+    if not rules:
+        return {
+            "early_round_format": fallback,
+            "semifinal_format": fallback,
+            "final_format": fallback,
+            "rules_total_rounds": 0,
+        }
+
+    total_rounds = max(int(row["round_number"]) for row in rules)
+    final_format = _normalize_match_format_value(next(
+        (row["match_format"] for row in reversed(rules) if int(row["round_number"]) == total_rounds),
+        fallback,
+    ))
+    semifinal_round = total_rounds - 1 if total_rounds > 1 else total_rounds
+    semifinal_format = _normalize_match_format_value(next(
+        (row["match_format"] for row in reversed(rules) if int(row["round_number"]) == semifinal_round),
+        final_format,
+    ))
+    early_format = _normalize_match_format_value(next(
+        (row["match_format"] for row in rules if int(row["round_number"]) < semifinal_round),
+        semifinal_format if total_rounds > 1 else final_format,
+    ))
+    return {
+        "early_round_format": early_format,
+        "semifinal_format": semifinal_format,
+        "final_format": final_format,
+        "rules_total_rounds": total_rounds,
+    }
+
+
+def sync_tournament_match_format_rules(tournament_id: int, total_rounds: int | None = None):
+    profile = get_tournament_stage_formats(tournament_id)
+    target_total_rounds = int(total_rounds or get_tournament_main_round_count(tournament_id) or 1)
+    rules = expand_stage_formats_to_round_rules(
+        target_total_rounds,
+        profile["early_round_format"],
+        profile["semifinal_format"],
+        profile["final_format"],
+    )
+    replace_tournament_match_format_rules(tournament_id, rules)
+    return rules
+
+
+def resolve_tournament_round_format(tournament_id: int, round_number: int, total_main_rounds: int | None = None) -> str:
+    tournament = get_tournament_by_id(tournament_id)
+    fallback = _normalize_match_format_value(tournament["match_format"] if tournament else "bo3")
+    rules = {
+        int(row["round_number"]): _normalize_match_format_value(row["match_format"])
+        for row in get_tournament_match_format_rules(tournament_id)
+    }
+    if not rules:
+        return fallback
+
+    target_round = int(round_number or 1)
+    if target_round == 5:
+        main_rounds = int(total_main_rounds or get_tournament_main_round_count(tournament_id) or 1)
+        target_round = max(main_rounds - 1, 1)
+
+    return rules.get(target_round, fallback)
+
+
+def resolve_bracket_match_format(match_id: int) -> str:
+    match = get_bracket_match_by_id(match_id)
+    if not match:
+        return "bo3"
+    total_main_rounds = get_tournament_main_round_count(match["tournament_id"])
+    return resolve_tournament_round_format(match["tournament_id"], match["round_number"], total_main_rounds)
+
+
 def add_tournament_application(tournament_id, team_id):
     conn = get_connection()
     cur = conn.cursor()

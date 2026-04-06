@@ -5,7 +5,7 @@ from database import get_connection
 from razryad_arena_utils import (
     get_user, get_user_teams, get_tournaments_by_sport, get_tournament_by_id,
     add_tournament_application, get_all_sports, get_team_application,
-    get_approved_teams_count, get_tournament_teams, is_admin, get_team_members_count, can_retry_tournament_application, get_team_by_id, get_team_members, is_captain,
+    get_approved_teams_count, get_tournament_teams, can_manage_tournament, is_admin, get_team_members_count, can_retry_tournament_application, get_team_by_id, get_team_members, is_captain,
     get_sport_display_name, normalize_sport_name, ensure_tournament_invite_token,
     get_tournament_member_application_conflicts,
 )
@@ -147,7 +147,7 @@ async def view_tournament(callback: CallbackQuery):
                        callback_data=f"view_bracket_{tournament_id}")
 
     # Кнопка управления турниром (только админ)
-    if user and is_admin(user['telegram_id']):
+    if user and can_manage_tournament(user['telegram_id'], tournament_id):
         builder.button(text="⚙️ Управление турниром",
                        callback_data=f"admin_tournament_manage_{tournament_id}")
 

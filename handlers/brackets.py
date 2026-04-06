@@ -11,13 +11,13 @@ from aiogram.types import CallbackQuery, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from razryad_arena_utils import (
-    is_admin, get_tournament_by_id, get_bracket_matches,
+    can_manage_bracket_match, can_manage_tournament, is_admin, get_tournament_by_id, get_bracket_matches,
     get_semifinal_matches, create_third_place_bracket_match,
     get_bracket_match_by_id, get_unscheduled_ready_bracket_matches,
     set_bracket_match_schedule, mark_bracket_schedule_notified,
     parse_msk_datetime_input, datetime_to_utc_storage, format_utc_to_msk,
     parse_utc_storage_datetime, mark_bracket_reminder_sent,
-    clear_bracket_related_data, can_create_third_place_match,
+    clear_bracket_related_data, can_create_third_place_match, sync_tournament_match_format_rules,
 )
 from utils.bracket_utils import generate_bracket, get_semifinal_losers
 from database import get_connection
@@ -25,9 +25,18 @@ from handlers.states import ManualMatchInput, BracketScheduleInput
 from handlers.match_manual import start_manual_input_by_match
 from utils.notifications import notify_bracket_match_scheduled, notify_bracket_match_reminder
 from utils.site_sync import request_site_sync
+from utils.veto_service import STATUS_COMPLETED, STATUS_IN_PROGRESS, get_match_veto_details
 
 router = Router()
 logger = logging.getLogger(__name__)
+
+
+def _schedule_locked_by_veto(match_id: int) -> bool:
+    details = get_match_veto_details(match_id)
+    session = details.get("session") if details else None
+    if not session:
+        return False
+    return session.get("status") in {STATUS_IN_PROGRESS, STATUS_COMPLETED}
 
 
 def _schedule_state_defaults(tournament_id: int, match_ids: list[int], return_callback: str):
@@ -158,10 +167,11 @@ async def start_schedule_wizard_for_tournament(
 
 @router.callback_query(F.data.startswith("bracket_schedule_cancel_"))
 async def bracket_schedule_cancel(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
+    data = await state.get_data()
+    tournament_id = data.get("schedule_tournament_id")
+    if not tournament_id or not can_manage_tournament(callback.from_user.id, tournament_id):
         await callback.answer("Нет прав", show_alert=True)
         return
-    data = await state.get_data()
     return_callback = data.get("schedule_return_callback") or callback.data.replace("bracket_schedule_cancel_", "view_bracket_")
     await state.clear()
     await callback.message.answer(
@@ -259,11 +269,10 @@ async def bracket_schedule_location_input(message: Message, state: FSMContext):
 @router.callback_query(F.data.startswith("admin_generate_bracket_"))
 async def admin_generate_bracket_confirm(callback: CallbackQuery, state: FSMContext):
     """Подтверждение генерации сетки турнира."""
-    if not is_admin(callback.from_user.id):
+    tournament_id = int(callback.data.split("_")[3])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
         await callback.answer("Нет прав", show_alert=True)
         return
-
-    tournament_id = int(callback.data.split("_")[3])
     tournament = get_tournament_by_id(tournament_id)
 
     if not tournament:
@@ -289,21 +298,17 @@ async def admin_generate_bracket_confirm(callback: CallbackQuery, state: FSMCont
 @router.callback_query(F.data == "confirm_generate_bracket")
 async def confirm_generate_bracket(callback: CallbackQuery, state: FSMContext):
     """Генерация сетки турнира."""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-
     data = await state.get_data()
     tournament_id = data.get('tournament_id')
-
-    if not tournament_id:
-        await callback.answer("❌ Ошибка: не удалось определить турнир", show_alert=True)
+    if not tournament_id or not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
         await state.clear()
         return
 
     success = generate_bracket(tournament_id)
 
     if success:
+        sync_tournament_match_format_rules(tournament_id)
         conn = get_connection()
         cur = conn.cursor()
         cur.execute(
@@ -335,11 +340,10 @@ async def confirm_generate_bracket(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("admin_regenerate_bracket_"))
 async def admin_regenerate_bracket_confirm(callback: CallbackQuery):
     """Подтверждение перегенерации существующей сетки."""
-    if not is_admin(callback.from_user.id):
+    tournament_id = int(callback.data.split("_")[3])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
         await callback.answer("Нет прав", show_alert=True)
         return
-
-    tournament_id = int(callback.data.split("_")[3])
     tournament = get_tournament_by_id(tournament_id)
     if not tournament:
         await callback.answer("Турнир не найден", show_alert=True)
@@ -376,11 +380,10 @@ async def admin_regenerate_bracket_confirm(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("confirm_regenerate_bracket_"))
 async def confirm_regenerate_bracket(callback: CallbackQuery, state: FSMContext):
     """Перегенерация сетки с предупреждением о сбросе уже сыгранных матчей."""
-    if not is_admin(callback.from_user.id):
+    tournament_id = int(callback.data.split("_")[3])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
         await callback.answer("Нет прав", show_alert=True)
         return
-
-    tournament_id = int(callback.data.split("_")[3])
     tournament = get_tournament_by_id(tournament_id)
     if not tournament:
         await callback.answer("Турнир не найден", show_alert=True)
@@ -399,6 +402,7 @@ async def confirm_regenerate_bracket(callback: CallbackQuery, state: FSMContext)
         await callback.answer("❌ Ошибка при перегенерации сетки", show_alert=True)
         return
 
+    sync_tournament_match_format_rules(tournament_id)
     request_site_sync(f"bracket_regenerated:{tournament_id}")
     await callback.answer("✅ Сетка перегенерирована.", show_alert=True)
     await callback.message.answer("Назначьте время и место для новых пар после перегенерации.")
@@ -474,7 +478,7 @@ async def view_bracket(callback: CallbackQuery, state: FSMContext, tournament_id
 
     builder = InlineKeyboardBuilder()
 
-    user_is_admin = is_admin(callback.from_user.id)
+    user_is_admin = can_manage_tournament(callback.from_user.id, tournament_id)
 
     if user_is_admin:
         # Сортируем матчи по round_number, match_number (как в PNG)
@@ -606,13 +610,12 @@ async def view_bracket(callback: CallbackQuery, state: FSMContext, tournament_id
 @router.callback_query(F.data.startswith("bracket_match_"))
 async def bracket_match_menu(callback: CallbackQuery, state: FSMContext):
     """Карточка матча: ввод результата и редактирование расписания."""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-
     parts = callback.data.split("_")
     match_id = int(parts[2])
     tournament_id = int(parts[3]) if len(parts) > 3 else None
+    if not can_manage_bracket_match(callback.from_user.id, match_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
     match = get_bracket_match_by_id(match_id)
     if not match:
         await callback.answer("Матч не найден", show_alert=True)
@@ -650,9 +653,16 @@ async def bracket_match_menu(callback: CallbackQuery, state: FSMContext):
         f"🕒 Время: {match_time} (МСК)\n"
         f"📌 Место: {location}"
     )
+    schedule_locked = _schedule_locked_by_veto(match_id)
+    if schedule_locked:
+        text += "\n\n🔒 Время и место зафиксированы: pick/ban уже начался или завершен."
     builder = InlineKeyboardBuilder()
     builder.button(text="✏️ Ввести результат", callback_data=f"manual_match_result_{match_id}_{tournament_id}")
-    builder.button(text="🗓 Изменить время/место", callback_data=f"bracket_schedule_edit_{match_id}_{tournament_id}")
+    if not schedule_locked:
+        builder.button(text="🗓 Изменить время/место", callback_data=f"bracket_schedule_edit_{match_id}_{tournament_id}")
+    tournament = get_tournament_by_id(tournament_id)
+    if tournament and tournament["sport"] == "CS2" and int(tournament["map_veto_enabled"] or 0) == 1:
+        builder.button(text="🗺 Пик / бан карт", callback_data=f"veto_admin_open_{match_id}")
     builder.button(text="🔙 К сетке", callback_data=f"view_bracket_{tournament_id}")
     builder.adjust(1)
     await callback.message.answer(text, reply_markup=builder.as_markup())
@@ -661,12 +671,15 @@ async def bracket_match_menu(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("bracket_schedule_edit_"))
 async def bracket_schedule_edit(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
     parts = callback.data.split("_")
     match_id = int(parts[3])
     tournament_id = int(parts[4])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    if _schedule_locked_by_veto(match_id):
+        await callback.answer("Нельзя менять время/место: pick/ban уже начался или завершен.", show_alert=True)
+        return
     await start_schedule_wizard_for_tournament(
         callback,
         state,
@@ -680,11 +693,10 @@ async def bracket_schedule_edit(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data.startswith("create_third_place_"))
 async def create_third_place_match_confirm(callback: CallbackQuery):
     """Подтверждение создания матча за 3-е место."""
-    if not is_admin(callback.from_user.id):
+    tournament_id = int(callback.data.split("_")[3])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
         await callback.answer("Нет прав", show_alert=True)
         return
-
-    tournament_id = int(callback.data.split("_")[3])
     check = can_create_third_place_match(tournament_id)
     if not check.get('ok'):
         reason_map = {
@@ -713,11 +725,10 @@ async def create_third_place_match_confirm(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("confirm_third_place_"))
 async def confirm_create_third_place(callback: CallbackQuery, state: FSMContext):
     """Создание матча за 3-е место."""
-    if not is_admin(callback.from_user.id):
+    tournament_id = int(callback.data.split("_")[3])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
         await callback.answer("Нет прав", show_alert=True)
         return
-
-    tournament_id = int(callback.data.split("_")[3])
     check = can_create_third_place_match(tournament_id)
     if not check.get('ok'):
         reason_map = {

@@ -13,9 +13,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from database import get_connection
 from handlers.states import ManualMatchInput
 from razryad_arena_utils import (
+    can_manage_bracket_match,
     get_steam_profile_name,
     get_tournament_by_id,
-    is_admin,
+    resolve_bracket_match_format,
     update_team_rating,
     upsert_football_player_stat,
     upsert_basketball_player_stat,
@@ -27,20 +28,14 @@ from razryad_arena_utils import (
 )
 from utils.bracket_utils import advance_winner
 from utils.bracket_visualizer import generate_bracket_png
+from utils.cs2_maps import CS2_MAPS, get_cs2_map_name
 from utils.notifications import notify_bracket_match_result
 from utils.site_sync import request_site_sync
+from utils.veto_service import get_completed_series_maps_for_match
 
 router = Router()
 
-CS2_MAPS = [
-    ("de_mirage", "Mirage"),
-    ("de_inferno", "Inferno"),
-    ("de_nuke", "Nuke"),
-    ("de_overpass", "Overpass"),
-    ("de_dust2", "Dust2"),
-    ("de_ancient", "Ancient"),
-    ("de_anubis", "Anubis"),
-]
+CS2_MAP_OPTIONS = [(row["key"], row["name"]) for row in CS2_MAPS]
 CUSTOM_CS2_MAP_TOKEN = "custom"
 
 
@@ -69,7 +64,7 @@ def _score_preview(team1_wins: int, team2_wins: int, map_winner_id: int, team1_i
 
 def _map_keyboard(tournament_id: int):
     builder = InlineKeyboardBuilder()
-    for map_id, map_name in CS2_MAPS:
+    for map_id, map_name in CS2_MAP_OPTIONS:
         builder.button(text=map_name, callback_data=f"manual_map_{map_id}")
     builder.button(text="✍️ Своя карта", callback_data=f"manual_map_{CUSTOM_CS2_MAP_TOKEN}")
     builder.button(text="❌ Отмена", callback_data=f"view_bracket_{tournament_id}")
@@ -161,6 +156,13 @@ async def _prompt_map_score_input(target: Message | CallbackQuery, state: FSMCon
 
 async def _show_map_selection(target: Message | CallbackQuery, state: FSMContext):
     data = await state.get_data()
+    predefined_maps = data.get("predefined_maps") or []
+    if predefined_maps:
+        map_no = data.get("current_map_number", 1)
+        if 1 <= map_no <= len(predefined_maps):
+            await _prompt_map_score_input(target, state, predefined_maps[map_no - 1]["map_name"])
+            return
+
     map_no = data.get("current_map_number", 1)
     total_maps = data.get("total_maps", 1)
     team1_name = data.get("team1_name", "Команда 1")
@@ -332,6 +334,8 @@ async def start_manual_input_by_match(callback: CallbackQuery, state: FSMContext
 
     tournament = get_tournament_by_id(tournament_id)
     sport_mode = normalize_sport_name(tournament["sport"]) if tournament else "CS2"
+    veto_series_maps = get_completed_series_maps_for_match(match_id) if sport_mode == "CS2" else []
+    effective_match_format = resolve_bracket_match_format(match_id).upper() if sport_mode == "CS2" else None
 
     await state.update_data(
         bracket_match_id=match_id,
@@ -345,6 +349,8 @@ async def start_manual_input_by_match(callback: CallbackQuery, state: FSMContext
         team2_wins=0,
         current_map_number=1,
         map_results=[],
+        predefined_maps=veto_series_maps,
+        match_format=effective_match_format,
     )
 
     if sport_mode != "CS2":
@@ -358,6 +364,52 @@ async def start_manual_input_by_match(callback: CallbackQuery, state: FSMContext
             "Пример: 2:1",
             reply_markup=_cancel_keyboard(tournament_id),
         )
+        await callback.answer()
+        return
+
+    if veto_series_maps:
+        total_maps = len(veto_series_maps)
+        format_label = effective_match_format or (f"BO{total_maps}")
+        await state.update_data(
+            match_format=format_label,
+            total_maps=total_maps,
+            maps_to_win=_series_required_wins(total_maps),
+            current_map_number=1,
+            map_results=[],
+        )
+        maps_text = "\n".join(
+            f"{row['map_order']}. {row['map_name']}"
+            for row in veto_series_maps
+        )
+        await callback.message.answer(
+            "✏️ Ввод результата\n\n"
+            f"🔵 {match['team1_name']} vs 🔴 {match['team2_name']}\n"
+            f"📌 Раунд: {match['round_name']}\n"
+            f"📊 Формат: {format_label}\n\n"
+            "Карты уже определены через pick/ban:\n"
+            f"{maps_text}"
+        )
+        await _show_map_selection(callback, state)
+        await callback.answer()
+        return
+
+    if effective_match_format:
+        total_maps = int(effective_match_format[-1])
+        await state.update_data(
+            match_format=effective_match_format,
+            total_maps=total_maps,
+            maps_to_win=_series_required_wins(total_maps),
+            current_map_number=1,
+            map_results=[],
+        )
+        await callback.message.answer(
+            "✏️ Ввод результата\n\n"
+            f"🔵 {match['team1_name']} vs 🔴 {match['team2_name']}\n"
+            f"📌 Раунд: {match['round_name']}\n"
+            f"📊 Формат: {effective_match_format}\n\n"
+            "Выберите карту:"
+        )
+        await _show_map_selection(callback, state)
         await callback.answer()
         return
 
@@ -382,12 +434,11 @@ async def start_manual_input_by_match(callback: CallbackQuery, state: FSMContext
 
 @router.callback_query(F.data.startswith("manual_match_result_"))
 async def start_manual_input(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-
     parts = callback.data.split("_")
     match_id = int(parts[3])
+    if not can_manage_bracket_match(callback.from_user.id, match_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
     tournament_id = int(parts[4]) if len(parts) > 4 else None
     await start_manual_input_by_match(callback, state, match_id, tournament_id)
 
@@ -411,8 +462,8 @@ async def select_format(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(ManualMatchInput.map_select, F.data.startswith("manual_map_"))
 async def select_map(callback: CallbackQuery, state: FSMContext):
-    map_name = callback.data.split("_", 2)[2]
-    if map_name == CUSTOM_CS2_MAP_TOKEN:
+    map_key = callback.data.split("_", 2)[2]
+    if map_key == CUSTOM_CS2_MAP_TOKEN:
         await state.set_state(ManualMatchInput.custom_map_input)
         await callback.message.answer(
             "✍️ Введите название карты вручную.\n\n"
@@ -422,7 +473,7 @@ async def select_map(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    await _prompt_map_score_input(callback, state, map_name)
+    await _prompt_map_score_input(callback, state, get_cs2_map_name(map_key))
     await callback.answer()
 
 

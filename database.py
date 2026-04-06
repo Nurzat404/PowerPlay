@@ -317,6 +317,37 @@ def init_db():
                     )
                 """)
 
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS tournament_map_pool (
+                        tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
+                        map_key TEXT NOT NULL,
+                        map_name TEXT NOT NULL,
+                        sort_order INTEGER DEFAULT 0,
+                        PRIMARY KEY (tournament_id, map_key)
+                    )
+                """)
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS tournament_managers (
+                        tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
+                        user_id INTEGER NOT NULL REFERENCES users(id),
+                        assigned_by INTEGER REFERENCES users(id),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (tournament_id, user_id)
+                    )
+                """)
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS tournament_match_format_rules (
+                        tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
+                        round_number INTEGER NOT NULL,
+                        match_format TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (tournament_id, round_number)
+                    )
+                """)
+
                 # Заявки на турниры
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS tournament_applications (
@@ -489,6 +520,29 @@ def init_db():
                         "ALTER TABLE tournaments ADD COLUMN max_age INTEGER DEFAULT 100")
                     logger.info(
                         "Поле max_age добавлено в таблицу tournaments (по умолчанию 100)")
+                if 'map_veto_enabled' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournaments ADD COLUMN map_veto_enabled INTEGER DEFAULT 0")
+                    logger.info("Поле map_veto_enabled добавлено в таблицу tournaments")
+                if 'veto_launch_mode' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournaments ADD COLUMN veto_launch_mode TEXT DEFAULT 'admin_start'")
+                    logger.info("Поле veto_launch_mode добавлено в таблицу tournaments")
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS tournament_match_format_rules (
+                        tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
+                        round_number INTEGER NOT NULL,
+                        match_format TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (tournament_id, round_number)
+                    )
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_tournament_match_format_rules_tournament
+                    ON tournament_match_format_rules(tournament_id, round_number)
+                """)
 
                 # Создаём таблицу tournament_brackets для турнирной сетки
                 cur.execute("""
@@ -515,6 +569,86 @@ def init_db():
                     )
                 """)
                 logger.info("Таблица tournament_brackets проверена")
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS match_veto_sessions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        bracket_match_id INTEGER NOT NULL UNIQUE REFERENCES tournament_brackets(id),
+                        tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
+                        team1_id INTEGER REFERENCES teams(id),
+                        team2_id INTEGER REFERENCES teams(id),
+                        match_format TEXT NOT NULL,
+                        status TEXT DEFAULT 'not_ready',
+                        ready_at TIMESTAMP,
+                        started_at TIMESTAMP,
+                        completed_at TIMESTAMP,
+                        cancelled_at TIMESTAMP,
+                        started_by_user_id INTEGER REFERENCES users(id),
+                        started_by_kind TEXT,
+                        start_source TEXT,
+                        current_step_index INTEGER DEFAULT 0,
+                        current_team_id INTEGER REFERENCES teams(id),
+                        current_action_type TEXT,
+                        auto_start_consumed INTEGER DEFAULT 0,
+                        admin_notified_at TIMESTAMP,
+                        captains_notified_at TIMESTAMP,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                logger.info("Таблица match_veto_sessions проверена")
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS match_veto_actions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id INTEGER NOT NULL REFERENCES match_veto_sessions(id),
+                        step_index INTEGER NOT NULL,
+                        action_type TEXT NOT NULL,
+                        actor_user_id INTEGER REFERENCES users(id),
+                        actor_role TEXT,
+                        team_id INTEGER REFERENCES teams(id),
+                        map_key TEXT,
+                        map_name TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                logger.info("Таблица match_veto_actions проверена")
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS match_series_maps (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id INTEGER NOT NULL REFERENCES match_veto_sessions(id),
+                        map_order INTEGER NOT NULL,
+                        map_key TEXT NOT NULL,
+                        map_name TEXT NOT NULL,
+                        selection_type TEXT NOT NULL,
+                        selected_by_team_id INTEGER REFERENCES teams(id),
+                        source_action_id INTEGER REFERENCES match_veto_actions(id),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(session_id, map_order),
+                        UNIQUE(session_id, map_key)
+                    )
+                """)
+                logger.info("Таблица match_series_maps проверена")
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS match_veto_message_targets (
+                        session_id INTEGER NOT NULL REFERENCES match_veto_sessions(id),
+                        chat_id INTEGER NOT NULL,
+                        message_id INTEGER NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (session_id, chat_id)
+                    )
+                """)
+                logger.info("Таблица match_veto_message_targets проверена")
+
+                cur.execute("PRAGMA table_info(match_veto_sessions)")
+                columns = [col[1] for col in cur.fetchall()]
+                if 'auto_start_consumed' not in columns:
+                    cur.execute(
+                        "ALTER TABLE match_veto_sessions ADD COLUMN auto_start_consumed INTEGER DEFAULT 0")
+                    logger.info("Поле auto_start_consumed добавлено в таблицу match_veto_sessions")
 
                 # Создаём таблицу player_match_stats с правильными полями для CS2
                 # ИСПРАВЛЕНО: убрали DROP TABLE - теперь таблица не пересоздаётся каждый раз
@@ -679,6 +813,20 @@ def init_db():
                     "CREATE INDEX IF NOT EXISTS idx_bracket_reminder_lookup ON tournament_brackets(status, scheduled_at_utc, reminder_sent_at)")
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_bracket_tournament_round_match ON tournament_brackets(tournament_id, round_number, match_number)")
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tournament_managers_tournament ON tournament_managers(tournament_id)")
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tournament_managers_user ON tournament_managers(user_id)")
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_veto_sessions_status_ready ON match_veto_sessions(status, ready_at)")
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_veto_sessions_bracket_match ON match_veto_sessions(bracket_match_id)")
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_veto_actions_session_step ON match_veto_actions(session_id, step_index)")
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_series_maps_session_order ON match_series_maps(session_id, map_order)")
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_veto_message_targets_session ON match_veto_message_targets(session_id)")
 
                 # Миграции для player_match_stats
                 cur.execute("PRAGMA table_info(player_match_stats)")
@@ -950,4 +1098,3 @@ def init_db():
             time.sleep(1)
     raise Exception(
         "Не удалось инициализировать базу данных после нескольких попыток.")
-

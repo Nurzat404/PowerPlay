@@ -19,7 +19,11 @@ from razryad_arena_utils import (
     get_sport_display_name, upsert_football_player_stat, upsert_basketball_player_stat,
     upsert_volleyball_player_stat, replace_volleyball_set_scores, map_sports_to_display,
     normalize_sport_name, allow_reapply_excluded_application, ensure_tournament_invite_token,
-    get_active_user_telegram_ids
+    get_active_user_telegram_ids, add_tournament_manager, can_manage_tournament,
+    get_tournament_manager_users, get_tournament_map_pool, is_tournament_creator_or_global_admin,
+    remove_tournament_manager, replace_tournament_map_pool, expand_stage_formats_to_round_rules,
+    get_tournament_main_round_count, get_tournament_match_format_rules, get_tournament_stage_formats,
+    replace_tournament_match_format_rules
 )
 from keyboards import (
     admin_menu_keyboard, back_to_main_keyboard,
@@ -29,9 +33,227 @@ from keyboards import (
 )
 from datetime import datetime, timezone
 import logging
+from utils.cs2_maps import (
+    CS2_MAPS,
+    default_cs2_map_entries,
+    get_cs2_map_name,
+    parse_map_pool_text,
+)
 from utils.site_sync import request_site_sync
+from utils.veto_service import (
+    LAUNCH_ADMIN,
+    LAUNCH_AUTO,
+    STATUS_CANCELLED,
+    STATUS_COMPLETED,
+    STATUS_IN_PROGRESS,
+    STATUS_READY,
+    get_veto_status_label,
+    list_tournament_veto_sessions,
+    validate_veto_pool,
+)
 
 logger = logging.getLogger(__name__)
+
+MATCH_FORMAT_OPTIONS = [("bo1", "BO1"), ("bo3", "BO3"), ("bo5", "BO5")]
+VETO_LAUNCH_OPTIONS = [
+    (LAUNCH_ADMIN, "admin_start"),
+    (LAUNCH_AUTO, "auto_start"),
+]
+
+
+def _is_cs2_sport(sport_name: str | None) -> bool:
+    return normalize_sport_name(sport_name) == "CS2"
+
+
+def _normalize_map_pool_entries(raw_entries) -> list[dict[str, str]]:
+    normalized: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw_entries or []:
+        if isinstance(item, dict):
+            map_key = str(item.get("map_key") or "").strip()
+            map_name = str(item.get("map_name") or "").strip()
+        elif isinstance(item, (tuple, list)) and len(item) >= 2:
+            map_key = str(item[0] or "").strip()
+            map_name = str(item[1] or "").strip()
+        else:
+            map_key = str(item or "").strip()
+            map_name = get_cs2_map_name(map_key)
+        if not map_key or map_key in seen:
+            continue
+        seen.add(map_key)
+        normalized.append({
+            "map_key": map_key,
+            "map_name": map_name or get_cs2_map_name(map_key),
+        })
+    return normalized
+
+
+def _default_map_pool_entries() -> list[dict[str, str]]:
+    return [{"map_key": map_key, "map_name": map_name} for map_key, map_name in default_cs2_map_entries()]
+
+
+def _pool_entry_keys(raw_entries) -> list[str]:
+    return [row["map_key"] for row in _normalize_map_pool_entries(raw_entries)]
+
+
+def _map_pool_label(raw_entries) -> str:
+    entries = _normalize_map_pool_entries(raw_entries)
+    if not entries:
+        return "не выбран"
+    return ", ".join(row["map_name"] for row in entries)
+
+
+def _build_match_format_keyboard(prefix: str, current: str | None = None, back_callback: str | None = None):
+    builder = InlineKeyboardBuilder()
+    current_value = (current or "").lower()
+    for value, label in MATCH_FORMAT_OPTIONS:
+        marker = "✅ " if current_value == value else ""
+        builder.button(text=f"{marker}{label}", callback_data=f"{prefix}_{value}")
+    if back_callback:
+        builder.button(text="🔙 Назад", callback_data=back_callback)
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def _format_stage_formats_text(stage_formats: dict) -> str:
+    return (
+        f"Ранние раунды: {(stage_formats['early_round_format'] or 'bo3').upper()}\n"
+        f"Полуфинал: {(stage_formats['semifinal_format'] or 'bo3').upper()}\n"
+        f"Финал: {(stage_formats['final_format'] or 'bo3').upper()}\n"
+        f"Матч за 3-е место: {(stage_formats['semifinal_format'] or 'bo3').upper()} (наследует полуфинал)"
+    )
+
+
+def _expected_total_rounds_for_tournament_data(data: dict) -> int:
+    team_count = max(int(data.get("max_teams") or 0), 2)
+    rounds = 1
+    slots = 2
+    while slots < team_count:
+        slots *= 2
+        rounds += 1
+    return rounds
+
+
+def _round_rules_from_stage_formats(stage_formats: dict, total_rounds: int) -> list[tuple[int, str]]:
+    return expand_stage_formats_to_round_rules(
+        total_rounds,
+        stage_formats["early_round_format"],
+        stage_formats["semifinal_format"],
+        stage_formats["final_format"],
+    )
+
+
+def _validate_veto_pool_for_stage_formats(stage_formats: dict, map_keys: list[str]) -> tuple[bool, str | None]:
+    formats = {
+        (stage_formats.get("early_round_format") or "bo3").lower(),
+        (stage_formats.get("semifinal_format") or "bo3").lower(),
+        (stage_formats.get("final_format") or "bo3").lower(),
+    }
+    if any(fmt in {"bo3", "bo5"} for fmt in formats):
+        return validate_veto_pool("bo3", map_keys)
+    return validate_veto_pool("bo1", map_keys)
+
+
+def _save_tournament_stage_formats(tournament_id: int, stage_formats: dict):
+    total_rounds = get_tournament_main_round_count(tournament_id)
+    replace_tournament_match_format_rules(
+        tournament_id,
+        _round_rules_from_stage_formats(stage_formats, total_rounds),
+    )
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE tournaments SET match_format=? WHERE id=?",
+        ((stage_formats["early_round_format"] or "bo3").lower(), tournament_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _build_veto_toggle_keyboard(prefix: str, enabled: bool, back_callback: str | None = None):
+    builder = InlineKeyboardBuilder()
+    builder.button(text=f"{'✅' if enabled else '⬜'} Включить map veto", callback_data=f"{prefix}_on")
+    builder.button(text=f"{'✅' if not enabled else '⬜'} Выключить map veto", callback_data=f"{prefix}_off")
+    if back_callback:
+        builder.button(text="🔙 Назад", callback_data=back_callback)
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def _build_launch_mode_keyboard(prefix: str, current: str | None = None, back_callback: str | None = None):
+    builder = InlineKeyboardBuilder()
+    current_value = (current or LAUNCH_ADMIN).strip()
+    for value, label in VETO_LAUNCH_OPTIONS:
+        marker = "✅ " if current_value == value else ""
+        builder.button(text=f"{marker}{label}", callback_data=f"{prefix}_{value}")
+    if back_callback:
+        builder.button(text="🔙 Назад", callback_data=back_callback)
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def _build_map_pool_keyboard(
+    selected_entries,
+    toggle_prefix: str,
+    done_callback: str,
+    back_callback: str,
+):
+    builder = InlineKeyboardBuilder()
+    entries = _normalize_map_pool_entries(selected_entries)
+    selected = {row["map_key"] for row in entries}
+    allowed = {row["key"] for row in CS2_MAPS}
+    for row in CS2_MAPS:
+        marker = "✅" if row["key"] in selected else "⬜"
+        builder.button(text=f"{marker} {row['name']}", callback_data=f"{toggle_prefix}_{row['key']}")
+    custom_entries = [row for row in entries if row["map_key"] not in allowed]
+    for row in custom_entries:
+        builder.button(text=f"➖ {row['map_name']}", callback_data=f"{toggle_prefix}_{row['map_key']}")
+    builder.button(text="✍️ Ввести вручную", callback_data=f"{toggle_prefix}_manual")
+    builder.button(text="💾 Сохранить", callback_data=done_callback)
+    builder.button(text="🔙 Назад", callback_data=back_callback)
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+def _map_pool_prompt_text(raw_entries) -> str:
+    entries = _normalize_map_pool_entries(raw_entries)
+    return (
+        "Выберите карты турнирного пула.\n"
+        "Можно нажимать кнопки или отправить список карт сообщением: по одной на строку, через запятую или через ;.\n\n"
+        f"Текущий пул: {_map_pool_label(entries)}"
+    )
+
+
+def _build_manager_label(user) -> str:
+    username = user["username"] if "username" in user.keys() and user["username"] else None
+    telegram_id = user["telegram_id"] if "telegram_id" in user.keys() else "?"
+    first_name = user["first_name"] if "first_name" in user.keys() and user["first_name"] else "Пользователь"
+    handle = f"@{username}" if username else f"id={telegram_id}"
+    return f"{first_name} ({handle})"
+
+
+def _has_in_progress_veto_sessions(tournament_id: int) -> bool:
+    return bool(list_tournament_veto_sessions(tournament_id, [STATUS_IN_PROGRESS]))
+
+
+def _build_veto_overview(tournament_id: int) -> str:
+    sessions = list_tournament_veto_sessions(tournament_id)
+    counters = {
+        STATUS_READY: 0,
+        STATUS_IN_PROGRESS: 0,
+        STATUS_COMPLETED: 0,
+        STATUS_CANCELLED: 0,
+    }
+    for session in sessions:
+        status = session.get("status")
+        if status in counters:
+            counters[status] += 1
+    return (
+        f"готовы: {counters[STATUS_READY]}, "
+        f"идут: {counters[STATUS_IN_PROGRESS]}, "
+        f"завершены: {counters[STATUS_COMPLETED]}, "
+        f"отменены: {counters[STATUS_CANCELLED]}"
+    )
 
 async def send_tournament_info(bot: Bot, chat_id: int, tournament_id: int, user_id: int):
     """Отправляет актуальную карточку турнира."""
@@ -106,7 +328,7 @@ async def send_tournament_info(bot: Bot, chat_id: int, tournament_id: int, user_
                        callback_data=f"view_bracket_{tournament_id}")
 
     # Кнопка управления турниром (только админ)
-    if user and is_admin(user['telegram_id']):
+    if user and can_manage_tournament(user['telegram_id'], tournament_id):
         builder.button(text="⚙️ Управление турниром",
                        callback_data=f"admin_tournament_manage_{tournament_id}")
 
@@ -511,6 +733,12 @@ class CreateTournament(StatesGroup):
     required_team_size = State()
     min_age = State()        # новое
     max_age = State()
+    early_round_format = State()
+    semifinal_format = State()
+    final_format = State()
+    map_veto_enabled = State()
+    veto_launch_mode = State()
+    map_pool = State()
     description = State()
 
 @router.callback_query(F.data == "admin_create_tournament")
@@ -621,8 +849,185 @@ async def create_tournament_max_age(message: Message, state: FSMContext):
         await message.answer("❌ Минимальный возраст не может быть больше максимального.")
         return
     await state.update_data(max_age=max_age)
+    await state.set_state(CreateTournament.early_round_format)
+    await message.answer(
+        "Выберите формат ранних раундов:",
+        reply_markup=_build_match_format_keyboard("create_tournament_early_format"),
+    )
+
+
+@router.callback_query(CreateTournament.early_round_format, F.data.startswith("create_tournament_early_format_"))
+async def create_tournament_early_format(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    match_format = callback.data.replace("create_tournament_early_format_", "")
+    await state.update_data(early_round_format=match_format)
+    await state.set_state(CreateTournament.semifinal_format)
+    await callback.message.edit_text(
+        "Выберите формат полуфинала:",
+        reply_markup=_build_match_format_keyboard("create_tournament_semifinal_format", match_format),
+    )
+
+
+@router.callback_query(CreateTournament.semifinal_format, F.data.startswith("create_tournament_semifinal_format_"))
+async def create_tournament_semifinal_format(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    match_format = callback.data.replace("create_tournament_semifinal_format_", "")
+    await state.update_data(semifinal_format=match_format)
+    await state.set_state(CreateTournament.final_format)
+    await callback.message.edit_text(
+        "Выберите формат финала:",
+        reply_markup=_build_match_format_keyboard("create_tournament_final_format", match_format),
+    )
+
+
+@router.callback_query(CreateTournament.final_format, F.data.startswith("create_tournament_final_format_"))
+async def create_tournament_final_format(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    match_format = callback.data.replace("create_tournament_final_format_", "")
+    data = await state.get_data()
+    stage_formats = {
+        "early_round_format": data.get("early_round_format", "bo1"),
+        "semifinal_format": data.get("semifinal_format", "bo3"),
+        "final_format": match_format,
+    }
+    await state.update_data(
+        final_format=match_format,
+        stage_formats=stage_formats,
+        match_format=stage_formats["early_round_format"],
+    )
+
+    if not _is_cs2_sport(data.get("sport")):
+        await state.update_data(map_veto_enabled=0, veto_launch_mode=LAUNCH_ADMIN, map_pool_entries=[])
+        await state.set_state(CreateTournament.description)
+        await callback.message.edit_text("Введите описание турнира (можно отправить 'нет', чтобы пропустить):")
+        return
+
+    await state.set_state(CreateTournament.map_veto_enabled)
+    await callback.message.edit_text(
+        "Включить map veto для этого турнира?",
+        reply_markup=_build_veto_toggle_keyboard("create_tournament_veto", False),
+    )
+
+
+@router.callback_query(CreateTournament.map_veto_enabled, F.data.startswith("create_tournament_veto_"))
+async def create_tournament_map_veto(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    enabled = callback.data.endswith("_on")
+    await state.update_data(map_veto_enabled=1 if enabled else 0)
+
+    if not enabled:
+        await state.update_data(veto_launch_mode=LAUNCH_ADMIN, map_pool_entries=[])
+        await state.set_state(CreateTournament.description)
+        await callback.message.edit_text("Введите описание турнира (можно отправить 'нет', чтобы пропустить):")
+        return
+
+    selected = _default_map_pool_entries()
+    await state.update_data(map_pool_entries=selected)
+    await state.set_state(CreateTournament.map_pool)
+    await callback.message.edit_text(
+        _map_pool_prompt_text(selected),
+        reply_markup=_build_map_pool_keyboard(
+            selected,
+            "create_tournament_pool_toggle",
+            "create_tournament_pool_done",
+            "create_tournament_veto_back",
+        ),
+    )
+
+
+@router.callback_query(CreateTournament.map_pool, F.data.startswith("create_tournament_pool_toggle_"))
+async def create_tournament_pool_toggle(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    map_key = callback.data.replace("create_tournament_pool_toggle_", "")
+    if map_key == "manual":
+        data = await state.get_data()
+        current_entries = _normalize_map_pool_entries(data.get("map_pool_entries") or _default_map_pool_entries())
+        await callback.message.edit_text(
+            "Отправьте новый пул карт сообщением.\n"
+            "Формат: по одной карте на строку, через запятую или через ;.\n"
+            "Можно указывать стандартные и пользовательские карты.\n\n"
+            f"Текущий пул: {_map_pool_label(current_entries)}",
+            reply_markup=_build_map_pool_keyboard(
+                current_entries,
+                "create_tournament_pool_toggle",
+                "create_tournament_pool_done",
+                "create_tournament_veto_back",
+            ),
+        )
+        return
+    data = await state.get_data()
+    entries = _normalize_map_pool_entries(data.get("map_pool_entries") or _default_map_pool_entries())
+    selected_keys = {row["map_key"] for row in entries}
+    if map_key in selected_keys:
+        entries = [row for row in entries if row["map_key"] != map_key]
+    else:
+        entries.append({"map_key": map_key, "map_name": get_cs2_map_name(map_key)})
+    await state.update_data(map_pool_entries=_normalize_map_pool_entries(entries))
+    await callback.message.edit_text(
+        _map_pool_prompt_text(entries),
+        reply_markup=_build_map_pool_keyboard(
+            entries,
+            "create_tournament_pool_toggle",
+            "create_tournament_pool_done",
+            "create_tournament_veto_back",
+        ),
+    )
+
+
+@router.callback_query(CreateTournament.map_pool, F.data == "create_tournament_veto_back")
+async def create_tournament_pool_back(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(CreateTournament.map_veto_enabled)
+    data = await state.get_data()
+    await callback.message.edit_text(
+        "Включить map veto для этого турнира?",
+        reply_markup=_build_veto_toggle_keyboard("create_tournament_veto", bool(data.get("map_veto_enabled"))),
+    )
+
+
+@router.message(CreateTournament.map_pool)
+async def create_tournament_pool_manual_input(message: Message, state: FSMContext):
+    entries = _normalize_map_pool_entries(parse_map_pool_text(message.text))
+    if not entries:
+        await message.answer("Не удалось распознать карты. Отправьте список заново: по одной на строку, через запятую или через ;.")
+        return
+    await state.update_data(map_pool_entries=entries)
+    await message.answer(
+        "Пул карт обновлен.\n\n"
+        f"{_map_pool_prompt_text(entries)}",
+        reply_markup=_build_map_pool_keyboard(
+            entries,
+            "create_tournament_pool_toggle",
+            "create_tournament_pool_done",
+            "create_tournament_veto_back",
+        ),
+    )
+
+
+@router.callback_query(CreateTournament.map_pool, F.data == "create_tournament_pool_done")
+async def create_tournament_pool_done(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    data = await state.get_data()
+    entries = _normalize_map_pool_entries(data.get("map_pool_entries") or [])
+    ok, error = _validate_veto_pool_for_stage_formats(data.get("stage_formats") or {}, _pool_entry_keys(entries))
+    if not ok:
+        await callback.answer(error or "Проверьте пул карт.", show_alert=True)
+        return
+    await state.update_data(map_pool_entries=entries)
+    await state.set_state(CreateTournament.veto_launch_mode)
+    await callback.message.edit_text(
+        "Выберите режим запуска pick/ban:",
+        reply_markup=_build_launch_mode_keyboard("create_tournament_launch_mode", LAUNCH_ADMIN),
+    )
+
+
+@router.callback_query(CreateTournament.veto_launch_mode, F.data.startswith("create_tournament_launch_mode_"))
+async def create_tournament_launch_mode(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    launch_mode = callback.data.replace("create_tournament_launch_mode_", "")
+    await state.update_data(veto_launch_mode=launch_mode)
     await state.set_state(CreateTournament.description)
-    await message.answer("Введите описание турнира (можно отправить 'нет', чтобы пропустить):")
+    await callback.message.edit_text("Введите описание турнира (можно отправить 'нет', чтобы пропустить):")
 
 @router.message(CreateTournament.description)
 async def create_tournament_description(message: Message, state: FSMContext):
@@ -631,12 +1036,38 @@ async def create_tournament_description(message: Message, state: FSMContext):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-    INSERT INTO tournaments (name, sport, city, start_date, end_date, max_teams, required_team_size, min_age, max_age, description, created_by, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'registration')
-    """, (data['name'], data['sport'], data['city'], data['start_date'], data['end_date'], data['max_teams'], data['required_team_size'], data['min_age'], data['max_age'], description, message.from_user.id))
+    INSERT INTO tournaments (
+        name, sport, city, start_date, end_date, max_teams, required_team_size,
+        min_age, max_age, description, created_by, status, match_format,
+        map_veto_enabled, veto_launch_mode
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'registration', ?, ?, ?)
+    """, (
+        data['name'], data['sport'], data['city'], data['start_date'], data['end_date'],
+        data['max_teams'], data['required_team_size'], data['min_age'], data['max_age'],
+        description, message.from_user.id, data.get('match_format', 'bo3'),
+        int(data.get('map_veto_enabled') or 0), data.get('veto_launch_mode', LAUNCH_ADMIN)
+    ))
     tournament_id = cur.lastrowid
     conn.commit()
     conn.close()
+    stage_formats = data.get("stage_formats") or {
+        "early_round_format": data.get("early_round_format", data.get("match_format", "bo3")),
+        "semifinal_format": data.get("semifinal_format", data.get("match_format", "bo3")),
+        "final_format": data.get("final_format", data.get("match_format", "bo3")),
+    }
+    replace_tournament_match_format_rules(
+        tournament_id,
+        _round_rules_from_stage_formats(
+            stage_formats,
+            get_tournament_main_round_count(tournament_id) or _expected_total_rounds_for_tournament_data(data),
+        ),
+    )
+    if _is_cs2_sport(data.get("sport")) and int(data.get("map_veto_enabled") or 0) == 1:
+        replace_tournament_map_pool(
+            tournament_id,
+            [(row["map_key"], row["map_name"]) for row in _normalize_map_pool_entries(data.get("map_pool_entries"))],
+        )
     ensure_tournament_invite_token(tournament_id, regenerate=False)
     request_site_sync(f"tournament_created:{tournament_id}")
     await state.clear()
@@ -655,18 +1086,115 @@ class EditTournament(StatesGroup):
     field = State()
     value = State()
     sport_choice = State()
+    early_round_format_choice = State()
+    semifinal_format_choice = State()
+    final_format_choice = State()
+    map_veto_choice = State()
+    launch_mode_choice = State()
+    map_pool_choice = State()
+    manager_add_input = State()
 
 class AdminBroadcast(StatesGroup):
     text = State()
 
+
+async def _open_tournament_field_editor(
+    callback: CallbackQuery,
+    state: FSMContext,
+    tournament_id: int,
+    field: str,
+    *,
+    return_callback: str,
+):
+    await state.update_data(tournament_id=tournament_id, field=field, editor_return_callback=return_callback)
+    tournament = get_tournament_by_id(tournament_id)
+    if field in {"map_veto_enabled", "map_pool", "veto_launch_mode"} and tournament and not _is_cs2_sport(tournament["sport"]):
+        await callback.answer("Map veto доступен только для CS2-турниров.", show_alert=True)
+        return
+
+    if field == "sport":
+        sports = get_all_sports()
+        await state.set_state(EditTournament.sport_choice)
+        await callback.message.edit_text("Выберите новый вид спорта:", reply_markup=sports_choice_keyboard_single(sports))
+    elif field in {"early_round_format", "semifinal_format", "final_format"}:
+        stage_formats = get_tournament_stage_formats(tournament_id)
+        if field == "early_round_format":
+            await state.set_state(EditTournament.early_round_format_choice)
+            title = "Выберите формат ранних раундов:"
+            prefix = "edit_early_round_format"
+            current_format = stage_formats["early_round_format"]
+        elif field == "semifinal_format":
+            await state.set_state(EditTournament.semifinal_format_choice)
+            title = "Выберите формат полуфинала:"
+            prefix = "edit_semifinal_format"
+            current_format = stage_formats["semifinal_format"]
+        else:
+            await state.set_state(EditTournament.final_format_choice)
+            title = "Выберите формат финала:"
+            prefix = "edit_final_format"
+            current_format = stage_formats["final_format"]
+        await callback.message.edit_text(
+            title,
+            reply_markup=_build_match_format_keyboard(prefix, current_format, return_callback),
+        )
+    elif field == "map_veto_enabled":
+        current = bool(tournament and int(tournament["map_veto_enabled"] or 0))
+        await state.set_state(EditTournament.map_veto_choice)
+        await callback.message.edit_text(
+            "Настройте map veto:",
+            reply_markup=_build_veto_toggle_keyboard("edit_veto_toggle", current, return_callback),
+        )
+    elif field == "veto_launch_mode":
+        await state.set_state(EditTournament.launch_mode_choice)
+        await callback.message.edit_text(
+            "Выберите режим запуска pick/ban:",
+            reply_markup=_build_launch_mode_keyboard(
+                "edit_launch_mode",
+                tournament["veto_launch_mode"] if tournament else LAUNCH_ADMIN,
+                return_callback,
+            ),
+        )
+    elif field == "map_pool":
+        current_pool = [dict(row) for row in get_tournament_map_pool(tournament_id)] or _default_map_pool_entries()
+        await state.set_state(EditTournament.map_pool_choice)
+        await state.update_data(edit_map_pool_entries=current_pool)
+        await callback.message.edit_text(
+            _map_pool_prompt_text(current_pool),
+            reply_markup=_build_map_pool_keyboard(
+                current_pool,
+                "edit_pool_toggle",
+                "edit_pool_done",
+                return_callback,
+            ),
+        )
+    elif field == "managers":
+        await state.clear()
+        await show_tournament_managers_panel(callback.message, tournament_id, callback.from_user.id)
+    else:
+        await state.set_state(EditTournament.value)
+        field_titles = {
+            "name": "Название",
+            "city": "Город",
+            "start_date": "Дата начала",
+            "end_date": "Дата конца",
+            "max_teams": "Макс. команд",
+            "required_team_size": "Размер команды",
+            "min_age": "Мин. возраст",
+            "max_age": "Макс. возраст",
+            "description": "Описание",
+        }
+        await callback.message.edit_text(
+            f"Введите новое значение для поля «{field_titles.get(field, field)}»:"
+        )
+
 @router.callback_query(F.data.startswith("admin_edit_tournament_"))
 async def edit_tournament_start(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    if not is_admin(callback.from_user.id):
+    tournament_id = int(callback.data.split("_")[3])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
         await callback.answer("Нет прав", show_alert=True)
         return
-    tournament_id = int(callback.data.split("_")[3])
-    await state.update_data(tournament_id=tournament_id)
+    await state.update_data(tournament_id=tournament_id, editor_return_callback=f"admin_edit_tournament_{tournament_id}")
     builder = InlineKeyboardBuilder()
     fields = [
         ("name", "Название"),
@@ -692,32 +1220,24 @@ async def edit_tournament_start(callback: CallbackQuery, state: FSMContext):
 async def edit_tournament_field(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     field = callback.data.replace("edit_field_", "")
-    await state.update_data(field=field)
-    if field == "sport":
-        sports = get_all_sports()
-        await state.set_state(EditTournament.sport_choice)
-        await callback.message.edit_text("Выберите новый вид спорта:", reply_markup=sports_choice_keyboard_single(sports))
-    else:
-        await state.set_state(EditTournament.value)
-        field_titles = {
-            "name": "Название",
-            "city": "Город",
-            "start_date": "Дата начала",
-            "end_date": "Дата конца",
-            "max_teams": "Макс. команд",
-            "required_team_size": "Размер команды",
-            "min_age": "Мин. возраст",
-            "max_age": "Макс. возраст",
-            "description": "Описание",
-        }
-        await callback.message.edit_text(
-            f"Введите новое значение для поля «{field_titles.get(field, field)}»:"
-        )
+    data = await state.get_data()
+    tournament_id = data["tournament_id"]
+    await _open_tournament_field_editor(
+        callback,
+        state,
+        tournament_id,
+        field,
+        return_callback=f"admin_edit_tournament_{tournament_id}",
+    )
 
 @router.message(EditTournament.value)
 async def edit_tournament_value(message: Message, state: FSMContext):
     data = await state.get_data()
     tournament_id = data['tournament_id']
+    if not can_manage_tournament(message.from_user.id, tournament_id):
+        await message.answer("Нет прав.")
+        await state.clear()
+        return
     field = data['field']
     new_value = message.text
     if field == "max_teams" or field == "required_team_size" or field == "min_age" or field == "max_age":
@@ -780,6 +1300,9 @@ async def edit_tournament_sport_chosen(callback: CallbackQuery, state: FSMContex
     new_sport = callback.data.replace("admin_tourn_sport_", "")
     data = await state.get_data()
     tournament_id = data['tournament_id']
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("UPDATE tournaments SET sport=? WHERE id=?",
@@ -789,6 +1312,306 @@ async def edit_tournament_sport_chosen(callback: CallbackQuery, state: FSMContex
     request_site_sync(f"tournament_updated:{tournament_id}:sport")
     await state.clear()
     await send_tournament_info(callback.bot, callback.message.chat.id, tournament_id, callback.from_user.id)
+
+
+async def _update_stage_format(callback: CallbackQuery, state: FSMContext, stage_key: str, selected_format: str):
+    data = await state.get_data()
+    tournament_id = data["tournament_id"]
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    if _has_in_progress_veto_sessions(tournament_id):
+        await callback.answer("Нельзя менять форматы, пока идет активный pick/ban.", show_alert=True)
+        return
+
+    stage_formats = get_tournament_stage_formats(tournament_id)
+    stage_formats[stage_key] = selected_format
+    tournament = get_tournament_by_id(tournament_id)
+    if tournament and _is_cs2_sport(tournament["sport"]) and int(tournament["map_veto_enabled"] or 0) == 1:
+        pool_entries = [dict(row) for row in get_tournament_map_pool(tournament_id)] or _default_map_pool_entries()
+        ok, error = _validate_veto_pool_for_stage_formats(stage_formats, _pool_entry_keys(pool_entries))
+        if not ok:
+            await callback.answer(error or "Проверьте пул карт.", show_alert=True)
+            return
+
+    _save_tournament_stage_formats(tournament_id, stage_formats)
+    request_site_sync(f"tournament_updated:{tournament_id}:round_formats")
+    await state.clear()
+    await admin_tournament_veto_panel(callback, tournament_id=tournament_id)
+
+
+@router.callback_query(EditTournament.early_round_format_choice, F.data.startswith("edit_early_round_format_"))
+async def edit_tournament_early_round_format(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await _update_stage_format(
+        callback,
+        state,
+        "early_round_format",
+        callback.data.replace("edit_early_round_format_", ""),
+    )
+
+
+@router.callback_query(EditTournament.semifinal_format_choice, F.data.startswith("edit_semifinal_format_"))
+async def edit_tournament_semifinal_format(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await _update_stage_format(
+        callback,
+        state,
+        "semifinal_format",
+        callback.data.replace("edit_semifinal_format_", ""),
+    )
+
+
+@router.callback_query(EditTournament.final_format_choice, F.data.startswith("edit_final_format_"))
+async def edit_tournament_final_format(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await _update_stage_format(
+        callback,
+        state,
+        "final_format",
+        callback.data.replace("edit_final_format_", ""),
+    )
+
+
+@router.callback_query(EditTournament.map_veto_choice, F.data.startswith("edit_veto_toggle_"))
+async def edit_tournament_veto_toggle(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    data = await state.get_data()
+    tournament_id = data["tournament_id"]
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    if _has_in_progress_veto_sessions(tournament_id):
+        await callback.answer("Нельзя менять настройки veto, пока идет активный pick/ban.", show_alert=True)
+        return
+
+    enabled = callback.data.endswith("_on")
+    tournament = get_tournament_by_id(tournament_id)
+    if enabled and not _is_cs2_sport(tournament["sport"] if tournament else None):
+        await callback.answer("Map veto доступен только для CS2.", show_alert=True)
+        return
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE tournaments SET map_veto_enabled=? WHERE id=?", (1 if enabled else 0, tournament_id))
+    conn.commit()
+    conn.close()
+    if enabled and not get_tournament_map_pool(tournament_id):
+        replace_tournament_map_pool(
+            tournament_id,
+            default_cs2_map_entries(),
+        )
+    request_site_sync(f"tournament_updated:{tournament_id}:map_veto_enabled")
+    await state.clear()
+    await admin_tournament_veto_panel(callback, tournament_id=tournament_id)
+
+
+@router.callback_query(EditTournament.launch_mode_choice, F.data.startswith("edit_launch_mode_"))
+async def edit_tournament_launch_mode(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    data = await state.get_data()
+    tournament_id = data["tournament_id"]
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    launch_mode = callback.data.replace("edit_launch_mode_", "")
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE tournaments SET veto_launch_mode=? WHERE id=?", (launch_mode, tournament_id))
+    conn.commit()
+    conn.close()
+    request_site_sync(f"tournament_updated:{tournament_id}:veto_launch_mode")
+    await state.clear()
+    await admin_tournament_veto_panel(callback, tournament_id=tournament_id)
+
+
+@router.callback_query(EditTournament.map_pool_choice, F.data.startswith("edit_pool_toggle_"))
+async def edit_tournament_pool_toggle(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    data = await state.get_data()
+    return_callback = data.get("editor_return_callback") or f"admin_tournament_veto_{data['tournament_id']}"
+    map_key = callback.data.replace("edit_pool_toggle_", "")
+    if map_key == "manual":
+        current_entries = _normalize_map_pool_entries(data.get("edit_map_pool_entries") or _default_map_pool_entries())
+        await callback.message.edit_text(
+            "Отправьте новый пул карт сообщением.\n"
+            "Формат: по одной карте на строку, через запятую или через ;.\n"
+            "Можно указывать стандартные и пользовательские карты.\n\n"
+            f"Текущий пул: {_map_pool_label(current_entries)}",
+            reply_markup=_build_map_pool_keyboard(
+                current_entries,
+                "edit_pool_toggle",
+                "edit_pool_done",
+                return_callback,
+            ),
+        )
+        return
+    entries = _normalize_map_pool_entries(data.get("edit_map_pool_entries") or _default_map_pool_entries())
+    selected_keys = {row["map_key"] for row in entries}
+    if map_key in selected_keys:
+        entries = [row for row in entries if row["map_key"] != map_key]
+    else:
+        entries.append({"map_key": map_key, "map_name": get_cs2_map_name(map_key)})
+    await state.update_data(edit_map_pool_entries=_normalize_map_pool_entries(entries))
+    tournament_id = data["tournament_id"]
+    await callback.message.edit_text(
+        _map_pool_prompt_text(entries),
+        reply_markup=_build_map_pool_keyboard(
+            entries,
+            "edit_pool_toggle",
+            "edit_pool_done",
+            return_callback,
+        ),
+    )
+
+
+@router.message(EditTournament.map_pool_choice)
+async def edit_tournament_pool_manual_input(message: Message, state: FSMContext):
+    entries = _normalize_map_pool_entries(parse_map_pool_text(message.text))
+    if not entries:
+        await message.answer("Не удалось распознать карты. Отправьте список заново: по одной на строку, через запятую или через ;.")
+        return
+    data = await state.get_data()
+    tournament_id = data["tournament_id"]
+    return_callback = data.get("editor_return_callback") or f"admin_tournament_veto_{tournament_id}"
+    await state.update_data(edit_map_pool_entries=entries)
+    await message.answer(
+        "Пул карт обновлен.\n\n"
+        f"{_map_pool_prompt_text(entries)}",
+        reply_markup=_build_map_pool_keyboard(
+            entries,
+            "edit_pool_toggle",
+            "edit_pool_done",
+            return_callback,
+        ),
+    )
+
+
+@router.callback_query(EditTournament.map_pool_choice, F.data == "edit_pool_done")
+async def edit_tournament_pool_done(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    data = await state.get_data()
+    tournament_id = data["tournament_id"]
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    if _has_in_progress_veto_sessions(tournament_id):
+        await callback.answer("Нельзя менять пул, пока идет активный pick/ban.", show_alert=True)
+        return
+    entries = _normalize_map_pool_entries(data.get("edit_map_pool_entries") or [])
+    stage_formats = get_tournament_stage_formats(tournament_id)
+    ok, error = _validate_veto_pool_for_stage_formats(stage_formats, _pool_entry_keys(entries))
+    if not ok:
+        await callback.answer(error or "Проверьте пул карт.", show_alert=True)
+        return
+    replace_tournament_map_pool(
+        tournament_id,
+        [(row["map_key"], row["map_name"]) for row in entries],
+    )
+    request_site_sync(f"tournament_updated:{tournament_id}:map_pool")
+    await state.clear()
+    await admin_tournament_veto_panel(callback, tournament_id=tournament_id)
+
+
+async def show_tournament_managers_panel(message, tournament_id: int, actor_telegram_id: int):
+    tournament = get_tournament_by_id(tournament_id)
+    if not tournament:
+        await message.edit_text("Турнир не найден.")
+        return
+    managers = list(get_tournament_manager_users(tournament_id))
+    is_owner = is_tournament_creator_or_global_admin(actor_telegram_id, tournament_id)
+    lines = [
+        "Ответственные турнира",
+        "",
+        f"Турнир: {tournament['name']}",
+    ]
+    if managers:
+        lines.append("")
+        lines.append("Назначены:")
+        for user in managers:
+            lines.append(f"• {_build_manager_label(user)}")
+    else:
+        lines.append("")
+        lines.append("Пока никто не назначен.")
+
+    builder = InlineKeyboardBuilder()
+    if is_owner:
+        builder.button(text="➕ Добавить ответственного", callback_data=f"admin_tournament_managers_add_{tournament_id}")
+        for user in managers:
+            builder.button(
+                text=f"➖ {_build_manager_label(user)}",
+                callback_data=f"admin_tournament_manager_remove_{tournament_id}_{user['id']}",
+            )
+    builder.button(text="🔙 К турниру", callback_data=f"admin_tournament_manage_{tournament_id}")
+    builder.adjust(1)
+    await message.edit_text("\n".join(lines), reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("admin_tournament_managers_add_"))
+async def admin_tournament_managers_add(callback: CallbackQuery, state: FSMContext):
+    tournament_id = int(callback.data.split("_")[4])
+    if not is_tournament_creator_or_global_admin(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    await state.update_data(tournament_id=tournament_id, editor_return_callback=f"admin_tournament_managers_{tournament_id}")
+    await state.set_state(EditTournament.manager_add_input)
+    await callback.message.edit_text(
+        "Введите username, имя или Telegram ID пользователя, которого нужно назначить ответственным."
+    )
+    await callback.answer()
+
+
+@router.message(EditTournament.manager_add_input)
+async def admin_tournament_manager_add_input(message: Message, state: FSMContext):
+    data = await state.get_data()
+    tournament_id = data["tournament_id"]
+    if not is_tournament_creator_or_global_admin(message.from_user.id, tournament_id):
+        await message.answer("Нет прав.")
+        await state.clear()
+        return
+    users = list(search_users((message.text or "").strip(), limit=10))
+    if not users:
+        await message.answer("Пользователи не найдены. Попробуйте другой запрос.")
+        return
+    builder = InlineKeyboardBuilder()
+    for user in users:
+        builder.button(
+            text=_build_manager_label(user),
+            callback_data=f"admin_tournament_manager_pick_{tournament_id}_{user['id']}",
+        )
+    builder.button(text="🔙 Назад", callback_data=f"admin_tournament_managers_{tournament_id}")
+    builder.adjust(1)
+    await message.answer("Выберите пользователя:", reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data.startswith("admin_tournament_manager_pick_"))
+async def admin_tournament_manager_pick(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    tournament_id = int(parts[4])
+    user_id = int(parts[5])
+    if not is_tournament_creator_or_global_admin(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    actor = get_user(callback.from_user.id)
+    add_tournament_manager(tournament_id, user_id, actor["id"] if actor else None)
+    request_site_sync(f"tournament_manager_added:{tournament_id}:{user_id}")
+    await state.clear()
+    await show_tournament_managers_panel(callback.message, tournament_id, callback.from_user.id)
+    await callback.answer("Ответственный назначен.")
+
+
+@router.callback_query(F.data.startswith("admin_tournament_manager_remove_"))
+async def admin_tournament_manager_remove(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    tournament_id = int(parts[4])
+    user_id = int(parts[5])
+    if not is_tournament_creator_or_global_admin(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    remove_tournament_manager(tournament_id, user_id)
+    request_site_sync(f"tournament_manager_removed:{tournament_id}:{user_id}")
+    await show_tournament_managers_panel(callback.message, tournament_id, callback.from_user.id)
+    await callback.answer("Ответственный снят.")
 
 # ---------- Заявки на турниры ----------
 
@@ -876,13 +1699,13 @@ async def admin_tournaments_page_callback(callback: CallbackQuery):
 # ---------- Управление конкретным турниром ----------
 
 @router.callback_query(F.data.startswith("admin_tournament_manage_"))
-async def admin_tournament_manage(callback: CallbackQuery):
+async def admin_tournament_manage(callback: CallbackQuery, tournament_id: int | None = None):
     """Меню управления конкретным турниром для админа."""
-    if not is_admin(callback.from_user.id):
+    if tournament_id is None:
+        tournament_id = int(callback.data.split("_")[3])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
         await callback.answer("Нет прав", show_alert=True)
         return
-
-    tournament_id = int(callback.data.split("_")[3])
     tournament = get_tournament_by_id(tournament_id)
 
     if not tournament:
@@ -945,6 +1768,7 @@ async def admin_tournament_manage(callback: CallbackQuery):
             age_text = f"{tournament['min_age']}–{tournament['max_age']} лет"
     else:
         age_text = "Не указан"
+    stage_formats = get_tournament_stage_formats(tournament_id)
 
     text = f"""
 ⚙️ Управление турниром
@@ -961,9 +1785,20 @@ async def admin_tournament_manage(callback: CallbackQuery):
 Отклоненные: {rejected_count}
 Сетка: {'✅ Сгенерирована' if tournament['bracket_generated'] else '❌ Не сгенерирована'}
 Статус: {status_display}
+Форматы серий:
+{_format_stage_formats_text(stage_formats)}
+Map veto: {'включен' if int(tournament['map_veto_enabled'] or 0) == 1 else 'выключен'}
+Режим запуска veto: {tournament['veto_launch_mode'] or LAUNCH_ADMIN}
 """
     if tournament['description'] and tournament['description'] != 'нет':
         text += f"\n📝 Описание: {tournament['description']}"
+    if _is_cs2_sport(tournament["sport"]) and int(tournament["map_veto_enabled"] or 0) == 1:
+        pool = [dict(row) for row in get_tournament_map_pool(tournament_id)] or _default_map_pool_entries()
+        text += f"\n🗺 Пул карт: {_map_pool_label(pool)}"
+        text += f"\n📋 Veto: {_build_veto_overview(tournament_id)}"
+    managers = list(get_tournament_manager_users(tournament_id))
+    if managers:
+        text += f"\n👤 Ответственные: {', '.join(_build_manager_label(user) for user in managers)}"
 
     builder = InlineKeyboardBuilder()
 
@@ -986,10 +1821,14 @@ async def admin_tournament_manage(callback: CallbackQuery):
     # Команды и заявки открываются через отдельный хаб со статусами.
     builder.button(text="👥 Команды и заявки",
                    callback_data=f"admin_tournament_teams_{tournament_id}")
+    if _is_cs2_sport(tournament["sport"]):
+        builder.button(text="🗺 Панель veto", callback_data=f"admin_tournament_veto_{tournament_id}")
 
     # Редактирование турнира
     builder.button(text="✏️ Редактировать турнир",
                    callback_data=f"admin_edit_tournament_{tournament_id}")
+    if is_tournament_creator_or_global_admin(callback.from_user.id, tournament_id):
+        builder.button(text="👤 Ответственные", callback_data=f"admin_tournament_managers_{tournament_id}")
     builder.button(text="🔗 Ссылка-приглашение",
                    callback_data=f"admin_tournament_invite_menu_{tournament_id}")
 
@@ -998,8 +1837,9 @@ async def admin_tournament_manage(callback: CallbackQuery):
                    callback_data=f"admin_delete_tournament_{tournament_id}")
 
     # Назад к списку турниров
-    builder.button(text="🔙 Назад к турнирам",
-                   callback_data="admin_tournaments_list")
+    back_callback = "admin_tournaments_list" if is_admin(callback.from_user.id) else f"tournament_{tournament_id}"
+    builder.button(text="🔙 Назад",
+                   callback_data=back_callback)
     builder.adjust(1)
 
     try:
@@ -1013,13 +1853,99 @@ async def admin_tournament_manage(callback: CallbackQuery):
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("admin_tournament_invite_menu_"))
-async def admin_tournament_invite_menu(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
+@router.callback_query(F.data.startswith("admin_tournament_veto_"))
+async def admin_tournament_veto_panel(callback: CallbackQuery, tournament_id: int | None = None):
+    if tournament_id is None:
+        tournament_id = int(callback.data.split("_")[3])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
         await callback.answer("Нет прав", show_alert=True)
         return
+    tournament = get_tournament_by_id(tournament_id)
+    if not tournament:
+        await callback.answer("Турнир не найден", show_alert=True)
+        return
 
+    sessions = list_tournament_veto_sessions(tournament_id)
+    stage_formats = get_tournament_stage_formats(tournament_id)
+    lines = [
+        "🗺 Панель veto",
+        "",
+        f"Турнир: {tournament['name']}",
+        "",
+        "Форматы серий:",
+        _format_stage_formats_text(stage_formats),
+        "",
+        f"Map veto: {'включен' if int(tournament['map_veto_enabled'] or 0) == 1 else 'выключен'}",
+        f"Режим запуска: {tournament['veto_launch_mode'] or LAUNCH_ADMIN}",
+        "",
+        f"Сводка: {_build_veto_overview(tournament_id)}",
+    ]
+    if int(tournament["map_veto_enabled"] or 0) == 1:
+        pool = [dict(row) for row in get_tournament_map_pool(tournament_id)] or _default_map_pool_entries()
+        lines.extend(["", f"Пул карт: {_map_pool_label(pool)}"])
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🧩 Ранние раунды", callback_data=f"admin_veto_field_{tournament_id}_early_round_format")
+    builder.button(text="🥈 Полуфинал", callback_data=f"admin_veto_field_{tournament_id}_semifinal_format")
+    builder.button(text="🏆 Финал", callback_data=f"admin_veto_field_{tournament_id}_final_format")
+    builder.button(text="🗺 Map veto", callback_data=f"admin_veto_field_{tournament_id}_map_veto_enabled")
+    builder.button(text="📚 Пул карт", callback_data=f"admin_veto_field_{tournament_id}_map_pool")
+    builder.button(text="🚀 Старт pick/ban", callback_data=f"admin_veto_field_{tournament_id}_veto_launch_mode")
+    if sessions:
+        lines.append("")
+        lines.append("Матчи:")
+        for session in sessions[:20]:
+            round_label = session.get("round_name") or f"Раунд {session.get('round_number') or '?'}"
+            lines.append(
+                f"• {round_label}: {session.get('team1_name') or 'TBD'} vs {session.get('team2_name') or 'TBD'} "
+                f"— {get_veto_status_label(session.get('status'))}"
+            )
+            builder.button(
+                text=f"🎮 {round_label}: {session.get('team1_name') or 'TBD'} vs {session.get('team2_name') or 'TBD'}",
+                callback_data=f"veto_admin_open_{session['bracket_match_id']}",
+            )
+    else:
+        lines.append("")
+        lines.append("Подходящих матчей для pick/ban пока нет.")
+    builder.button(text="🔙 К турниру", callback_data=f"admin_tournament_manage_{tournament_id}")
+    builder.adjust(1)
+    await callback.message.edit_text("\n".join(lines), reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_veto_field_"))
+async def admin_veto_field(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    _, _, _, tournament_id_str, field = callback.data.split("_", 4)
+    tournament_id = int(tournament_id_str)
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    await _open_tournament_field_editor(
+        callback,
+        state,
+        tournament_id,
+        field,
+        return_callback=f"admin_tournament_veto_{tournament_id}",
+    )
+
+
+@router.callback_query(F.data.regexp(r"^admin_tournament_managers_\d+$"))
+async def admin_tournament_managers(callback: CallbackQuery, state: FSMContext):
+    tournament_id = int(callback.data.split("_")[3])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    await state.clear()
+    await show_tournament_managers_panel(callback.message, tournament_id, callback.from_user.id)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_tournament_invite_menu_"))
+async def admin_tournament_invite_menu(callback: CallbackQuery):
     tournament_id = int(callback.data.split("_")[4])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
     token = ensure_tournament_invite_token(tournament_id, regenerate=False)
     if not token:
         await callback.answer("Не удалось получить ссылку.", show_alert=True)
@@ -1051,11 +1977,10 @@ async def admin_tournament_invite_menu(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("admin_tournament_invite_show_"))
 async def admin_tournament_invite_show(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
+    tournament_id = int(callback.data.split("_")[4])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
         await callback.answer("Нет прав", show_alert=True)
         return
-
-    tournament_id = int(callback.data.split("_")[4])
     token = ensure_tournament_invite_token(tournament_id, regenerate=False)
     if not token:
         await callback.answer("Не удалось получить ссылку.", show_alert=True)
@@ -1077,11 +2002,10 @@ async def admin_tournament_invite_show(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("admin_tournament_invite_reset_"))
 async def admin_tournament_invite_reset(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
+    tournament_id = int(callback.data.split("_")[4])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
         await callback.answer("Нет прав", show_alert=True)
         return
-
-    tournament_id = int(callback.data.split("_")[4])
     token = ensure_tournament_invite_token(tournament_id, regenerate=True)
     if not token:
         await callback.answer("Не удалось обновить ссылку.", show_alert=True)
@@ -1105,11 +2029,10 @@ async def admin_tournament_invite_reset(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("admin_finish_tournament_"))
 async def admin_finish_tournament_confirm(callback: CallbackQuery):
     """Подтверждение завершения турнира."""
-    if not is_admin(callback.from_user.id):
+    tournament_id = int(callback.data.split("_")[3])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
         await callback.answer("Нет прав", show_alert=True)
         return
-
-    tournament_id = int(callback.data.split("_")[3])
     tournament = get_tournament_by_id(tournament_id)
 
     if not tournament:
@@ -1137,11 +2060,10 @@ async def admin_finish_tournament_confirm(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("confirm_finish_tournament_"))
 async def confirm_finish_tournament(callback: CallbackQuery):
     """Завершение турнира с начислением очков."""
-    if not is_admin(callback.from_user.id):
+    tournament_id = int(callback.data.split("_")[3])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
         await callback.answer("Нет прав", show_alert=True)
         return
-
-    tournament_id = int(callback.data.split("_")[3])
 
     # Импортируем функцию завершения
     from razryad_arena_utils import finish_tournament_with_awards, get_team_by_id
@@ -1250,16 +2172,16 @@ async def admin_pending_team_info(callback: CallbackQuery):
 @router.callback_query(F.data.regexp(r"^approve_\d+(?:_\d+)?(?:_\d+)?(?:_[a-z]+)?$"))
 async def approve_app(callback: CallbackQuery):
     """Одобрение заявки."""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-
     parts = callback.data.split("_")
     app_id = int(parts[1])
     tournament_id = int(parts[2]) if len(parts) > 2 else None
     page_offset = int(parts[3]) if len(parts) > 3 else 0
     section = parts[4] if len(parts) > 4 else None
     app = _get_tournament_application_details(app_id)
+    target_tournament_id = tournament_id or (app["tournament_id"] if app else None)
+    if not target_tournament_id or not can_manage_tournament(callback.from_user.id, target_tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
 
     result = approve_application(app_id)
     if result.get("ok"):
@@ -1286,16 +2208,16 @@ async def approve_app(callback: CallbackQuery):
 @router.callback_query(F.data.regexp(r"^reject_\d+(?:_\d+)?(?:_\d+)?(?:_[a-z]+)?$"))
 async def reject_app(callback: CallbackQuery):
     """Отклонение заявки."""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-
     parts = callback.data.split("_")
     app_id = int(parts[1])
     tournament_id = int(parts[2]) if len(parts) > 2 else None
     page_offset = int(parts[3]) if len(parts) > 3 else 0
     section = parts[4] if len(parts) > 4 else None
     app = _get_tournament_application_details(app_id)
+    target_tournament_id = tournament_id or (app["tournament_id"] if app else None)
+    if not target_tournament_id or not can_manage_tournament(callback.from_user.id, target_tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
 
     reject_application(app_id)
     request_site_sync(f"application_rejected:{app_id}")
@@ -1319,13 +2241,12 @@ async def reject_app(callback: CallbackQuery):
 @router.callback_query(F.data.regexp(r"^exclude_\d+_\d+$"))
 async def exclude_app(callback: CallbackQuery):
     """Legacy callback: запрашивает подтверждение исключения."""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-
     parts = callback.data.split("_")
     app_id = int(parts[1])
     tournament_id = int(parts[2])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
     await show_exclusion_confirm(callback.message, tournament_id, app_id, offset=0)
     await callback.answer()
 
@@ -1448,27 +2369,25 @@ async def show_tournament_application_section(message, tournament_id: int, secti
 
 @router.callback_query(F.data.startswith("admin_tournament_section_page_"))
 async def admin_tournament_section_page(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-
     parts = callback.data.split("_")
     section = parts[4]
     tournament_id = int(parts[5])
     offset = int(parts[6])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
     await show_tournament_application_section(callback.message, tournament_id, section, offset=offset)
     await callback.answer()
 
 
 @router.callback_query(F.data.regexp(r"^admin_tournament_section_(approved|pending|excluded|rejected)_\d+$"))
 async def admin_tournament_section(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-
     parts = callback.data.split("_")
     section = parts[3]
     tournament_id = int(parts[4])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
     await show_tournament_application_section(callback.message, tournament_id, section, offset=0)
     await callback.answer()
 
@@ -1476,11 +2395,10 @@ async def admin_tournament_section(callback: CallbackQuery):
 @router.callback_query(F.data.regexp(r"^admin_tournament_teams_\d+$"))
 async def admin_tournament_teams(callback: CallbackQuery):
     """Хаб раздела команд и заявок конкретного турнира."""
-    if not is_admin(callback.from_user.id):
+    tournament_id = int(callback.data.split("_")[3])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
         await callback.answer("Нет прав", show_alert=True)
         return
-
-    tournament_id = int(callback.data.split("_")[3])
     await show_tournament_applications_hub(callback.message, tournament_id)
     await callback.answer()
 
@@ -1488,12 +2406,11 @@ async def admin_tournament_teams(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("admin_tournament_teams_page_"))
 async def admin_tournament_teams_page_legacy(callback: CallbackQuery):
     """Устаревшая пагинация общего списка: перенаправляет в новый хаб."""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-
     parts = callback.data.split("_")
     tournament_id = int(parts[4])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
     await show_tournament_applications_hub(callback.message, tournament_id)
     await callback.answer()
 
@@ -1603,33 +2520,33 @@ async def show_exclusion_confirm(message, tournament_id: int, app_id: int, offse
 
 @router.callback_query(F.data.regexp(r"^admin_tournament_exclusions_\d+$"))
 async def admin_tournament_exclusions(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
+    tournament_id = int(callback.data.split("_")[3])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
         await callback.answer("Нет прав", show_alert=True)
         return
-    tournament_id = int(callback.data.split("_")[3])
     await show_tournament_application_section(callback.message, tournament_id, "approved", offset=0)
     await callback.answer()
 
 @router.callback_query(F.data.startswith("admin_tournament_exclusions_page_"))
 async def admin_tournament_exclusions_page(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
     parts = callback.data.split("_")
     tournament_id = int(parts[4])
     offset = int(parts[5])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
     await show_tournament_exclusions_list(callback.message, tournament_id, offset=offset)
     await callback.answer()
 
 @router.callback_query(F.data.startswith("admin_tournament_exclude_pick_"))
 async def admin_tournament_exclude_pick(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
     parts = callback.data.split("_")
     tournament_id = int(parts[4])
     app_id = int(parts[5])
     offset = int(parts[6])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
     await show_exclusion_confirm(
         callback.message,
         tournament_id,
@@ -1641,14 +2558,14 @@ async def admin_tournament_exclude_pick(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("admin_tournament_exclude_confirm_"))
 async def admin_tournament_exclude_confirm(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
     parts = callback.data.split("_")
     tournament_id = int(parts[4])
     app_id = int(parts[5])
     offset = int(parts[6])
     section = parts[7] if len(parts) > 7 else None
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
     app = _get_tournament_application_details(app_id)
 
     result = exclude_team_from_tournament(app_id)
@@ -1672,15 +2589,14 @@ async def admin_tournament_exclude_confirm(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("admin_tournament_allow_reapply_"))
 async def admin_tournament_allow_reapply(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-
     parts = callback.data.split("_")
     tournament_id = int(parts[4])
     app_id = int(parts[5])
     offset = int(parts[6])
     section = parts[7] if len(parts) > 7 else None
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
 
     result = allow_reapply_excluded_application(app_id)
     if result.get("ok"):
@@ -1707,10 +2623,6 @@ async def admin_tournament_allow_reapply(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("admin_tournament_team_info_"))
 async def admin_tournament_team_info(callback: CallbackQuery):
     """Подробная информация о команде в контексте заявки на конкретный турнир."""
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-
     parts = callback.data.split("_")
     if len(parts) > 8 and parts[4] in TOURNAMENT_APPLICATION_SECTIONS:
         section = parts[4]
@@ -1725,6 +2637,9 @@ async def admin_tournament_team_info(callback: CallbackQuery):
         offset = int(parts[7]) if len(parts) > 7 else 0
         app = _get_tournament_application_details(app_id)
         section = app['status'] if app and app['status'] in TOURNAMENT_APPLICATION_SECTIONS else 'pending'
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
 
     tournament = get_tournament_by_id(tournament_id)
     app = _get_tournament_application_details(app_id)
@@ -1767,6 +2682,9 @@ async def admin_tournament_team_info(callback: CallbackQuery):
 async def admin_tournament_applications(callback: CallbackQuery):
     """Устаревший callback: открывает новый хаб раздела турнира."""
     tournament_id = int(callback.data.split("_")[3])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
     await show_tournament_applications_hub(callback.message, tournament_id)
     await callback.answer()
 
@@ -2483,10 +3401,10 @@ async def admin_search_page(callback: CallbackQuery):
 @router.callback_query(F.data.startswith("admin_delete_tournament_"))
 async def admin_delete_tournament_confirm(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
-    if not is_admin(callback.from_user.id):
+    tournament_id = int(callback.data.split("_")[3])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
         await callback.answer("Нет прав", show_alert=True)
         return
-    tournament_id = int(callback.data.split("_")[3])
     tournament = get_tournament_by_id(tournament_id)
     if not tournament:
         await callback.answer("Турнир не найден", show_alert=True)
@@ -2503,11 +3421,11 @@ async def admin_delete_tournament_confirm(callback: CallbackQuery, state: FSMCon
 
 @router.callback_query(F.data == "admin_confirm_delete_tournament")
 async def admin_delete_tournament_execute(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
     data = await state.get_data()
     tournament_id = data.get('tournament_id')
+    if not tournament_id or not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
     if not tournament_id:
         await callback.answer("Ошибка", show_alert=True)
         return

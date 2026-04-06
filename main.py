@@ -16,8 +16,10 @@ import handlers.admin as admin
 import handlers.brackets as brackets
 import handlers.stats as stats
 import handlers.match_manual as match_manual
+import handlers.match_veto as match_veto
 from middlewares import BanCheckMiddleware, RequiredSubscriptionMiddleware
 from utils.notifications import dispatch_due_match_reminders
+from utils.veto_service import dispatch_due_veto_sessions
 from utils.site_sync import site_sync_enabled, site_sync_worker
 
 logging.basicConfig(level=logging.INFO)
@@ -40,6 +42,7 @@ async def reminder_worker(bot: Bot, interval_seconds: int = 60):
     while True:
         try:
             await dispatch_due_match_reminders(bot)
+            await dispatch_due_veto_sessions(bot)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -63,6 +66,7 @@ async def main():
     dp.include_router(brackets.router)
     dp.include_router(stats.router)
     dp.include_router(match_manual.router)
+    dp.include_router(match_veto.router)
 
     dp.message.middleware(BanCheckMiddleware())
     dp.callback_query.middleware(BanCheckMiddleware())
