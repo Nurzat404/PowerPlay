@@ -21,9 +21,9 @@ from razryad_arena_utils import (
 )
 from utils.bracket_utils import generate_bracket, get_semifinal_losers
 from database import get_connection
-from handlers.states import ManualMatchInput, BracketScheduleInput
+from handlers.states import ManualMatchInput, BracketScheduleInput, TargetedBroadcast
 from handlers.match_manual import start_manual_input_by_match
-from utils.notifications import notify_bracket_match_scheduled, notify_bracket_match_reminder
+from utils.notifications import notify_bracket_match_scheduled, notify_bracket_match_reminder, prepare_match_broadcast_payload
 from utils.site_sync import request_site_sync
 from utils.veto_service import STATUS_COMPLETED, STATUS_IN_PROGRESS, get_match_veto_details
 
@@ -249,10 +249,6 @@ async def bracket_schedule_location_input(message: Message, state: FSMContext):
                 old_location=result["old"]["location"],
             )
             mark_bracket_schedule_notified(match_payload["id"])
-            scheduled_dt = parse_utc_storage_datetime(match_payload.get("scheduled_at_utc"))
-            if scheduled_dt and scheduled_dt <= datetime.now(timezone.utc) + timedelta(hours=1):
-                await notify_bracket_match_reminder(message.bot, match_payload)
-                mark_bracket_reminder_sent(match_payload["id"])
             action_text = "изменено" if changed else "назначено"
             await message.answer(
                 f"✅ Расписание {action_text}: "
@@ -607,7 +603,40 @@ async def view_bracket(callback: CallbackQuery, state: FSMContext, tournament_id
         await callback.answer()
 
 
-@router.callback_query(F.data.startswith("bracket_match_"))
+@router.callback_query(F.data.startswith("bracket_match_broadcast_"))
+async def bracket_match_broadcast_start(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    match_id = int(parts[3])
+    tournament_id = int(parts[4])
+    if not can_manage_bracket_match(callback.from_user.id, match_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+
+    payload, error = prepare_match_broadcast_payload(match_id)
+    if not payload:
+        await callback.answer(error or "Не удалось подготовить рассылку.", show_alert=True)
+        return
+
+    await state.clear()
+    await state.set_state(TargetedBroadcast.text)
+    await state.update_data(
+        broadcast_scope="match",
+        broadcast_target_id=match_id,
+        broadcast_return_callback=f"bracket_match_{match_id}_{tournament_id}",
+    )
+    await callback.message.edit_text(
+        "📢 Сообщение участникам матча\n\n"
+        f"Матч: {payload['title']}\n"
+        f"Получателей: {payload['recipient_count']}\n\n"
+        "Введите текст сообщения. Бот добавит шапку матча автоматически.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="targeted_broadcast_cancel")]
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^bracket_match_\d+(?:_\d+)?$"))
 async def bracket_match_menu(callback: CallbackQuery, state: FSMContext):
     """Карточка матча: ввод результата и редактирование расписания."""
     parts = callback.data.split("_")
@@ -658,6 +687,7 @@ async def bracket_match_menu(callback: CallbackQuery, state: FSMContext):
         text += "\n\n🔒 Время и место зафиксированы: pick/ban уже начался или завершен."
     builder = InlineKeyboardBuilder()
     builder.button(text="✏️ Ввести результат", callback_data=f"manual_match_result_{match_id}_{tournament_id}")
+    builder.button(text="📢 Сообщение участникам матча", callback_data=f"bracket_match_broadcast_{match_id}_{tournament_id}")
     if not schedule_locked:
         builder.button(text="🗓 Изменить время/место", callback_data=f"bracket_schedule_edit_{match_id}_{tournament_id}")
     tournament = get_tournament_by_id(tournament_id)

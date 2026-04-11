@@ -15,6 +15,10 @@ from razryad_arena_utils import (
     get_sport_display_name,
     get_team_by_id,
     get_team_members,
+    get_tournament_by_id,
+    get_tournament_manager_chat_ids,
+    get_tournament_teams,
+    get_user_by_id,
     mark_bracket_reminder_sent,
     normalize_sport_name,
 )
@@ -77,6 +81,112 @@ async def _broadcast_text(bot: Bot, chat_ids: list[int], text: str):
                 await bot.send_message(chat_id=chat_id, text=chunk)
             except Exception as exc:
                 logger.warning("Не удалось отправить уведомление chat_id=%s: %s", chat_id, exc)
+
+
+async def send_custom_broadcast(bot: Bot, chat_ids: list[int], text: str) -> tuple[int, int]:
+    ok_count = 0
+    fail_count = 0
+    for chat_id in chat_ids:
+        try:
+            for chunk in _chunk_text(text):
+                await bot.send_message(chat_id=chat_id, text=chunk)
+            ok_count += 1
+        except Exception as exc:
+            logger.warning("Не удалось отправить custom-уведомление chat_id=%s: %s", chat_id, exc)
+            fail_count += 1
+    return ok_count, fail_count
+
+
+def prepare_match_broadcast_payload(match_id: int, body_text: str = "") -> tuple[dict[str, Any] | None, str | None]:
+    match = get_bracket_match_by_id(match_id)
+    if not match:
+        return None, "Матч не найден."
+    match_dict = dict(match)
+    if not match_dict.get("team1_id") or not match_dict.get("team2_id"):
+        return None, "В этом матче еще нет пары команд."
+
+    chat_ids = _collect_team_member_chat_ids(match_dict.get("team1_id"), match_dict.get("team2_id"))
+    if not chat_ids:
+        return None, "У участников этого матча нет доступных Telegram ID для рассылки."
+
+    tournament_name = (match_dict.get("tournament_name") or "Турнир").strip()
+    round_name = _round_label(match_dict)
+    team1_name = _safe_team_name(match_dict.get("team1_name"), "Команда 1")
+    team2_name = _safe_team_name(match_dict.get("team2_name"), "Команда 2")
+    location = (match_dict.get("location") or "").strip()
+
+    lines = [
+        "📢 Сообщение по матчу",
+        "",
+        f"🏆 Турнир: {tournament_name}",
+        f"📍 Раунд: {round_name}",
+        f"⚔️ {team1_name} vs {team2_name}",
+    ]
+    if location:
+        lines.extend(["", f"📌 Место: {location}"])
+    if body_text:
+        lines.extend(["", body_text.strip()])
+
+    return {
+        "scope": "match",
+        "target_id": match_id,
+        "recipient_ids": sorted(set(chat_ids)),
+        "recipient_count": len(set(chat_ids)),
+        "text": "\n".join(lines),
+        "return_callback": f"bracket_match_{match_id}_{match_dict['tournament_id']}",
+        "title": f"{team1_name} vs {team2_name}",
+    }, None
+
+
+def prepare_tournament_broadcast_payload(tournament_id: int, body_text: str = "") -> tuple[dict[str, Any] | None, str | None]:
+    tournament = get_tournament_by_id(tournament_id)
+    if not tournament:
+        return None, "Турнир не найден."
+    tournament_dict = dict(tournament)
+
+    chat_ids: set[int] = set()
+    for team in get_tournament_teams(tournament_id, status="approved"):
+        team_id = team["id"] if isinstance(team, dict) else team["id"]
+        for member in get_team_members(team_id):
+            telegram_id = member.get("telegram_id") if isinstance(member, dict) else (member["telegram_id"] if "telegram_id" in member.keys() else None)
+            if telegram_id:
+                chat_ids.add(int(telegram_id))
+
+    for telegram_id in get_tournament_manager_chat_ids(tournament_id):
+        if telegram_id:
+            chat_ids.add(int(telegram_id))
+
+    creator = get_user_by_id(tournament_dict.get("created_by")) if tournament_dict.get("created_by") else None
+    if creator and creator.get("telegram_id"):
+        chat_ids.add(int(creator["telegram_id"]))
+
+    if not chat_ids:
+        return None, "У этого турнира нет получателей для рассылки."
+
+    lines = [
+        "📢 Сообщение по турниру",
+        "",
+        f"🏆 Турнир: {(tournament_dict.get('name') or 'Турнир').strip()}",
+        f"🎮 Вид спорта: {get_sport_display_name(tournament_dict.get('sport'))}",
+    ]
+    start_date = (tournament_dict.get("start_date") or "").strip()
+    end_date = (tournament_dict.get("end_date") or "").strip()
+    if start_date and end_date:
+        lines.append(f"📅 Даты: {start_date} - {end_date}")
+    elif start_date:
+        lines.append(f"📅 Дата: {start_date}")
+    if body_text:
+        lines.extend(["", body_text.strip()])
+
+    return {
+        "scope": "tournament",
+        "target_id": tournament_id,
+        "recipient_ids": sorted(chat_ids),
+        "recipient_count": len(chat_ids),
+        "text": "\n".join(lines),
+        "return_callback": f"admin_tournament_manage_{tournament_id}",
+        "title": (tournament_dict.get("name") or "Турнир").strip(),
+    }, None
 
 
 async def notify_bracket_match_scheduled(
@@ -400,4 +510,3 @@ async def notify_match_result(
     match = get_bracket_match_by_id(match_id)
     sport = match["tournament_sport"] if match else "CS2"
     await notify_bracket_match_result(bot, match_id, sport)
-

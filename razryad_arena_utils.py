@@ -1637,6 +1637,11 @@ def set_bracket_match_schedule(match_id: int, scheduled_at_utc: str, location: s
         old_location = (row["location"] or "").strip()
         is_new = not old_time or not old_location
         is_changed = old_time != clean_time or old_location != clean_location
+        scheduled_dt = parse_utc_storage_datetime(clean_time)
+        reminder_value = None
+        if scheduled_dt and scheduled_dt <= datetime.now(timezone.utc) + timedelta(hours=1):
+            # If less than an hour remains at the moment of scheduling, skip the 1-hour reminder.
+            reminder_value = datetime.now(timezone.utc).strftime(UTC_STORAGE_FORMAT)
 
         if is_changed:
             cur.execute("""
@@ -1645,9 +1650,9 @@ def set_bracket_match_schedule(match_id: int, scheduled_at_utc: str, location: s
                     scheduled_at_utc=?,
                     location=?,
                     schedule_updated_at=CURRENT_TIMESTAMP,
-                    reminder_sent_at=NULL
+                    reminder_sent_at=?
                 WHERE id=?
-            """, (clean_time, clean_location, match_id))
+            """, (clean_time, clean_location, reminder_value, match_id))
             conn.commit()
         else:
             conn.rollback()

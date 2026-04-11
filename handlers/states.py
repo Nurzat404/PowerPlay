@@ -13,3 +13,7 @@ class ManualMatchInput(StatesGroup):
 class BracketScheduleInput(StatesGroup):
     datetime_input = State()
     location_input = State()
+
+
+class TargetedBroadcast(StatesGroup):
+    text = State()

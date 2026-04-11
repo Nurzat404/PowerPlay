@@ -19,7 +19,7 @@ from razryad_arena_utils import (
     get_sport_display_name, upsert_football_player_stat, upsert_basketball_player_stat,
     upsert_volleyball_player_stat, replace_volleyball_set_scores, map_sports_to_display,
     normalize_sport_name, allow_reapply_excluded_application, ensure_tournament_invite_token,
-    get_active_user_telegram_ids, add_tournament_manager, can_manage_tournament,
+    get_active_user_telegram_ids, add_tournament_manager, can_manage_bracket_match, can_manage_tournament,
     get_tournament_manager_users, get_tournament_map_pool, is_tournament_creator_or_global_admin,
     remove_tournament_manager, replace_tournament_map_pool, expand_stage_formats_to_round_rules,
     get_tournament_main_round_count, get_tournament_match_format_rules, get_tournament_stage_formats,
@@ -40,6 +40,11 @@ from utils.cs2_maps import (
     parse_map_pool_text,
 )
 from utils.site_sync import request_site_sync
+from utils.notifications import (
+    prepare_match_broadcast_payload,
+    prepare_tournament_broadcast_payload,
+    send_custom_broadcast,
+)
 from utils.veto_service import (
     LAUNCH_ADMIN,
     LAUNCH_AUTO,
@@ -51,6 +56,7 @@ from utils.veto_service import (
     list_tournament_veto_sessions,
     validate_veto_pool,
 )
+from handlers.states import TargetedBroadcast
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +260,35 @@ def _build_veto_overview(tournament_id: int) -> str:
         f"завершены: {counters[STATUS_COMPLETED]}, "
         f"отменены: {counters[STATUS_CANCELLED]}"
     )
+
+
+def _targeted_broadcast_keyboard(confirm_callback: str, cancel_callback: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Отправить", callback_data=confirm_callback)],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=cancel_callback)],
+    ])
+
+
+def _targeted_broadcast_return_keyboard(return_callback: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад", callback_data=return_callback)],
+    ])
+
+
+def _can_manage_targeted_broadcast(telegram_id: int, scope: str, target_id: int) -> bool:
+    if scope == "match":
+        return can_manage_bracket_match(telegram_id, target_id)
+    if scope == "tournament":
+        return can_manage_tournament(telegram_id, target_id)
+    return False
+
+
+def _resolve_targeted_broadcast_payload(scope: str, target_id: int, body_text: str = ""):
+    if scope == "match":
+        return prepare_match_broadcast_payload(target_id, body_text)
+    if scope == "tournament":
+        return prepare_tournament_broadcast_payload(target_id, body_text)
+    return None, "Неизвестный тип рассылки."
 
 async def send_tournament_info(bot: Bot, chat_id: int, tournament_id: int, user_id: int):
     """Отправляет актуальную карточку турнира."""
@@ -1821,6 +1856,8 @@ Map veto: {'включен' if int(tournament['map_veto_enabled'] or 0) == 1 els
     # Команды и заявки открываются через отдельный хаб со статусами.
     builder.button(text="👥 Команды и заявки",
                    callback_data=f"admin_tournament_teams_{tournament_id}")
+    builder.button(text="📢 Сообщение участникам турнира",
+                   callback_data=f"admin_tournament_broadcast_{tournament_id}")
     if _is_cs2_sport(tournament["sport"]):
         builder.button(text="🗺 Панель veto", callback_data=f"admin_tournament_veto_{tournament_id}")
 
@@ -1938,6 +1975,117 @@ async def admin_tournament_managers(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await show_tournament_managers_panel(callback.message, tournament_id, callback.from_user.id)
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_tournament_broadcast_"))
+async def admin_tournament_broadcast_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    tournament_id = int(callback.data.split("_")[3])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+
+    payload, error = _resolve_targeted_broadcast_payload("tournament", tournament_id)
+    if not payload:
+        await callback.answer(error or "Не удалось подготовить рассылку.", show_alert=True)
+        return
+
+    await state.clear()
+    await state.set_state(TargetedBroadcast.text)
+    await state.update_data(
+        broadcast_scope="tournament",
+        broadcast_target_id=tournament_id,
+        broadcast_return_callback=payload["return_callback"],
+    )
+    await callback.message.edit_text(
+        "📢 Сообщение участникам турнира\n\n"
+        f"Турнир: {payload['title']}\n"
+        f"Получателей: {payload['recipient_count']}\n\n"
+        "Введите текст сообщения. Бот добавит шапку турнира автоматически.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="targeted_broadcast_cancel")]
+        ]),
+    )
+
+
+@router.message(TargetedBroadcast.text)
+async def targeted_broadcast_preview(message: Message, state: FSMContext):
+    data = await state.get_data()
+    scope = data.get("broadcast_scope")
+    target_id = data.get("broadcast_target_id")
+    if not scope or not target_id:
+        await state.clear()
+        await message.answer("Контекст рассылки потерян.")
+        return
+    if not _can_manage_targeted_broadcast(message.from_user.id, scope, int(target_id)):
+        await state.clear()
+        await message.answer("Нет прав.")
+        return
+
+    body_text = (message.text or "").strip()
+    if not body_text:
+        await message.answer("Текст рассылки не должен быть пустым.")
+        return
+
+    payload, error = _resolve_targeted_broadcast_payload(scope, int(target_id), body_text)
+    if not payload:
+        await state.clear()
+        await message.answer(error or "Не удалось подготовить предпросмотр.", reply_markup=_targeted_broadcast_return_keyboard(data.get("broadcast_return_callback", "admin_menu")))
+        return
+
+    await state.update_data(broadcast_text=body_text)
+    await message.answer(
+        "Предпросмотр рассылки:\n\n"
+        f"{payload['text']}\n\n"
+        f"Получателей: {payload['recipient_count']}\n\n"
+        "Отправить это сообщение?",
+        reply_markup=_targeted_broadcast_keyboard("targeted_broadcast_confirm", "targeted_broadcast_cancel"),
+    )
+
+
+@router.callback_query(F.data == "targeted_broadcast_confirm")
+async def targeted_broadcast_confirm(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    data = await state.get_data()
+    scope = data.get("broadcast_scope")
+    target_id = data.get("broadcast_target_id")
+    return_callback = data.get("broadcast_return_callback", "admin_menu")
+    body_text = (data.get("broadcast_text") or "").strip()
+    if not scope or not target_id or not body_text:
+        await state.clear()
+        await callback.message.edit_text("Нет данных для рассылки.", reply_markup=_targeted_broadcast_return_keyboard(return_callback))
+        return
+    if not _can_manage_targeted_broadcast(callback.from_user.id, scope, int(target_id)):
+        await state.clear()
+        await callback.message.edit_text("Нет прав.", reply_markup=_targeted_broadcast_return_keyboard(return_callback))
+        return
+
+    payload, error = _resolve_targeted_broadcast_payload(scope, int(target_id), body_text)
+    if not payload:
+        await state.clear()
+        await callback.message.edit_text(error or "Не удалось подготовить рассылку.", reply_markup=_targeted_broadcast_return_keyboard(return_callback))
+        return
+
+    ok_count, fail_count = await send_custom_broadcast(callback.bot, payload["recipient_ids"], payload["text"])
+    await state.clear()
+    await callback.message.edit_text(
+        "📢 Рассылка завершена.\n\n"
+        f"Успешно: {ok_count}\n"
+        f"Ошибок: {fail_count}",
+        reply_markup=_targeted_broadcast_return_keyboard(payload["return_callback"]),
+    )
+
+
+@router.callback_query(F.data == "targeted_broadcast_cancel")
+async def targeted_broadcast_cancel(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    data = await state.get_data()
+    return_callback = data.get("broadcast_return_callback", "admin_menu")
+    await state.clear()
+    await callback.message.edit_text(
+        "Отправка сообщения отменена.",
+        reply_markup=_targeted_broadcast_return_keyboard(return_callback),
+    )
 
 
 @router.callback_query(F.data.startswith("admin_tournament_invite_menu_"))
