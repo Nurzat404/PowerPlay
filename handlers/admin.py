@@ -1805,26 +1805,32 @@ async def admin_tournament_manage(callback: CallbackQuery, tournament_id: int | 
         age_text = "Не указан"
     stage_formats = get_tournament_stage_formats(tournament_id)
 
-    text = f"""
-⚙️ Управление турниром
-
-🏆 {tournament['name']}
-Вид спорта: {get_sport_display_name(tournament['sport'])}
-Требуемый размер команды: {tournament['required_team_size']} чел.
-Город: {tournament['city']}
-Возраст: {age_text}
-Даты: {tournament['start_date']} - {tournament['end_date']}
-{teams_text}
-Новые заявки: {pending_count}
-Исключенные: {excluded_count}
-Отклоненные: {rejected_count}
-Сетка: {'✅ Сгенерирована' if tournament['bracket_generated'] else '❌ Не сгенерирована'}
-Статус: {status_display}
-Форматы серий:
-{_format_stage_formats_text(stage_formats)}
-Map veto: {'включен' if int(tournament['map_veto_enabled'] or 0) == 1 else 'выключен'}
-Режим запуска veto: {tournament['veto_launch_mode'] or LAUNCH_ADMIN}
-"""
+    lines = [
+        "⚙️ Управление турниром",
+        "",
+        f"🏆 {tournament['name']}",
+        f"Вид спорта: {get_sport_display_name(tournament['sport'])}",
+        f"Требуемый размер команды: {tournament['required_team_size']} чел.",
+        f"Город: {tournament['city']}",
+        f"Возраст: {age_text}",
+        f"Даты: {tournament['start_date']} - {tournament['end_date']}",
+        teams_text,
+        f"Новые заявки: {pending_count}",
+        f"Исключенные: {excluded_count}",
+        f"Отклоненные: {rejected_count}",
+        f"Сетка: {'✅ Сгенерирована' if tournament['bracket_generated'] else '❌ Не сгенерирована'}",
+        f"Статус: {status_display}",
+    ]
+    if _is_cs2_sport(tournament["sport"]):
+        lines.extend(
+            [
+                "Форматы серий:",
+                _format_stage_formats_text(stage_formats),
+                f"Map veto: {'включен' if int(tournament['map_veto_enabled'] or 0) == 1 else 'выключен'}",
+                f"Режим запуска veto: {tournament['veto_launch_mode'] or LAUNCH_ADMIN}",
+            ]
+        )
+    text = "\n".join(lines)
     if tournament['description'] and tournament['description'] != 'нет':
         text += f"\n📝 Описание: {tournament['description']}"
     if _is_cs2_sport(tournament["sport"]) and int(tournament["map_veto_enabled"] or 0) == 1:
@@ -1901,6 +1907,9 @@ async def admin_tournament_veto_panel(callback: CallbackQuery, tournament_id: in
     if not tournament:
         await callback.answer("Турнир не найден", show_alert=True)
         return
+    if not _is_cs2_sport(tournament["sport"]):
+        await callback.answer("Панель veto доступна только для CS2-турниров.", show_alert=True)
+        return
 
     sessions = list_tournament_veto_sessions(tournament_id)
     stage_formats = get_tournament_stage_formats(tournament_id)
@@ -1956,6 +1965,10 @@ async def admin_veto_field(callback: CallbackQuery, state: FSMContext):
     tournament_id = int(tournament_id_str)
     if not can_manage_tournament(callback.from_user.id, tournament_id):
         await callback.answer("Нет прав", show_alert=True)
+        return
+    tournament = get_tournament_by_id(tournament_id)
+    if not tournament or not _is_cs2_sport(tournament["sport"]):
+        await callback.answer("Настройки veto доступны только для CS2-турниров.", show_alert=True)
         return
     await _open_tournament_field_editor(
         callback,
