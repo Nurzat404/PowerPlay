@@ -104,6 +104,430 @@ def get_team_members(team_id):
     return members
 
 
+def _tournament_team_roster_exists(tournament_id: int, team_id: int) -> bool:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT 1
+        FROM tournament_team_rosters
+        WHERE tournament_id=? AND team_id=?
+        LIMIT 1
+    """, (tournament_id, team_id))
+    row = cur.fetchone()
+    conn.close()
+    return bool(row)
+
+
+def _get_tournament_roster_active_member_ids(conn: sqlite3.Connection, tournament_id: int, team_id: int) -> list[int]:
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT user_id
+        FROM tournament_team_rosters
+        WHERE tournament_id=? AND team_id=? AND status='active'
+        ORDER BY created_at, user_id
+    """, (tournament_id, team_id))
+    return [int(row["user_id"]) for row in cur.fetchall()]
+
+
+def ensure_tournament_team_roster(tournament_id: int, team_id: int) -> bool:
+    app = get_team_application(tournament_id, team_id)
+    if not app or app["status"] != "approved":
+        return False
+
+    team = get_team_by_id(team_id)
+    if not team:
+        return False
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute("""
+            SELECT 1
+            FROM tournament_team_rosters
+            WHERE tournament_id=? AND team_id=?
+            LIMIT 1
+        """, (tournament_id, team_id))
+        has_rows = bool(cur.fetchone())
+
+        if not has_rows:
+            members = list(get_team_members(team_id))
+            for member in members:
+                cur.execute("""
+                    INSERT OR IGNORE INTO tournament_team_rosters (
+                        tournament_id, team_id, user_id, status, added_by, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, 'active', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """, (tournament_id, team_id, member["id"]))
+
+        active_ids = _get_tournament_roster_active_member_ids(conn, tournament_id, team_id)
+        if active_ids:
+            preferred_captain_id = int(team["captain_id"]) if team["captain_id"] in active_ids else active_ids[0]
+            cur.execute("""
+                INSERT INTO tournament_team_captains (tournament_id, team_id, user_id, assigned_by, created_at, updated_at)
+                VALUES (?, ?, ?, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT(tournament_id, team_id) DO NOTHING
+            """, (tournament_id, team_id, preferred_captain_id))
+
+        conn.commit()
+        return True
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_tournament_team_members(tournament_id: int, team_id: int):
+    ensure_tournament_team_roster(tournament_id, team_id)
+    if not _tournament_team_roster_exists(tournament_id, team_id):
+        return get_team_members(team_id)
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT u.*
+        FROM tournament_team_rosters r
+        JOIN users u ON u.id = r.user_id
+        WHERE r.tournament_id=? AND r.team_id=? AND r.status='active'
+        ORDER BY COALESCE(u.first_name, ''), COALESCE(u.username, ''), u.id
+    """, (tournament_id, team_id))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_effective_tournament_captain_id(tournament_id: int, team_id: int) -> int | None:
+    ensure_tournament_team_roster(tournament_id, team_id)
+    team = get_team_by_id(team_id)
+    if not team:
+        return None
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT user_id
+        FROM tournament_team_rosters
+        WHERE tournament_id=? AND team_id=? AND status='active'
+        ORDER BY created_at, user_id
+    """, (tournament_id, team_id))
+    active_ids = [int(row["user_id"]) for row in cur.fetchall()]
+
+    cur.execute("""
+        SELECT user_id
+        FROM tournament_team_captains
+        WHERE tournament_id=? AND team_id=?
+    """, (tournament_id, team_id))
+    captain_row = cur.fetchone()
+    conn.close()
+
+    if captain_row and int(captain_row["user_id"]) in active_ids:
+        return int(captain_row["user_id"])
+    if int(team["captain_id"]) in active_ids:
+        return int(team["captain_id"])
+    if active_ids:
+        return active_ids[0]
+    return int(team["captain_id"]) if team["captain_id"] else None
+
+
+def is_tournament_captain(telegram_id: int, tournament_id: int, team_id: int) -> bool:
+    user = get_user(telegram_id)
+    if not user:
+        return False
+    return get_effective_tournament_captain_id(tournament_id, team_id) == user["id"]
+
+
+def can_manage_tournament_team_roster(telegram_id: int, tournament_id: int, team_id: int) -> bool:
+    return can_manage_tournament(telegram_id, tournament_id) or is_tournament_captain(telegram_id, tournament_id, team_id)
+
+
+def get_user_tournament_captain_teams(tournament_id: int, telegram_id: int):
+    user = get_user(telegram_id)
+    if not user:
+        return []
+    teams = []
+    for team in get_tournament_teams(tournament_id, status="approved"):
+        team_id = team["id"] if isinstance(team, dict) else team["id"]
+        if is_tournament_captain(telegram_id, tournament_id, team_id):
+            teams.append(team)
+    return teams
+
+
+def _get_tournament_required_team_size(tournament_id: int) -> int:
+    tournament = get_tournament_by_id(tournament_id)
+    return int(tournament["required_team_size"] or 0) if tournament else 0
+
+
+def _find_user_active_tournament_team(tournament_id: int, user_id: int, exclude_team_id: int | None = None) -> int | None:
+    for team in get_tournament_teams(tournament_id, status="approved"):
+        team_id = team["id"] if isinstance(team, dict) else team["id"]
+        if exclude_team_id and team_id == exclude_team_id:
+            continue
+        members = get_tournament_team_members(tournament_id, team_id)
+        member_ids = {int(member["id"]) for member in members}
+        if user_id in member_ids:
+            return team_id
+    return None
+
+
+def _validate_tournament_replacement(tournament_id: int, team_id: int, old_user_id: int, new_user_id: int):
+    ensure_tournament_team_roster(tournament_id, team_id)
+    user = get_user_by_id(new_user_id)
+    if not user:
+        return False, "Новый игрок не найден."
+    if old_user_id == new_user_id:
+        return False, "Нужно выбрать другого игрока для замены."
+    if _find_user_active_tournament_team(tournament_id, new_user_id, exclude_team_id=team_id):
+        return False, "Этот пользователь уже состоит в другой команде этого турнира."
+
+    members = get_tournament_team_members(tournament_id, team_id)
+    member_ids = {int(member["id"]) for member in members}
+    if old_user_id not in member_ids:
+        return False, "Игрок для замены не найден в активном составе."
+    if new_user_id in member_ids:
+        return False, "Этот пользователь уже находится в составе команды на турнире."
+    return True, None
+
+
+def assign_tournament_team_captain(tournament_id: int, team_id: int, new_captain_user_id: int, actor_user_id: int | None = None):
+    ensure_tournament_team_roster(tournament_id, team_id)
+    members = get_tournament_team_members(tournament_id, team_id)
+    member_ids = {int(member["id"]) for member in members}
+    if new_captain_user_id not in member_ids:
+        return False, "Новый турнирный капитан должен входить в активный состав команды."
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO tournament_team_captains (tournament_id, team_id, user_id, assigned_by, created_at, updated_at)
+        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(tournament_id, team_id) DO UPDATE SET
+            user_id=excluded.user_id,
+            assigned_by=excluded.assigned_by,
+            updated_at=CURRENT_TIMESTAMP
+    """, (tournament_id, team_id, new_captain_user_id, actor_user_id))
+    conn.commit()
+    conn.close()
+    return True, None
+
+
+def create_tournament_roster_change_request(
+    tournament_id: int,
+    team_id: int,
+    old_user_id: int,
+    new_user_id: int,
+    actor_user_id: int | None = None,
+):
+    ok, error = _validate_tournament_replacement(tournament_id, team_id, old_user_id, new_user_id)
+    if not ok:
+        return None, error
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO tournament_roster_change_requests (
+            tournament_id, team_id, old_user_id, new_user_id, requested_by_user_id, status, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP)
+    """, (tournament_id, team_id, old_user_id, new_user_id, actor_user_id))
+    request_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return request_id, None
+
+
+def get_tournament_roster_change_request(request_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT r.*,
+               t.name AS tournament_name,
+               tm.name AS team_name,
+               old_u.first_name AS old_first_name,
+               old_u.username AS old_username,
+               new_u.first_name AS new_first_name,
+               new_u.username AS new_username
+        FROM tournament_roster_change_requests r
+        JOIN tournaments t ON t.id = r.tournament_id
+        JOIN teams tm ON tm.id = r.team_id
+        LEFT JOIN users old_u ON old_u.id = r.old_user_id
+        LEFT JOIN users new_u ON new_u.id = r.new_user_id
+        WHERE r.id=?
+    """, (request_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def update_tournament_roster_change_request_status(request_id: int, status: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE tournament_roster_change_requests
+        SET status=?, responded_at=CURRENT_TIMESTAMP
+        WHERE id=? AND status='pending'
+    """, (status, request_id))
+    updated = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return updated
+
+
+def accept_tournament_roster_change_request(request_id: int, responder_user_id: int):
+    request_row = get_tournament_roster_change_request(request_id)
+    if not request_row:
+        return False, "Запрос не найден.", None
+    if request_row["status"] != "pending":
+        return False, "Запрос уже обработан.", request_row
+    if int(request_row["new_user_id"]) != responder_user_id:
+        return False, "Подтвердить замену может только приглашенный игрок.", request_row
+
+    ok, error = replace_tournament_team_player(
+        int(request_row["tournament_id"]),
+        int(request_row["team_id"]),
+        int(request_row["old_user_id"]),
+        int(request_row["new_user_id"]),
+        int(request_row["requested_by_user_id"]) if request_row["requested_by_user_id"] else None,
+    )
+    if not ok:
+        update_tournament_roster_change_request_status(request_id, "cancelled")
+        return False, error or "Не удалось выполнить замену.", get_tournament_roster_change_request(request_id)
+
+    update_tournament_roster_change_request_status(request_id, "accepted")
+    return True, None, get_tournament_roster_change_request(request_id)
+
+
+def decline_tournament_roster_change_request(request_id: int, responder_user_id: int):
+    request_row = get_tournament_roster_change_request(request_id)
+    if not request_row:
+        return False, "Запрос не найден.", None
+    if request_row["status"] != "pending":
+        return False, "Запрос уже обработан.", request_row
+    if int(request_row["new_user_id"]) != responder_user_id:
+        return False, "Отклонить замену может только приглашенный игрок.", request_row
+    update_tournament_roster_change_request_status(request_id, "declined")
+    return True, None, get_tournament_roster_change_request(request_id)
+
+
+def add_tournament_team_member(tournament_id: int, team_id: int, user_id: int, actor_user_id: int | None = None):
+    ensure_tournament_team_roster(tournament_id, team_id)
+    user = get_user_by_id(user_id)
+    if not user:
+        return False, "Пользователь не найден."
+    if _find_user_active_tournament_team(tournament_id, user_id, exclude_team_id=team_id):
+        return False, "Этот пользователь уже состоит в другой команде этого турнира."
+
+    members = get_tournament_team_members(tournament_id, team_id)
+    member_ids = {int(member["id"]) for member in members}
+    if user_id in member_ids:
+        return False, "Этот пользователь уже находится в составе команды на турнире."
+
+    required_size = _get_tournament_required_team_size(tournament_id)
+    if required_size > 0 and len(member_ids) >= required_size:
+        return False, "Состав уже заполнен до лимита турнира. Используйте замену игрока."
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO tournament_team_rosters (
+            tournament_id, team_id, user_id, status, added_by, removed_by, created_at, updated_at, removed_at
+        )
+        VALUES (?, ?, ?, 'active', ?, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL)
+        ON CONFLICT(tournament_id, team_id, user_id) DO UPDATE SET
+            status='active',
+            added_by=excluded.added_by,
+            removed_by=NULL,
+            removed_at=NULL,
+            updated_at=CURRENT_TIMESTAMP
+    """, (tournament_id, team_id, user_id, actor_user_id))
+    conn.commit()
+    conn.close()
+    return True, None
+
+
+def remove_tournament_team_member(tournament_id: int, team_id: int, user_id: int, actor_user_id: int | None = None, replacement_captain_user_id: int | None = None):
+    ensure_tournament_team_roster(tournament_id, team_id)
+    members = get_tournament_team_members(tournament_id, team_id)
+    member_ids = [int(member["id"]) for member in members]
+    if user_id not in member_ids:
+        return False, "Игрок не найден в активном составе турнира."
+    if len(member_ids) <= 1:
+        return False, "Нельзя убрать последнего активного участника команды."
+
+    current_captain_id = get_effective_tournament_captain_id(tournament_id, team_id)
+    if current_captain_id == user_id:
+        if not replacement_captain_user_id or replacement_captain_user_id == user_id:
+            return False, "Сначала назначьте нового турнирного капитана."
+        if replacement_captain_user_id not in member_ids:
+            return False, "Новый турнирный капитан должен быть в активном составе команды."
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE tournament_team_rosters
+        SET status='inactive',
+            removed_by=?,
+            removed_at=CURRENT_TIMESTAMP,
+            updated_at=CURRENT_TIMESTAMP
+        WHERE tournament_id=? AND team_id=? AND user_id=? AND status='active'
+    """, (actor_user_id, tournament_id, team_id, user_id))
+    if current_captain_id == user_id and replacement_captain_user_id:
+        cur.execute("""
+            INSERT INTO tournament_team_captains (tournament_id, team_id, user_id, assigned_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(tournament_id, team_id) DO UPDATE SET
+                user_id=excluded.user_id,
+                assigned_by=excluded.assigned_by,
+                updated_at=CURRENT_TIMESTAMP
+        """, (tournament_id, team_id, replacement_captain_user_id, actor_user_id))
+    conn.commit()
+    conn.close()
+    return True, None
+
+
+def replace_tournament_team_player(tournament_id: int, team_id: int, old_user_id: int, new_user_id: int, actor_user_id: int | None = None):
+    ok, error = _validate_tournament_replacement(tournament_id, team_id, old_user_id, new_user_id)
+    if not ok:
+        return False, error
+
+    current_captain_id = get_effective_tournament_captain_id(tournament_id, team_id)
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE tournament_team_rosters
+        SET status='inactive',
+            removed_by=?,
+            removed_at=CURRENT_TIMESTAMP,
+            updated_at=CURRENT_TIMESTAMP
+        WHERE tournament_id=? AND team_id=? AND user_id=? AND status='active'
+    """, (actor_user_id, tournament_id, team_id, old_user_id))
+    cur.execute("""
+        INSERT INTO tournament_team_rosters (
+            tournament_id, team_id, user_id, status, added_by, removed_by, created_at, updated_at, removed_at
+        )
+        VALUES (?, ?, ?, 'active', ?, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, NULL)
+        ON CONFLICT(tournament_id, team_id, user_id) DO UPDATE SET
+            status='active',
+            added_by=excluded.added_by,
+            removed_by=NULL,
+            removed_at=NULL,
+            updated_at=CURRENT_TIMESTAMP
+    """, (tournament_id, team_id, new_user_id, actor_user_id))
+    if current_captain_id == old_user_id:
+        cur.execute("""
+            INSERT INTO tournament_team_captains (tournament_id, team_id, user_id, assigned_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT(tournament_id, team_id) DO UPDATE SET
+                user_id=excluded.user_id,
+                assigned_by=excluded.assigned_by,
+                updated_at=CURRENT_TIMESTAMP
+        """, (tournament_id, team_id, new_user_id, actor_user_id))
+    conn.commit()
+    conn.close()
+    return True, None
+
+
 def get_tournaments_by_sport(sport):
     """Возвращает турниры по виду спорта со всеми статусами."""
     conn = get_connection()
@@ -1563,6 +1987,134 @@ def get_bracket_match_by_id(match_id: int):
     return row
 
 
+def _snapshot_bracket_technical_participants(cur: sqlite3.Cursor, tournament_id: int, team1_id: int | None, team2_id: int | None, match_id: int):
+    cur.execute("DELETE FROM bracket_match_technical_participants WHERE match_id=?", (match_id,))
+    for team_id in (team1_id, team2_id):
+        if not team_id:
+            continue
+        member_ids: list[int] = []
+        if tournament_id:
+            cur.execute("""
+                SELECT user_id
+                FROM tournament_team_rosters
+                WHERE tournament_id=? AND team_id=? AND status='active'
+                ORDER BY created_at, user_id
+            """, (tournament_id, team_id))
+            member_ids = [int(row["user_id"]) for row in cur.fetchall()]
+
+        if not member_ids:
+            cur.execute("""
+                SELECT user_id
+                FROM team_members
+                WHERE team_id=?
+                ORDER BY joined_at, user_id
+            """, (team_id,))
+            member_ids = [int(row["user_id"]) for row in cur.fetchall()]
+
+        for user_id in member_ids:
+            cur.execute("""
+                INSERT OR IGNORE INTO bracket_match_technical_participants (match_id, user_id, team_id)
+                VALUES (?, ?, ?)
+            """, (match_id, user_id, team_id))
+
+
+def clear_bracket_match_stats(match_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM player_match_stats WHERE match_source='bracket' AND match_id=?", (match_id,))
+    cur.execute("DELETE FROM match_map_results WHERE match_source='bracket' AND match_id=?", (match_id,))
+    cur.execute("DELETE FROM football_player_stats WHERE match_source='bracket' AND match_id=?", (match_id,))
+    cur.execute("DELETE FROM basketball_player_stats WHERE match_source='bracket' AND match_id=?", (match_id,))
+    cur.execute("DELETE FROM volleyball_player_stats WHERE match_source='bracket' AND match_id=?", (match_id,))
+    cur.execute("DELETE FROM volleyball_set_scores WHERE match_source='bracket' AND match_id=?", (match_id,))
+    conn.commit()
+    conn.close()
+
+
+def apply_bracket_technical_result(
+    match_id: int,
+    loser_team_id: int,
+    actor_user_id: int | None = None,
+    reason: str | None = None,
+):
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("BEGIN IMMEDIATE")
+        cur.execute("SELECT * FROM tournament_brackets WHERE id=?", (match_id,))
+        match = cur.fetchone()
+        if not match:
+            conn.rollback()
+            return {"ok": False, "reason": "not_found"}
+        if match["status"] == "completed":
+            conn.rollback()
+            return {"ok": False, "reason": "already_completed"}
+        if loser_team_id not in {match["team1_id"], match["team2_id"]}:
+            conn.rollback()
+            return {"ok": False, "reason": "invalid_loser"}
+
+        winner_id = match["team2_id"] if loser_team_id == match["team1_id"] else match["team1_id"]
+        if not winner_id:
+            conn.rollback()
+            return {"ok": False, "reason": "winner_not_found"}
+
+        clean_reason = (reason or "").strip() or None
+        score1 = 0 if loser_team_id == match["team1_id"] else 1
+        score2 = 0 if loser_team_id == match["team2_id"] else 1
+
+        from utils.bracket_utils import _auto_advance_ready_matches, _propagate_winner
+
+        cur.execute("DELETE FROM player_match_stats WHERE match_source='bracket' AND match_id=?", (match_id,))
+        cur.execute("DELETE FROM match_map_results WHERE match_source='bracket' AND match_id=?", (match_id,))
+        cur.execute("DELETE FROM football_player_stats WHERE match_source='bracket' AND match_id=?", (match_id,))
+        cur.execute("DELETE FROM basketball_player_stats WHERE match_source='bracket' AND match_id=?", (match_id,))
+        cur.execute("DELETE FROM volleyball_player_stats WHERE match_source='bracket' AND match_id=?", (match_id,))
+        cur.execute("DELETE FROM volleyball_set_scores WHERE match_source='bracket' AND match_id=?", (match_id,))
+
+        _snapshot_bracket_technical_participants(cur, match["tournament_id"], match["team1_id"], match["team2_id"], match_id)
+
+        cur.execute("""
+            UPDATE tournament_brackets
+            SET winner_id=?,
+                status='completed',
+                score1=?,
+                score2=?,
+                result_type='technical',
+                technical_winner_id=?,
+                technical_loser_id=?,
+                technical_reason=?,
+                technical_assigned_by=?,
+                technical_assigned_at=CURRENT_TIMESTAMP
+            WHERE id=?
+        """, (
+            winner_id,
+            score1,
+            score2,
+            winner_id,
+            loser_team_id,
+            clean_reason,
+            actor_user_id,
+            match_id,
+        ))
+
+        _propagate_winner(conn, match, winner_id)
+        _auto_advance_ready_matches(conn, match["tournament_id"])
+        conn.commit()
+        return {
+            "ok": True,
+            "winner_id": winner_id,
+            "loser_id": loser_team_id,
+            "score1": score1,
+            "score2": score2,
+            "tournament_id": match["tournament_id"],
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def get_unscheduled_ready_bracket_matches(tournament_id: int):
     """
     Возвращает pending-матчи сетки, где уже есть обе команды,
@@ -1982,12 +2534,27 @@ def get_player_match_history_page(telegram_id: int, offset: int = 0, limit: int 
             FROM player_match_stats pms
             WHERE pms.user_id = ?
         ),
+        technical_rows AS (
+            SELECT
+                tp.match_id,
+                tp.created_at,
+                'bracket' AS resolved_source
+            FROM bracket_match_technical_participants tp
+            JOIN tournament_brackets b ON b.id = tp.match_id
+            WHERE tp.user_id = ?
+              AND COALESCE(b.result_type, 'regular') = 'technical'
+        ),
+        source_rows AS (
+            SELECT match_id, created_at, resolved_source FROM stats_rows
+            UNION ALL
+            SELECT match_id, created_at, resolved_source FROM technical_rows
+        ),
         user_matches AS (
             SELECT
                 resolved_source AS match_source,
                 match_id,
                 MAX(created_at) AS last_stat_at
-            FROM stats_rows
+            FROM source_rows
             GROUP BY resolved_source, match_id
         ),
         history_rows AS (
@@ -2001,6 +2568,10 @@ def get_player_match_history_page(telegram_id: int, offset: int = 0, limit: int 
                 t2.name AS team2_name,
                 b.score1,
                 b.score2,
+                COALESCE(b.result_type, 'regular') AS result_type,
+                b.technical_winner_id,
+                b.technical_loser_id,
+                b.technical_reason,
                 COALESCE(um.last_stat_at, b.created_at) AS played_at
             FROM user_matches um
             JOIN tournament_brackets b ON b.id = um.match_id
@@ -2021,6 +2592,10 @@ def get_player_match_history_page(telegram_id: int, offset: int = 0, limit: int 
                 t2.name AS team2_name,
                 m.score1,
                 m.score2,
+                'regular' AS result_type,
+                NULL AS technical_winner_id,
+                NULL AS technical_loser_id,
+                NULL AS technical_reason,
                 COALESCE(um.last_stat_at, m.match_date, m.created_at) AS played_at
             FROM user_matches um
             JOIN matches m ON m.id = um.match_id
@@ -2033,7 +2608,7 @@ def get_player_match_history_page(telegram_id: int, offset: int = 0, limit: int 
         FROM history_rows
         ORDER BY played_at DESC, match_id DESC
         LIMIT ? OFFSET ?
-    """, (internal_user_id, limit, offset))
+    """, (internal_user_id, internal_user_id, limit, offset))
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -2050,16 +2625,30 @@ def get_player_match_history_count(telegram_id: int):
         return 0
 
     cur.execute(f"""
-        SELECT COUNT(*)
-        FROM (
+        WITH source_rows AS (
             SELECT
                 {_resolve_match_source_case("pms")} AS resolved_source,
                 pms.match_id
             FROM player_match_stats pms
             WHERE pms.user_id = ?
-            GROUP BY resolved_source, pms.match_id
+
+            UNION ALL
+
+            SELECT
+                'bracket' AS resolved_source,
+                tp.match_id
+            FROM bracket_match_technical_participants tp
+            JOIN tournament_brackets b ON b.id = tp.match_id
+            WHERE tp.user_id = ?
+              AND COALESCE(b.result_type, 'regular') = 'technical'
         )
-    """, (internal_user_id,))
+        SELECT COUNT(*)
+        FROM (
+            SELECT resolved_source, match_id
+            FROM source_rows
+            GROUP BY resolved_source, match_id
+        )
+    """, (internal_user_id, internal_user_id))
     count = cur.fetchone()[0]
     conn.close()
     return count
@@ -2088,6 +2677,10 @@ def get_match_history_details(match_source: str, match_id: int):
                 t2.name AS team2_name,
                 b.score1,
                 b.score2,
+                COALESCE(b.result_type, 'regular') AS result_type,
+                b.technical_winner_id,
+                b.technical_loser_id,
+                b.technical_reason,
                 tour.name AS tournament_name,
                 b.created_at AS played_at
             FROM tournament_brackets b
@@ -2107,6 +2700,10 @@ def get_match_history_details(match_source: str, match_id: int):
                 t2.name AS team2_name,
                 m.score1,
                 m.score2,
+                'regular' AS result_type,
+                NULL AS technical_winner_id,
+                NULL AS technical_loser_id,
+                NULL AS technical_reason,
                 tour.name AS tournament_name,
                 COALESCE(m.match_date, m.created_at) AS played_at
             FROM matches m
@@ -2120,6 +2717,13 @@ def get_match_history_details(match_source: str, match_id: int):
     if not header:
         conn.close()
         return None
+
+    if (header["result_type"] or "regular") == "technical":
+        conn.close()
+        payload = dict(header)
+        payload["is_technical_result"] = True
+        payload["maps"] = []
+        return payload
 
     cur.execute("""
         SELECT
@@ -2422,14 +3026,28 @@ def get_player_match_history_count_by_sport(telegram_id: int, sport: str) -> int
 
     cur = conn.cursor()
     cur.execute(f"""
-        SELECT COUNT(*)
-        FROM (
+        WITH source_rows AS (
             SELECT COALESCE(NULLIF(TRIM(match_source), ''), 'legacy') AS source, match_id
             FROM {table}
             WHERE user_id=?
+
+            UNION ALL
+
+            SELECT 'bracket' AS source, tp.match_id
+            FROM bracket_match_technical_participants tp
+            JOIN tournament_brackets b ON b.id = tp.match_id
+            JOIN tournaments tr ON tr.id = b.tournament_id
+            WHERE tp.user_id=?
+              AND COALESCE(b.result_type, 'regular')='technical'
+              AND tr.sport=?
+        )
+        SELECT COUNT(*)
+        FROM (
+            SELECT source, match_id
+            FROM source_rows
             GROUP BY source, match_id
         )
-    """, (internal_user_id,))
+    """, (internal_user_id, internal_user_id, sport))
     count = cur.fetchone()[0]
     conn.close()
     return count
@@ -2460,6 +3078,20 @@ def get_player_match_history_page_by_sport(telegram_id: int, sport: str, offset:
             FROM {table} s
             WHERE s.user_id=?
             GROUP BY match_source, s.match_id
+
+            UNION ALL
+
+            SELECT
+                'bracket' AS match_source,
+                tp.match_id,
+                MAX(tp.created_at) AS last_stat_at
+            FROM bracket_match_technical_participants tp
+            JOIN tournament_brackets b ON b.id = tp.match_id
+            JOIN tournaments tr ON tr.id = b.tournament_id
+            WHERE tp.user_id=?
+              AND COALESCE(b.result_type, 'regular')='technical'
+              AND tr.sport=?
+            GROUP BY tp.match_id
         ),
         history_rows AS (
             SELECT
@@ -2472,6 +3104,10 @@ def get_player_match_history_page_by_sport(telegram_id: int, sport: str, offset:
                 t2.name AS team2_name,
                 b.score1,
                 b.score2,
+                COALESCE(b.result_type, 'regular') AS result_type,
+                b.technical_winner_id,
+                b.technical_loser_id,
+                b.technical_reason,
                 COALESCE(um.last_stat_at, b.created_at) AS played_at
             FROM user_matches um
             JOIN tournament_brackets b ON b.id = um.match_id
@@ -2492,6 +3128,10 @@ def get_player_match_history_page_by_sport(telegram_id: int, sport: str, offset:
                 t2.name AS team2_name,
                 m.score1,
                 m.score2,
+                'regular' AS result_type,
+                NULL AS technical_winner_id,
+                NULL AS technical_loser_id,
+                NULL AS technical_reason,
                 COALESCE(um.last_stat_at, m.match_date, m.created_at) AS played_at
             FROM user_matches um
             JOIN matches m ON m.id = um.match_id
@@ -2504,7 +3144,7 @@ def get_player_match_history_page_by_sport(telegram_id: int, sport: str, offset:
         FROM history_rows
         ORDER BY played_at DESC, match_id DESC
         LIMIT ? OFFSET ?
-    """, (internal_user_id, limit, offset))
+    """, (internal_user_id, internal_user_id, sport, limit, offset))
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -2533,6 +3173,10 @@ def get_match_history_details_by_sport(sport: str, match_source: str, match_id: 
                 t2.name AS team2_name,
                 b.score1,
                 b.score2,
+                COALESCE(b.result_type, 'regular') AS result_type,
+                b.technical_winner_id,
+                b.technical_loser_id,
+                b.technical_reason,
                 tour.name AS tournament_name,
                 b.created_at AS played_at
             FROM tournament_brackets b
@@ -2552,6 +3196,10 @@ def get_match_history_details_by_sport(sport: str, match_source: str, match_id: 
                 t2.name AS team2_name,
                 m.score1,
                 m.score2,
+                'regular' AS result_type,
+                NULL AS technical_winner_id,
+                NULL AS technical_loser_id,
+                NULL AS technical_reason,
                 tour.name AS tournament_name,
                 COALESCE(m.match_date, m.created_at) AS played_at
             FROM matches m
@@ -2564,6 +3212,16 @@ def get_match_history_details_by_sport(sport: str, match_source: str, match_id: 
     if not header:
         conn.close()
         return None
+
+    if (header["result_type"] or "regular") == "technical":
+        conn.close()
+        payload = dict(header)
+        payload["is_technical_result"] = True
+        payload["players_team1"] = []
+        payload["players_team2"] = []
+        payload["players_other"] = []
+        payload["set_scores"] = []
+        return payload
 
     if sport == "Football":
         cur.execute(f"""
@@ -3009,6 +3667,11 @@ def clear_bracket_related_data(tournament_id: int):
             DELETE FROM volleyball_set_scores
             WHERE COALESCE(NULLIF(TRIM(match_source), ''), 'bracket')='bracket'
               AND match_id IN ({bracket_match_ids_query})
+        """, (tournament_id,))
+
+        cur.execute(f"""
+            DELETE FROM bracket_match_technical_participants
+            WHERE match_id IN ({bracket_match_ids_query})
         """, (tournament_id,))
 
         conn.commit()

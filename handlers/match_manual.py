@@ -7,14 +7,17 @@ import os
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from database import get_connection
-from handlers.states import ManualMatchInput
+from handlers.states import ManualMatchInput, BracketTechnicalResultInput
 from razryad_arena_utils import (
+    apply_bracket_technical_result,
     can_manage_bracket_match,
+    get_user,
     get_steam_profile_name,
+    get_tournament_team_members,
     get_tournament_by_id,
     resolve_bracket_match_format,
     update_team_rating,
@@ -31,7 +34,7 @@ from utils.bracket_visualizer import generate_bracket_png
 from utils.cs2_maps import CS2_MAPS, get_cs2_map_name
 from utils.notifications import notify_bracket_match_result
 from utils.site_sync import request_site_sync
-from utils.veto_service import get_completed_series_maps_for_match
+from utils.veto_service import close_veto_for_technical_result, get_completed_series_maps_for_match, get_match_veto_details, refresh_veto_messages
 
 router = Router()
 
@@ -94,6 +97,29 @@ def _save_keyboard(tournament_id: int):
     return builder.as_markup()
 
 
+def _tech_loss_loser_keyboard(match_id: int, tournament_id: int, team1_id: int, team1_name: str, team2_id: int, team2_name: str):
+    builder = InlineKeyboardBuilder()
+    builder.button(text=f"❌ {team1_name}", callback_data=f"manual_tech_pick_loser_{match_id}_{tournament_id}_{team1_id}")
+    builder.button(text=f"❌ {team2_name}", callback_data=f"manual_tech_pick_loser_{match_id}_{tournament_id}_{team2_id}")
+    builder.button(text="🔙 Назад", callback_data=f"bracket_match_{match_id}_{tournament_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def _tech_loss_reason_keyboard(match_id: int, tournament_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏭ Без причины", callback_data=f"manual_tech_reason_skip_{match_id}_{tournament_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"bracket_match_{match_id}_{tournament_id}")],
+    ])
+
+
+def _tech_loss_confirm_keyboard(match_id: int, tournament_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Подтвердить тех.поражение", callback_data="manual_tech_confirm")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data=f"bracket_match_{match_id}_{tournament_id}")],
+    ])
+
+
 def _fetch_bracket_match(match_id: int):
     conn = get_connection()
     cur = conn.cursor()
@@ -112,21 +138,30 @@ def _fetch_bracket_match(match_id: int):
     return match
 
 
-def _fetch_players(team1_id: int, team2_id: int) -> list[dict]:
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT u.id, u.first_name, u.username, u.steam_id, tm.team_id
-        FROM users u
-        JOIN team_members tm ON u.id = tm.user_id
-        WHERE tm.team_id IN (?, ?)
-        ORDER BY tm.team_id, u.first_name
-        """,
-        (team1_id, team2_id),
-    )
-    rows = [dict(r) for r in cur.fetchall()]
-    conn.close()
+def _fetch_players(team1_id: int, team2_id: int, tournament_id: int | None = None) -> list[dict]:
+    rows: list[dict] = []
+    for team_id in (team1_id, team2_id):
+        members = get_tournament_team_members(tournament_id, team_id) if tournament_id else []
+        if not members:
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT u.id, u.first_name, u.username, u.steam_id, tm.team_id
+                FROM users u
+                JOIN team_members tm ON u.id = tm.user_id
+                WHERE tm.team_id=?
+                ORDER BY u.first_name
+                """,
+                (team_id,),
+            )
+            members = [dict(r) for r in cur.fetchall()]
+            conn.close()
+        else:
+            members = [dict(member) for member in members]
+            for member in members:
+                member["team_id"] = team_id
+        rows.extend(members)
     return rows
 
 
@@ -303,6 +338,27 @@ async def _show_confirm(target: Message | CallbackQuery, state: FSMContext):
         await target.answer(text, reply_markup=_save_keyboard(tournament_id))
 
 
+async def _show_technical_result_confirm(target: Message | CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    loser_team_id = data.get("technical_loser_team_id")
+    loser_name = data.get("team1_name") if loser_team_id == data.get("team1_id") else data.get("team2_name")
+    winner_name = data.get("team2_name") if loser_team_id == data.get("team1_id") else data.get("team1_name")
+    reason = (data.get("technical_reason") or "").strip() or "не указана"
+    text = (
+        "🚫 Подтверждение тех.поражения\n\n"
+        f"Матч: {data.get('team1_name')} vs {data.get('team2_name')}\n"
+        f"Победитель: {winner_name}\n"
+        f"Тех.поражение: {loser_name}\n"
+        f"Итоговый счет: {data.get('technical_score1', 0)}:{data.get('technical_score2', 0)}\n"
+        f"Причина: {reason}"
+    )
+    await state.set_state(BracketTechnicalResultInput.confirm)
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, reply_markup=_tech_loss_confirm_keyboard(data["bracket_match_id"], data["tournament_id"]))
+    else:
+        await target.answer(text, reply_markup=_tech_loss_confirm_keyboard(data["bracket_match_id"], data["tournament_id"]))
+
+
 async def start_manual_input_by_match(callback: CallbackQuery, state: FSMContext, match_id: int, tournament_id: int | None = None):
     """Запускает ручной ввод результата для конкретного матча сетки."""
     match = _fetch_bracket_match(match_id)
@@ -443,6 +499,204 @@ async def start_manual_input(callback: CallbackQuery, state: FSMContext):
     await start_manual_input_by_match(callback, state, match_id, tournament_id)
 
 
+@router.callback_query(F.data.startswith("manual_match_technical_"))
+async def start_technical_result_input(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    match_id = int(parts[3])
+    tournament_id = int(parts[4]) if len(parts) > 4 else 0
+    if not can_manage_bracket_match(callback.from_user.id, match_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+
+    match = _fetch_bracket_match(match_id)
+    if not match:
+        await callback.answer("Матч не найден", show_alert=True)
+        return
+    match = dict(match)
+    if match["status"] == "completed":
+        await callback.answer("Этот матч уже завершен.", show_alert=True)
+        return
+    if not match["team1_id"] or not match["team2_id"]:
+        await callback.answer("В этом матче еще нет пары команд.", show_alert=True)
+        return
+
+    await state.clear()
+    await state.update_data(
+        bracket_match_id=match_id,
+        tournament_id=tournament_id or match["tournament_id"],
+        team1_id=match["team1_id"],
+        team2_id=match["team2_id"],
+        team1_name=match["team1_name"],
+        team2_name=match["team2_name"],
+        sport_mode=normalize_sport_name(match.get("tournament_sport", "CS2")),
+    )
+    await callback.message.edit_text(
+        "🚫 Тех.поражение\n\nВыберите команду, которой будет засчитано тех.поражение:",
+        reply_markup=_tech_loss_loser_keyboard(
+            match_id,
+            tournament_id or match["tournament_id"],
+            match["team1_id"],
+            match["team1_name"],
+            match["team2_id"],
+            match["team2_name"],
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("manual_tech_pick_loser_"))
+async def pick_technical_loser(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    match_id = int(parts[4])
+    tournament_id = int(parts[5])
+    loser_team_id = int(parts[6])
+    if not can_manage_bracket_match(callback.from_user.id, match_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    data = await state.get_data()
+    team1_id = data.get("team1_id")
+    score1 = 0 if loser_team_id == team1_id else 1
+    score2 = 0 if loser_team_id != team1_id else 1
+    await state.update_data(
+        bracket_match_id=match_id,
+        tournament_id=tournament_id,
+        technical_loser_team_id=loser_team_id,
+        technical_score1=score1,
+        technical_score2=score2,
+    )
+    await state.set_state(BracketTechnicalResultInput.reason_input)
+    await callback.message.edit_text(
+        "Введите причину тех.поражения.\n\n"
+        "Можно отправить короткий текст или нажать «Без причины».",
+        reply_markup=_tech_loss_reason_keyboard(match_id, tournament_id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("manual_tech_reason_skip_"))
+async def skip_technical_reason(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    match_id = int(parts[4])
+    if not can_manage_bracket_match(callback.from_user.id, match_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    await state.update_data(technical_reason="")
+    await _show_technical_result_confirm(callback, state)
+
+
+@router.message(BracketTechnicalResultInput.reason_input)
+async def technical_reason_input(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if _is_cancel(text):
+        data = await state.get_data()
+        await state.clear()
+        await message.answer(
+            "Отменено.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🔙 К матчу", callback_data=f"bracket_match_{data.get('bracket_match_id')}_{data.get('tournament_id')}")
+            ]]),
+        )
+        return
+    await state.update_data(technical_reason=text)
+    await _show_technical_result_confirm(message, state)
+
+
+@router.callback_query(F.data == "manual_tech_confirm")
+async def confirm_technical_result(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    match_id = int(data.get("bracket_match_id") or 0)
+    tournament_id = int(data.get("tournament_id") or 0)
+    loser_team_id = int(data.get("technical_loser_team_id") or 0)
+    if not can_manage_bracket_match(callback.from_user.id, match_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+
+    actor = get_user(callback.from_user.id)
+    match = _fetch_bracket_match(match_id)
+    if not match:
+        await callback.answer("Матч не найден", show_alert=True)
+        return
+    match = dict(match)
+
+    veto_details = get_match_veto_details(match_id)
+    ok, error = close_veto_for_technical_result(match_id, callback.from_user.id)
+    if not ok:
+        await callback.answer(error or "Не удалось остановить pick/ban.", show_alert=True)
+        return
+
+    result = apply_bracket_technical_result(
+        match_id,
+        loser_team_id,
+        actor["id"] if actor else None,
+        data.get("technical_reason"),
+    )
+    if not result.get("ok"):
+        reason = result.get("reason")
+        reason_map = {
+            "not_found": "Матч не найден.",
+            "already_completed": "Матч уже завершен.",
+            "invalid_loser": "Некорректная команда для тех.поражения.",
+            "winner_not_found": "Не удалось определить победителя.",
+        }
+        await callback.answer(reason_map.get(reason, "Не удалось оформить тех.поражение."), show_alert=True)
+        return
+
+    third_place_result = auto_create_third_place_if_ready(tournament_id)
+    tournament = get_tournament_by_id(tournament_id)
+    round_number = match["round_number"] if match else 0
+    winner_id = result["winner_id"]
+    winner_name = match["team2_name"] if loser_team_id == match["team1_id"] else match["team1_name"]
+    loser_name = match["team1_name"] if loser_team_id == match["team1_id"] else match["team2_name"]
+
+    if tournament:
+        month = datetime.now(timezone.utc).strftime("%Y-%m")
+        points = 3 if round_number == 5 else 5
+        update_team_rating(winner_id, tournament["sport"], month, points)
+
+    temp_dir = os.path.abspath("temp/brackets")
+    os.makedirs(temp_dir, exist_ok=True)
+    png_path = os.path.join(temp_dir, f"bracket_{tournament_id}.png")
+    png_result = generate_bracket_png(tournament_id, png_path)
+    request_site_sync(f"match_technical_result_saved:{tournament_id}:{match_id}")
+
+    summary = (
+        "🚫 Тех.поражение оформлено\n"
+        f"🏆 Победитель: {winner_name}\n"
+        f"❌ Тех.поражение: {loser_name}\n"
+        f"📊 Счет матча: {result['score1']}:{result['score2']}"
+    )
+    reason = (data.get("technical_reason") or "").strip()
+    if reason:
+        summary += f"\n📝 Причина: {reason}"
+    if third_place_result.get("created"):
+        summary += "\n🥉 Матч за 3-е место создан автоматически."
+
+    if png_result and os.path.exists(png_path):
+        from aiogram.types import FSInputFile
+        try:
+            await callback.message.answer_photo(photo=FSInputFile(png_path), caption=summary)
+        except Exception:
+            await callback.message.answer(summary)
+    else:
+        await callback.message.answer(summary)
+
+    if veto_details and veto_details.get("session"):
+        await refresh_veto_messages(callback.bot, match_id)
+
+    sport_mode = normalize_sport_name(tournament["sport"]) if tournament else "CS2"
+    await notify_bracket_match_result(callback.bot, match_id, sport_mode)
+    await callback.message.answer("Выберите действие:", reply_markup=_summary_keyboard(tournament_id))
+    await state.clear()
+    from handlers.brackets import start_schedule_wizard_for_tournament
+    await start_schedule_wizard_for_tournament(
+        callback,
+        state,
+        tournament_id=tournament_id,
+        return_callback=f"view_bracket_{tournament_id}",
+    )
+    await callback.answer()
+
+
 @router.callback_query(ManualMatchInput.format, F.data.startswith("manual_format_"))
 async def select_format(callback: CallbackQuery, state: FSMContext):
     format_choice = callback.data.split("_")[2]
@@ -525,7 +779,7 @@ async def input_score(message: Message, state: FSMContext):
         return
 
     if sport_mode != "CS2":
-        players = _fetch_players(data.get("team1_id"), data.get("team2_id"))
+        players = _fetch_players(data.get("team1_id"), data.get("team2_id"), data.get("tournament_id"))
         if not players:
             await message.answer("❌ Нет игроков в командах.")
             await state.clear()
@@ -554,7 +808,7 @@ async def input_score(message: Message, state: FSMContext):
         await _show_player_input(message, state, 0)
         return
 
-    players = _fetch_players(data.get("team1_id"), data.get("team2_id"))
+    players = _fetch_players(data.get("team1_id"), data.get("team2_id"), data.get("tournament_id"))
     if not players:
         await message.answer("❌ Нет игроков в командах.")
         await state.clear()

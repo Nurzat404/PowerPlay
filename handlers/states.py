@@ -17,3 +17,13 @@ class BracketScheduleInput(StatesGroup):
 
 class TargetedBroadcast(StatesGroup):
     text = State()
+
+
+class TournamentRosterEdit(StatesGroup):
+    username_input = State()
+    confirm = State()
+
+
+class BracketTechnicalResultInput(StatesGroup):
+    reason_input = State()
+    confirm = State()

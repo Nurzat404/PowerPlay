@@ -10,11 +10,13 @@ from razryad_arena_utils import (
     format_utc_to_msk,
     get_bracket_match_by_id,
     get_bracket_matches_due_for_reminder,
+    get_effective_tournament_captain_id,
     get_match_history_details,
     get_match_history_details_by_sport,
     get_sport_display_name,
     get_team_by_id,
     get_team_members,
+    get_tournament_team_members,
     get_tournament_by_id,
     get_tournament_manager_chat_ids,
     get_tournament_teams,
@@ -38,12 +40,13 @@ def _round_label(match: dict[str, Any]) -> str:
     return f"Раунд {round_number}" if round_number else "Раунд"
 
 
-def _collect_team_member_chat_ids(team1_id: int | None, team2_id: int | None) -> list[int]:
+def _collect_team_member_chat_ids(team1_id: int | None, team2_id: int | None, tournament_id: int | None = None) -> list[int]:
     chat_ids: set[int] = set()
     for team_id in (team1_id, team2_id):
         if not team_id:
             continue
-        for player in get_team_members(team_id):
+        players = get_tournament_team_members(tournament_id, team_id) if tournament_id else get_team_members(team_id)
+        for player in players:
             if isinstance(player, dict):
                 telegram_id = player.get("telegram_id")
             else:
@@ -105,7 +108,7 @@ def prepare_match_broadcast_payload(match_id: int, body_text: str = "") -> tuple
     if not match_dict.get("team1_id") or not match_dict.get("team2_id"):
         return None, "В этом матче еще нет пары команд."
 
-    chat_ids = _collect_team_member_chat_ids(match_dict.get("team1_id"), match_dict.get("team2_id"))
+    chat_ids = _collect_team_member_chat_ids(match_dict.get("team1_id"), match_dict.get("team2_id"), match_dict.get("tournament_id"))
     if not chat_ids:
         return None, "У участников этого матча нет доступных Telegram ID для рассылки."
 
@@ -147,7 +150,7 @@ def prepare_tournament_broadcast_payload(tournament_id: int, body_text: str = ""
     chat_ids: set[int] = set()
     for team in get_tournament_teams(tournament_id, status="approved"):
         team_id = team["id"] if isinstance(team, dict) else team["id"]
-        for member in get_team_members(team_id):
+        for member in get_tournament_team_members(tournament_id, team_id):
             telegram_id = member.get("telegram_id") if isinstance(member, dict) else (member["telegram_id"] if "telegram_id" in member.keys() else None)
             if telegram_id:
                 chat_ids.add(int(telegram_id))
@@ -229,7 +232,7 @@ async def notify_bracket_match_scheduled(
             f"📌 Место: {new_location}"
         )
 
-    chat_ids = _collect_team_member_chat_ids(match.get("team1_id"), match.get("team2_id"))
+    chat_ids = _collect_team_member_chat_ids(match.get("team1_id"), match.get("team2_id"), match.get("tournament_id"))
     await _broadcast_text(bot, chat_ids, text)
 
 
@@ -249,7 +252,7 @@ async def notify_bracket_match_reminder(bot: Bot, match: dict[str, Any]):
         f"🕒 Время: {match_time} (МСК)\n"
         f"📌 Место: {location}"
     )
-    chat_ids = _collect_team_member_chat_ids(match.get("team1_id"), match.get("team2_id"))
+    chat_ids = _collect_team_member_chat_ids(match.get("team1_id"), match.get("team2_id"), match.get("tournament_id"))
     await _broadcast_text(bot, chat_ids, text)
 
 
@@ -356,6 +359,25 @@ def _format_non_cs2_result(sport: str, match: dict[str, Any], details: dict[str,
     return "\n".join(lines).strip()
 
 
+def _format_technical_result(match: dict[str, Any]) -> str:
+    team1_name = _safe_team_name(match.get("team1_name"), "Команда 1")
+    team2_name = _safe_team_name(match.get("team2_name"), "Команда 2")
+    score1 = match.get("score1") if match.get("score1") is not None else 0
+    score2 = match.get("score2") if match.get("score2") is not None else 0
+    winner_name = _safe_team_name(match.get("winner_name"), "Победитель")
+    loser_name = team1_name if match.get("technical_loser_id") == match.get("team1_id") else team2_name
+    lines = [
+        f"🚫 Матч завершен тех.поражением",
+        f"📊 Счет матча: {team1_name} {score1}:{score2} {team2_name}",
+        f"🏆 Победитель: {winner_name}",
+        f"❌ Тех.поражение: {loser_name}",
+    ]
+    reason = (match.get("technical_reason") or "").strip()
+    if reason:
+        lines.append(f"📝 Причина: {reason}")
+    return "\n".join(lines)
+
+
 async def notify_bracket_match_result(bot: Bot, match_id: int, sport: str):
     match = get_bracket_match_by_id(match_id)
     if not match:
@@ -377,14 +399,16 @@ async def notify_bracket_match_result(bot: Bot, match_id: int, sport: str):
         f"⚔️ {team1_name} vs {team2_name}\n\n"
     )
 
-    if sport_normalized == "CS2":
+    if (match_dict.get("result_type") or "regular") == "technical":
+        body = _format_technical_result(match_dict)
+    elif sport_normalized == "CS2":
         details = get_match_history_details("bracket", match_id) or {}
         body = _format_cs2_result(match_dict, details)
     else:
         details = get_match_history_details_by_sport(sport_normalized, "bracket", match_id) or {}
         body = _format_non_cs2_result(sport_normalized, match_dict, details)
 
-    chat_ids = _collect_team_member_chat_ids(match_dict.get("team1_id"), match_dict.get("team2_id"))
+    chat_ids = _collect_team_member_chat_ids(match_dict.get("team1_id"), match_dict.get("team2_id"), match_dict.get("tournament_id"))
     await _broadcast_text(bot, chat_ids, header + body)
 
 

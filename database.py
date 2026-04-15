@@ -338,6 +338,57 @@ def init_db():
                 """)
 
                 cur.execute("""
+                    CREATE TABLE IF NOT EXISTS tournament_team_rosters (
+                        tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
+                        team_id INTEGER NOT NULL REFERENCES teams(id),
+                        user_id INTEGER NOT NULL REFERENCES users(id),
+                        status TEXT DEFAULT 'active',
+                        added_by INTEGER REFERENCES users(id),
+                        removed_by INTEGER REFERENCES users(id),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        removed_at TIMESTAMP,
+                        PRIMARY KEY (tournament_id, team_id, user_id)
+                    )
+                """)
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS tournament_team_captains (
+                        tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
+                        team_id INTEGER NOT NULL REFERENCES teams(id),
+                        user_id INTEGER NOT NULL REFERENCES users(id),
+                        assigned_by INTEGER REFERENCES users(id),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (tournament_id, team_id)
+                    )
+                """)
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS tournament_roster_change_requests (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
+                        team_id INTEGER NOT NULL REFERENCES teams(id),
+                        old_user_id INTEGER NOT NULL REFERENCES users(id),
+                        new_user_id INTEGER NOT NULL REFERENCES users(id),
+                        requested_by_user_id INTEGER REFERENCES users(id),
+                        status TEXT DEFAULT 'pending',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        responded_at TIMESTAMP
+                    )
+                """)
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS bracket_match_technical_participants (
+                        match_id INTEGER NOT NULL REFERENCES tournament_brackets(id),
+                        user_id INTEGER NOT NULL REFERENCES users(id),
+                        team_id INTEGER NOT NULL REFERENCES teams(id),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (match_id, user_id)
+                    )
+                """)
+
+                cur.execute("""
                     CREATE TABLE IF NOT EXISTS tournament_match_format_rules (
                         tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
                         round_number INTEGER NOT NULL,
@@ -528,6 +579,10 @@ def init_db():
                     cur.execute(
                         "ALTER TABLE tournaments ADD COLUMN veto_launch_mode TEXT DEFAULT 'admin_start'")
                     logger.info("Поле veto_launch_mode добавлено в таблицу tournaments")
+                if 'replacements_enabled' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournaments ADD COLUMN replacements_enabled INTEGER DEFAULT 1")
+                    logger.info("Поле replacements_enabled добавлено в таблицу tournaments")
 
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS tournament_match_format_rules (
@@ -542,6 +597,30 @@ def init_db():
                 cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_tournament_match_format_rules_tournament
                     ON tournament_match_format_rules(tournament_id, round_number)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_tournament_team_rosters_lookup
+                    ON tournament_team_rosters(tournament_id, team_id, status, user_id)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_tournament_team_rosters_user
+                    ON tournament_team_rosters(tournament_id, user_id, status)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_tournament_team_captains_lookup
+                    ON tournament_team_captains(tournament_id, team_id, user_id)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_tournament_roster_requests_target
+                    ON tournament_roster_change_requests(new_user_id, status)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_tournament_roster_requests_team
+                    ON tournament_roster_change_requests(tournament_id, team_id, status)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_bracket_technical_participants_user
+                    ON bracket_match_technical_participants(user_id, match_id)
                 """)
 
                 # Создаём таблицу tournament_brackets для турнирной сетки
@@ -809,10 +888,36 @@ def init_db():
                     cur.execute(
                         "ALTER TABLE tournament_brackets ADD COLUMN reminder_sent_at TIMESTAMP")
                     logger.info("Поле reminder_sent_at добавлено в таблицу tournament_brackets")
+                if 'result_type' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournament_brackets ADD COLUMN result_type TEXT DEFAULT 'regular'")
+                    logger.info("Поле result_type добавлено в таблицу tournament_brackets")
+                if 'technical_winner_id' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournament_brackets ADD COLUMN technical_winner_id INTEGER")
+                    logger.info("Поле technical_winner_id добавлено в таблицу tournament_brackets")
+                if 'technical_loser_id' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournament_brackets ADD COLUMN technical_loser_id INTEGER")
+                    logger.info("Поле technical_loser_id добавлено в таблицу tournament_brackets")
+                if 'technical_reason' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournament_brackets ADD COLUMN technical_reason TEXT")
+                    logger.info("Поле technical_reason добавлено в таблицу tournament_brackets")
+                if 'technical_assigned_by' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournament_brackets ADD COLUMN technical_assigned_by INTEGER")
+                    logger.info("Поле technical_assigned_by добавлено в таблицу tournament_brackets")
+                if 'technical_assigned_at' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournament_brackets ADD COLUMN technical_assigned_at TIMESTAMP")
+                    logger.info("Поле technical_assigned_at добавлено в таблицу tournament_brackets")
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_bracket_reminder_lookup ON tournament_brackets(status, scheduled_at_utc, reminder_sent_at)")
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_bracket_tournament_round_match ON tournament_brackets(tournament_id, round_number, match_number)")
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_bracket_result_type ON tournament_brackets(result_type, tournament_id)")
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_tournament_managers_tournament ON tournament_managers(tournament_id)")
                 cur.execute(

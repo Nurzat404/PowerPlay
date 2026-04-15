@@ -7,7 +7,7 @@ from razryad_arena_utils import (
     add_tournament_application, get_all_sports, get_team_application,
     get_approved_teams_count, get_tournament_teams, can_manage_tournament, is_admin, get_team_members_count, can_retry_tournament_application, get_team_by_id, get_team_members, is_captain,
     get_sport_display_name, normalize_sport_name, ensure_tournament_invite_token,
-    get_tournament_member_application_conflicts,
+    get_tournament_member_application_conflicts, get_user_tournament_captain_teams,
 )
 from keyboards import (
     tournaments_main_keyboard, tournaments_list_keyboard,
@@ -83,7 +83,7 @@ async def show_tournament_teams(callback: CallbackQuery):
     await callback.answer()
 
 
-@router.callback_query(F.data.startswith("tournament_"))
+@router.callback_query(F.data.regexp(r"^tournament_\d+$"))
 async def view_tournament(callback: CallbackQuery):
     tournament_id = int(callback.data.split("_")[1])
     tournament = get_tournament_by_id(tournament_id)
@@ -96,11 +96,16 @@ async def view_tournament(callback: CallbackQuery):
 
     # Кнопка "Подать заявку" доступна только капитану команды нужного спорта.
     can_apply = False
+    can_manage_roster = False
     if user and tournament['status'] == 'registration':
         for team in teams:
             if normalize_sport_name(team['sport']) == normalize_sport_name(tournament['sport']) and is_captain(user['id'], team['id']):
                 can_apply = True
                 break
+    captain_teams = []
+    if user and int(tournament['replacements_enabled'] or 0) == 1:
+        captain_teams = list(get_user_tournament_captain_teams(tournament_id, user['telegram_id']))
+        can_manage_roster = bool(captain_teams)
 
     status_map = {
         'registration': 'Регистрация',
@@ -150,6 +155,11 @@ async def view_tournament(callback: CallbackQuery):
     if user and can_manage_tournament(user['telegram_id'], tournament_id):
         builder.button(text="⚙️ Управление турниром",
                        callback_data=f"admin_tournament_manage_{tournament_id}")
+    elif can_manage_roster:
+        if len(captain_teams) == 1:
+            builder.button(text="🔁 Замены состава", callback_data=f"tournament_roster_open_{tournament_id}_{captain_teams[0]['id']}")
+        else:
+            builder.button(text="🔁 Замены состава", callback_data=f"tournament_roster_manage_{tournament_id}")
 
     builder.button(
         text="🔙 Назад", callback_data=f"tournament_sport_{tournament['sport']}")

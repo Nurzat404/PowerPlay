@@ -659,20 +659,9 @@ async def bracket_match_menu(callback: CallbackQuery, state: FSMContext):
     if match.get("status") == "completed":
         await callback.answer("Этот матч уже завершён.", show_alert=True)
         return
-
-    if _schedule_missing(match):
-        await callback.answer("Сначала укажите время и место матча.", show_alert=True)
-        await start_schedule_wizard_for_tournament(
-            callback,
-            state,
-            tournament_id=tournament_id,
-            match_ids=[match_id],
-            return_callback=f"view_bracket_{tournament_id}",
-        )
-        return
-
-    match_time = format_utc_to_msk(match.get("scheduled_at_utc"))
-    location = (match.get("location") or "не указано").strip()
+    schedule_missing = _schedule_missing(match)
+    match_time = format_utc_to_msk(match.get("scheduled_at_utc")) if match.get("scheduled_at_utc") else "не назначено"
+    location = (match.get("location") or "не указано").strip() if match.get("location") else "не указано"
     round_name = match.get("round_name") or f"Раунд {match.get('round_number') or '?'}"
     text = (
         "⚙️ Управление матчем\n\n"
@@ -682,14 +671,21 @@ async def bracket_match_menu(callback: CallbackQuery, state: FSMContext):
         f"🕒 Время: {match_time} (МСК)\n"
         f"📌 Место: {location}"
     )
+    if schedule_missing:
+        text += "\n\nℹ️ Для обычного ввода результата сначала укажите время и место матча."
     schedule_locked = _schedule_locked_by_veto(match_id)
     if schedule_locked:
         text += "\n\n🔒 Время и место зафиксированы: pick/ban уже начался или завершен."
     builder = InlineKeyboardBuilder()
-    builder.button(text="✏️ Ввести результат", callback_data=f"manual_match_result_{match_id}_{tournament_id}")
+    if not schedule_missing:
+        builder.button(text="✏️ Ввести результат", callback_data=f"manual_match_result_{match_id}_{tournament_id}")
+    builder.button(text="🚫 Тех.поражение", callback_data=f"manual_match_technical_{match_id}_{tournament_id}")
     builder.button(text="📢 Сообщение участникам матча", callback_data=f"bracket_match_broadcast_{match_id}_{tournament_id}")
     if not schedule_locked:
-        builder.button(text="🗓 Изменить время/место", callback_data=f"bracket_schedule_edit_{match_id}_{tournament_id}")
+        builder.button(
+            text="🗓 Назначить время/место" if schedule_missing else "🗓 Изменить время/место",
+            callback_data=f"bracket_schedule_edit_{match_id}_{tournament_id}",
+        )
     tournament = get_tournament_by_id(tournament_id)
     if tournament and tournament["sport"] == "CS2" and int(tournament["map_veto_enabled"] or 0) == 1:
         builder.button(text="🗺 Пик / бан карт", callback_data=f"veto_admin_open_{match_id}")

@@ -21,9 +21,16 @@ from razryad_arena_utils import (
     normalize_sport_name, allow_reapply_excluded_application, ensure_tournament_invite_token,
     get_active_user_telegram_ids, add_tournament_manager, can_manage_bracket_match, can_manage_tournament,
     get_tournament_manager_users, get_tournament_map_pool, is_tournament_creator_or_global_admin,
+    get_tournament_teams,
     remove_tournament_manager, replace_tournament_map_pool, expand_stage_formats_to_round_rules,
     get_tournament_main_round_count, get_tournament_match_format_rules, get_tournament_stage_formats,
-    replace_tournament_match_format_rules
+    replace_tournament_match_format_rules, ensure_tournament_team_roster, get_tournament_team_members,
+    get_effective_tournament_captain_id, assign_tournament_team_captain,
+    add_tournament_team_member, remove_tournament_team_member, replace_tournament_team_player,
+    can_manage_tournament_team_roster, is_tournament_captain, get_user_by_username,
+    create_tournament_roster_change_request, get_tournament_roster_change_request,
+    accept_tournament_roster_change_request, decline_tournament_roster_change_request,
+    update_tournament_roster_change_request_status,
 )
 from keyboards import (
     admin_menu_keyboard, back_to_main_keyboard,
@@ -56,7 +63,7 @@ from utils.veto_service import (
     list_tournament_veto_sessions,
     validate_veto_pool,
 )
-from handlers.states import TargetedBroadcast
+from handlers.states import TargetedBroadcast, TournamentRosterEdit
 
 logger = logging.getLogger(__name__)
 
@@ -441,6 +448,12 @@ def _build_team_members_block(members):
             f"{idx}. {member['first_name']} ({username}) | возраст: {age} | steam: {steam}")
     return "\n".join(lines)
 
+
+def _build_roster_member_label(member: dict, *, is_captain_member: bool = False) -> str:
+    username = f"@{member['username']}" if member.get("username") else "без username"
+    prefix = "👑 " if is_captain_member else ""
+    return f"{prefix}{member.get('first_name') or 'Участник'} ({username})"
+
 def _build_tournament_compliance_block(tournament: dict, members: list[dict]) -> tuple[str, bool]:
     """Возвращает текст проверки и флаг полного соответствия."""
     checks = []
@@ -499,10 +512,16 @@ def _build_admin_team_card_text(team_id: int, tournament: dict | None = None, ap
     if not team:
         return None
 
-    captain = get_user_by_id(team['captain_id'])
+    if tournament:
+        ensure_tournament_team_roster(tournament["id"], team_id)
+        members = list(get_tournament_team_members(tournament["id"], team_id))
+        captain_id = get_effective_tournament_captain_id(tournament["id"], team_id)
+    else:
+        members = list(get_team_members(team_id))
+        captain_id = team["captain_id"]
+    captain = get_user_by_id(captain_id) if captain_id else None
     captain_name = f"{captain['first_name']} (@{captain['username']})" if captain else "Неизвестно"
-    members = get_team_members(team_id)
-    members_count = get_team_members_count(team_id)
+    members_count = len(members) if tournament else get_team_members_count(team_id)
     max_members = get_team_max_members(team_id)
     settings = get_team_settings(team_id)
 
@@ -527,7 +546,7 @@ def _build_admin_team_card_text(team_id: int, tournament: dict | None = None, ap
         f"Название: {team['name']}\n"
         f"Вид спорта: {get_sport_display_name(team['sport'])}\n"
         f"Город: {team['city']}\n"
-        f"Капитан: {captain_name}\n"
+        f"{'Турнирный капитан' if tournament else 'Капитан'}: {captain_name}\n"
         f"Участники: {members_count}/{max_members}\n"
         f"Набор в команду: {'🔓 открыт' if settings['is_open'] else '🔒 закрыт'}\n"
         f"Уведомления капитану: {'🔔 включены' if settings['notify'] else '🔕 выключены'}\n"
@@ -569,6 +588,108 @@ def _get_tournament_application_details(app_id: int):
     app = cur.fetchone()
     conn.close()
     return app
+
+
+def _get_tournament_team_application(tournament_id: int, team_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT *
+        FROM tournament_applications
+        WHERE tournament_id=? AND team_id=?
+    """, (tournament_id, team_id))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def _build_tournament_roster_action_keyboard(
+    tournament_id: int,
+    team_id: int,
+    *,
+    can_replace: bool,
+    can_assign_captain: bool,
+    is_finished: bool,
+    refresh_callback: str,
+    back_callback: str,
+):
+    builder = InlineKeyboardBuilder()
+    if can_replace and not is_finished:
+        builder.button(text="🔁 Заменить игрока", callback_data=f"tournament_roster_replace_{tournament_id}_{team_id}")
+    if can_assign_captain and not is_finished:
+        builder.button(text="👑 Назначить турнирного капитана", callback_data=f"tournament_roster_captain_{tournament_id}_{team_id}")
+    builder.button(text="🔄 Обновить", callback_data=refresh_callback)
+    builder.button(text="🔙 Назад", callback_data=back_callback)
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+async def _show_tournament_roster_screen(message, tournament_id: int, team_id: int, *, viewer_telegram_id: int, refresh_callback: str, back_callback: str, notice: str | None = None):
+    tournament = get_tournament_by_id(tournament_id)
+    team = get_team_by_id(team_id)
+    app = _get_tournament_team_application(tournament_id, team_id)
+    if not tournament or not team or not app:
+        await message.edit_text(
+            "Команда или турнир не найдены.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data=back_callback)]])
+        )
+        return
+
+    ensure_tournament_team_roster(tournament_id, team_id)
+    members = list(get_tournament_team_members(tournament_id, team_id))
+    captain_id = get_effective_tournament_captain_id(tournament_id, team_id)
+    captain = get_user_by_id(captain_id) if captain_id else None
+    captain_name = f"{captain['first_name']} (@{captain['username']})" if captain else "Не назначен"
+    can_edit = can_manage_tournament_team_roster(viewer_telegram_id, tournament_id, team_id)
+    is_manager = can_manage_tournament(viewer_telegram_id, tournament_id)
+    is_team_captain = is_tournament_captain(viewer_telegram_id, tournament_id, team_id)
+    can_assign_captain = is_manager
+    replacements_enabled = int(tournament["replacements_enabled"] or 0) == 1
+    can_replace = can_edit and replacements_enabled
+    is_finished = tournament["status"] == "finished"
+
+    lines = [
+        "🔁 Замены состава",
+        "",
+        f"🏆 Турнир: {tournament['name']}",
+        f"👥 Команда: {team['name']}",
+        f"Турнирный капитан: {captain_name}",
+        f"Игроков в составе: {len(members)}/{tournament['required_team_size']}",
+        f"Замены: {'разрешены' if replacements_enabled else 'запрещены'}",
+    ]
+    if is_manager:
+        lines.insert(4, f"Статус заявки: {app['status']}")
+    if is_finished:
+        lines.extend(["", "ℹ️ Турнир завершен. Доступен только просмотр состава."])
+    elif is_manager:
+        lines.extend(["", "ℹ️ Админ или ответственный может назначать турнирного капитана и управлять заменами."])
+    elif is_team_captain:
+        lines.extend(["", "ℹ️ Вы турнирный капитан этой команды и можете запрашивать замены состава."])
+    elif not can_edit:
+        lines.extend(["", "ℹ️ Изменять состав может админ/ответственный или текущий турнирный капитан."])
+    elif not replacements_enabled:
+        lines.extend(["", "ℹ️ В этом турнире замены отключены настройками турнира."])
+    lines.extend(["", "Состав:"])
+    if members:
+        for idx, member in enumerate(members, 1):
+            lines.append(f"{idx}. {_build_roster_member_label(dict(member), is_captain_member=int(member['id']) == captain_id)}")
+    else:
+        lines.append("—")
+    if notice:
+        lines = [notice, ""] + lines
+
+    await message.edit_text(
+        "\n".join(lines),
+        reply_markup=_build_tournament_roster_action_keyboard(
+            tournament_id,
+            team_id,
+            can_replace=can_replace,
+            can_assign_captain=can_assign_captain,
+            is_finished=is_finished,
+            refresh_callback=refresh_callback,
+            back_callback=back_callback,
+        ),
+    )
 
 def _admin_team_manage_card_keyboard(team_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -1830,6 +1951,7 @@ async def admin_tournament_manage(callback: CallbackQuery, tournament_id: int | 
                 f"Режим запуска veto: {tournament['veto_launch_mode'] or LAUNCH_ADMIN}",
             ]
         )
+    lines.append(f"Замены состава: {'разрешены' if int(tournament['replacements_enabled'] or 0) == 1 else 'запрещены'}")
     text = "\n".join(lines)
     if tournament['description'] and tournament['description'] != 'нет':
         text += f"\n📝 Описание: {tournament['description']}"
@@ -1862,6 +1984,10 @@ async def admin_tournament_manage(callback: CallbackQuery, tournament_id: int | 
     # Команды и заявки открываются через отдельный хаб со статусами.
     builder.button(text="👥 Команды и заявки",
                    callback_data=f"admin_tournament_teams_{tournament_id}")
+    builder.button(
+        text=f"🔁 Замены: {'Вкл' if int(tournament['replacements_enabled'] or 0) == 1 else 'Выкл'}",
+        callback_data=f"admin_tournament_replacements_toggle_{tournament_id}"
+    )
     builder.button(text="📢 Сообщение участникам турнира",
                    callback_data=f"admin_tournament_broadcast_{tournament_id}")
     if _is_cs2_sport(tournament["sport"]):
@@ -1894,6 +2020,26 @@ async def admin_tournament_manage(callback: CallbackQuery, tournament_id: int | 
         else:
             raise
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_tournament_replacements_toggle_"))
+async def admin_tournament_replacements_toggle(callback: CallbackQuery):
+    tournament_id = int(callback.data.split("_")[4])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    tournament = get_tournament_by_id(tournament_id)
+    if not tournament:
+        await callback.answer("Турнир не найден", show_alert=True)
+        return
+    conn = get_connection()
+    cur = conn.cursor()
+    new_value = 0 if int(tournament["replacements_enabled"] or 0) == 1 else 1
+    cur.execute("UPDATE tournaments SET replacements_enabled=? WHERE id=?", (new_value, tournament_id))
+    conn.commit()
+    conn.close()
+    request_site_sync(f"tournament_updated:{tournament_id}:replacements_enabled")
+    await admin_tournament_manage(callback, tournament_id=tournament_id)
 
 
 @router.callback_query(F.data.startswith("admin_tournament_veto_"))
@@ -2832,12 +2978,455 @@ async def admin_tournament_team_info(callback: CallbackQuery):
         builder.button(text="♻️ Разрешить повторную заявку",
                        callback_data=f"admin_tournament_allow_reapply_{tournament_id}_{app_id}_{offset}_{section}")
 
+    if app['status'] == 'approved':
+        builder.button(
+            text="🔁 Замены состава",
+            callback_data=f"admin_tournament_roster_{tournament_id}_{team_id}_{app_id}_{section}_{offset}"
+        )
+
     builder.button(text=f"🔙 Назад в раздел: {_section_label(section)}",
                    callback_data=_section_back_callback(section, tournament_id, offset))
     builder.adjust(2)
 
     await callback.message.edit_text(text, reply_markup=builder.as_markup())
     await callback.answer()
+
+
+def _build_tournament_roster_member_picker(
+    tournament_id: int,
+    team_id: int,
+    *,
+    callback_prefix: str,
+    back_callback: str,
+    include_captain_marker: bool = False,
+):
+    members = list(get_tournament_team_members(tournament_id, team_id))
+    captain_id = get_effective_tournament_captain_id(tournament_id, team_id)
+    builder = InlineKeyboardBuilder()
+    for member in members:
+        member_dict = dict(member)
+        builder.button(
+            text=_build_roster_member_label(member_dict, is_captain_member=include_captain_marker and int(member_dict["id"]) == captain_id),
+            callback_data=f"{callback_prefix}_{member_dict['id']}",
+        )
+    builder.button(text="🔙 Назад", callback_data=back_callback)
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+@router.callback_query(F.data.startswith("admin_tournament_roster_"))
+async def admin_tournament_roster_open(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    tournament_id = int(parts[3])
+    team_id = int(parts[4])
+    app_id = int(parts[5])
+    section = parts[6]
+    offset = int(parts[7])
+    if not can_manage_tournament_team_roster(callback.from_user.id, tournament_id, team_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    refresh_callback = callback.data
+    back_callback = f"admin_tournament_team_info_{section}_{tournament_id}_{team_id}_{app_id}_{offset}"
+    await state.clear()
+    await state.update_data(
+        roster_refresh_callback=refresh_callback,
+        roster_back_callback=back_callback,
+        tournament_id=tournament_id,
+        team_id=team_id,
+    )
+    await _show_tournament_roster_screen(
+        callback.message,
+        tournament_id,
+        team_id,
+        viewer_telegram_id=callback.from_user.id,
+        refresh_callback=refresh_callback,
+        back_callback=back_callback,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("tournament_roster_open_"))
+async def tournament_roster_open(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    tournament_id = int(parts[3])
+    team_id = int(parts[4])
+    if not can_manage_tournament_team_roster(callback.from_user.id, tournament_id, team_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(
+        roster_refresh_callback=callback.data,
+        roster_back_callback=f"tournament_{tournament_id}",
+        tournament_id=tournament_id,
+        team_id=team_id,
+    )
+    await _show_tournament_roster_screen(
+        callback.message,
+        tournament_id,
+        team_id,
+        viewer_telegram_id=callback.from_user.id,
+        refresh_callback=callback.data,
+        back_callback=f"tournament_{tournament_id}",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("tournament_roster_from_list_"))
+async def tournament_roster_from_list(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    tournament_id = int(parts[4])
+    team_id = int(parts[5])
+    if not can_manage_tournament_team_roster(callback.from_user.id, tournament_id, team_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(
+        roster_refresh_callback=callback.data,
+        roster_back_callback=f"tournament_roster_manage_{tournament_id}",
+        tournament_id=tournament_id,
+        team_id=team_id,
+    )
+    await _show_tournament_roster_screen(
+        callback.message,
+        tournament_id,
+        team_id,
+        viewer_telegram_id=callback.from_user.id,
+        refresh_callback=callback.data,
+        back_callback=f"tournament_roster_manage_{tournament_id}",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("tournament_roster_manage_"))
+async def tournament_roster_manage(callback: CallbackQuery, state: FSMContext):
+    tournament_id = int(callback.data.split("_")[3])
+    tournament = get_tournament_by_id(tournament_id)
+    if not tournament:
+        await callback.answer("Турнир не найден", show_alert=True)
+        return
+    teams = []
+    for team in get_tournament_teams(tournament_id, status="approved"):
+        team_id = team["id"] if isinstance(team, dict) else team["id"]
+        if can_manage_tournament_team_roster(callback.from_user.id, tournament_id, team_id):
+            teams.append(team)
+    if not teams:
+        await callback.answer("У вас нет доступа к заменам в этом турнире.", show_alert=True)
+        return
+    await state.clear()
+    builder = InlineKeyboardBuilder()
+    for team in teams:
+        builder.button(text=f"👥 {team['name']}", callback_data=f"tournament_roster_from_list_{tournament_id}_{team['id']}")
+    builder.button(text="🔙 К турниру", callback_data=f"tournament_{tournament_id}")
+    builder.adjust(1)
+    await callback.message.edit_text(
+        f"🔁 Замены состава\n\n🏆 Турнир: {tournament['name']}\n\nВыберите команду:",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^tournament_roster_add_\d+_\d+$"))
+async def tournament_roster_add_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer("Отдельное добавление отключено. Используйте замену игрока.", show_alert=True)
+
+
+@router.callback_query(F.data.regexp(r"^tournament_roster_remove_\d+_\d+$"))
+async def tournament_roster_remove_start(callback: CallbackQuery, state: FSMContext):
+    await callback.answer("Отдельное удаление отключено. Используйте замену игрока.", show_alert=True)
+
+
+@router.callback_query(F.data.regexp(r"^tournament_roster_remove_pick_\d+_\d+_\d+$"))
+async def tournament_roster_remove_pick(callback: CallbackQuery, state: FSMContext):
+    await callback.answer("Отдельное удаление отключено. Используйте замену игрока.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("tournament_roster_captain_"))
+async def tournament_roster_captain_start(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    tournament_id = int(parts[3])
+    team_id = int(parts[4])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Назначать турнирного капитана может только админ или ответственный турнира.", show_alert=True)
+        return
+    tournament = get_tournament_by_id(tournament_id)
+    if tournament and tournament["status"] == "finished":
+        await callback.answer("Турнир завершен. Изменения недоступны.", show_alert=True)
+        return
+    context = await state.get_data()
+    await callback.message.edit_text(
+        "Выберите нового турнирного капитана:",
+        reply_markup=_build_tournament_roster_member_picker(
+            tournament_id,
+            team_id,
+            callback_prefix=f"tournament_roster_assign_{tournament_id}_{team_id}",
+            back_callback=context.get("roster_refresh_callback") or f"tournament_roster_open_{tournament_id}_{team_id}",
+            include_captain_marker=True,
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("tournament_roster_assign_"))
+async def tournament_roster_assign(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    tournament_id = int(parts[3])
+    team_id = int(parts[4])
+    user_id = int(parts[5])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Назначать турнирного капитана может только админ или ответственный турнира.", show_alert=True)
+        return
+    context = await state.get_data()
+    actor = get_user(callback.from_user.id)
+    ok, error = assign_tournament_team_captain(tournament_id, team_id, user_id, actor["id"] if actor else None)
+    if not ok:
+        await callback.answer(error or "Не удалось назначить турнирного капитана.", show_alert=True)
+        return
+    await _show_tournament_roster_screen(
+        callback.message,
+        tournament_id,
+        team_id,
+        viewer_telegram_id=callback.from_user.id,
+        refresh_callback=context.get("roster_refresh_callback") or f"tournament_roster_open_{tournament_id}_{team_id}",
+        back_callback=context.get("roster_back_callback") or f"tournament_roster_manage_{tournament_id}",
+        notice="✅ Турнирный капитан назначен.",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^tournament_roster_replace_\d+_\d+$"))
+async def tournament_roster_replace_start(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    tournament_id = int(parts[3])
+    team_id = int(parts[4])
+    if not can_manage_tournament_team_roster(callback.from_user.id, tournament_id, team_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    tournament = get_tournament_by_id(tournament_id)
+    if tournament and tournament["status"] == "finished":
+        await callback.answer("Турнир завершен. Изменения недоступны.", show_alert=True)
+        return
+    context = await state.get_data()
+    await callback.message.edit_text(
+        "Выберите игрока, которого нужно заменить:",
+        reply_markup=_build_tournament_roster_member_picker(
+            tournament_id,
+            team_id,
+            callback_prefix=f"tournament_roster_replace_pick_{tournament_id}_{team_id}",
+            back_callback=context.get("roster_refresh_callback") or f"tournament_roster_open_{tournament_id}_{team_id}",
+            include_captain_marker=True,
+        ),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("tournament_roster_replace_pick_"))
+async def tournament_roster_replace_pick(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    tournament_id = int(parts[4])
+    team_id = int(parts[5])
+    old_user_id = int(parts[6])
+    context = await state.get_data()
+    if not can_manage_tournament_team_roster(callback.from_user.id, tournament_id, team_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(
+        roster_mode="replace",
+        tournament_id=tournament_id,
+        team_id=team_id,
+        old_user_id=old_user_id,
+        roster_refresh_callback=context.get("roster_refresh_callback") or f"tournament_roster_open_{tournament_id}_{team_id}",
+        roster_back_callback=context.get("roster_back_callback") or f"tournament_roster_manage_{tournament_id}",
+    )
+    await state.set_state(TournamentRosterEdit.username_input)
+    await callback.message.edit_text(
+        "Введите username нового игрока для замены.\nНапример: `nickname` или `@nickname`",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="❌ Отмена",
+                callback_data=(context.get("roster_refresh_callback") or f"tournament_roster_open_{tournament_id}_{team_id}"),
+            )
+        ]]),
+        parse_mode="Markdown",
+    )
+    await callback.answer()
+
+
+@router.message(TournamentRosterEdit.username_input)
+async def tournament_roster_username_input(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Введите username игрока.")
+        return
+    username = text[1:] if text.startswith("@") else text
+    user = get_user_by_username(username)
+    if not user:
+        await message.answer("Пользователь с таким username не найден.")
+        return
+    data = await state.get_data()
+    mode = data.get("roster_mode")
+    tournament_id = int(data["tournament_id"])
+    team_id = int(data["team_id"])
+    team = get_team_by_id(team_id)
+    old_user = get_user_by_id(data.get("old_user_id")) if data.get("old_user_id") else None
+    preview = [
+        "Подтвердите изменение состава",
+        "",
+        f"Команда: {team['name'] if team else team_id}",
+    ]
+    if mode == "replace" and old_user:
+        preview.append(f"Замена: {old_user['first_name']} -> {user['first_name']}")
+    preview.append("")
+    preview.append("После подтверждения запрос уйдет игроку.")
+    preview.append("Замена вступит в силу только после его согласия.")
+    await state.update_data(pending_user_id=user["id"])
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Подтвердить", callback_data="tournament_roster_confirm")
+    builder.button(text="❌ Отмена", callback_data="tournament_roster_cancel")
+    builder.adjust(1)
+    await state.set_state(TournamentRosterEdit.confirm)
+    await message.answer("\n".join(preview), reply_markup=builder.as_markup())
+
+
+@router.callback_query(F.data == "tournament_roster_confirm")
+async def tournament_roster_confirm(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    mode = data.get("roster_mode")
+    tournament_id = int(data["tournament_id"])
+    team_id = int(data["team_id"])
+    actor = get_user(callback.from_user.id)
+    pending_user_id = int(data["pending_user_id"])
+    refresh_callback = data.get("roster_refresh_callback") or f"tournament_roster_open_{tournament_id}_{team_id}"
+    back_callback = data.get("roster_back_callback") or f"tournament_roster_manage_{tournament_id}"
+    if mode != "replace":
+        await callback.answer("Поддерживается только замена игрока.", show_alert=True)
+        return
+
+    request_id, error = create_tournament_roster_change_request(
+        tournament_id,
+        team_id,
+        int(data["old_user_id"]),
+        pending_user_id,
+        actor["id"] if actor else None,
+    )
+    if not request_id:
+        await callback.answer(error or "Не удалось подготовить запрос на замену.", show_alert=True)
+        return
+
+    request_row = get_tournament_roster_change_request(request_id)
+    new_user = get_user_by_id(pending_user_id)
+    old_user = get_user_by_id(int(data["old_user_id"]))
+    current_captain_id = get_effective_tournament_captain_id(tournament_id, team_id)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Согласен", callback_data=f"tournament_roster_request_accept_{request_id}")
+    builder.button(text="❌ Отказаться", callback_data=f"tournament_roster_request_decline_{request_id}")
+    builder.adjust(1)
+    request_text_lines = [
+        "🔁 Вас приглашают на замену в турнире",
+        "",
+        f"🏆 Турнир: {request_row['tournament_name']}",
+        f"👥 Команда: {request_row['team_name']}",
+        f"Замена: {request_row['old_first_name']} -> {request_row['new_first_name']}",
+    ]
+    if current_captain_id == int(data["old_user_id"]):
+        request_text_lines.extend(["", "👑 После подтверждения вы станете турнирным капитаном этой команды."])
+    request_text_lines.extend(["", "Подтвердите участие, если готовы войти в состав на этот турнир."])
+
+    try:
+        await callback.bot.send_message(
+            new_user["telegram_id"],
+            "\n".join(request_text_lines),
+            reply_markup=builder.as_markup(),
+        )
+    except Exception:
+        update_tournament_roster_change_request_status(request_id, "cancelled")
+        await callback.answer("Не удалось отправить запрос игроку. Пусть он сначала запустит бота и нажмет /start.", show_alert=True)
+        return
+
+    await state.clear()
+    await _show_tournament_roster_screen(
+        callback.message,
+        tournament_id,
+        team_id,
+        viewer_telegram_id=callback.from_user.id,
+        refresh_callback=refresh_callback,
+        back_callback=back_callback,
+        notice="✅ Запрос на замену отправлен игроку. Состав обновится после его подтверждения.",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "tournament_roster_cancel")
+async def tournament_roster_cancel(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    tournament_id = int(data.get("tournament_id") or 0)
+    team_id = int(data.get("team_id") or 0)
+    refresh_callback = data.get("roster_refresh_callback") or f"tournament_roster_open_{tournament_id}_{team_id}"
+    back_callback = data.get("roster_back_callback") or f"tournament_roster_manage_{tournament_id}"
+    await state.clear()
+    await _show_tournament_roster_screen(
+        callback.message,
+        tournament_id,
+        team_id,
+        viewer_telegram_id=callback.from_user.id,
+        refresh_callback=refresh_callback,
+        back_callback=back_callback,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("tournament_roster_request_accept_"))
+async def tournament_roster_request_accept(callback: CallbackQuery):
+    request_id = int(callback.data.split("_")[4])
+    user = get_user(callback.from_user.id)
+    ok, error, request_row = accept_tournament_roster_change_request(request_id, user["id"] if user else 0)
+    if not ok:
+        await callback.answer(error or "Не удалось подтвердить замену.", show_alert=True)
+        return
+    requester = get_user_by_id(int(request_row["requested_by_user_id"])) if request_row["requested_by_user_id"] else None
+    if requester and requester["telegram_id"]:
+        try:
+            await callback.bot.send_message(
+                requester["telegram_id"],
+                f"✅ Игрок {request_row['new_first_name']} подтвердил замену в команде «{request_row['team_name']}» на турнире «{request_row['tournament_name']}».",
+            )
+        except Exception:
+            pass
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🏆 К турниру", callback_data=f"tournament_{request_row['tournament_id']}")
+    builder.adjust(1)
+    await callback.message.edit_text(
+        f"✅ Вы подтвердили участие в турнире «{request_row['tournament_name']}» за команду «{request_row['team_name']}».",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer("Замена подтверждена.")
+
+
+@router.callback_query(F.data.startswith("tournament_roster_request_decline_"))
+async def tournament_roster_request_decline(callback: CallbackQuery):
+    request_id = int(callback.data.split("_")[4])
+    user = get_user(callback.from_user.id)
+    ok, error, request_row = decline_tournament_roster_change_request(request_id, user["id"] if user else 0)
+    if not ok:
+        await callback.answer(error or "Не удалось отклонить запрос.", show_alert=True)
+        return
+    requester = get_user_by_id(int(request_row["requested_by_user_id"])) if request_row["requested_by_user_id"] else None
+    if requester and requester["telegram_id"]:
+        try:
+            await callback.bot.send_message(
+                requester["telegram_id"],
+                f"❌ Игрок {request_row['new_first_name']} отказался от замены в команде «{request_row['team_name']}» на турнире «{request_row['tournament_name']}».",
+            )
+        except Exception:
+            pass
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🏆 К турниру", callback_data=f"tournament_{request_row['tournament_id']}")
+    builder.adjust(1)
+    await callback.message.edit_text(
+        f"❌ Вы отказались от участия в турнире «{request_row['tournament_name']}» за команду «{request_row['team_name']}».",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer("Запрос отклонен.")
 
 @router.callback_query(F.data.startswith("admin_tournament_applications_"))
 async def admin_tournament_applications(callback: CallbackQuery):

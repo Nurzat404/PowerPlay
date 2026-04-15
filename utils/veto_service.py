@@ -20,13 +20,16 @@ from razryad_arena_utils import (
     can_manage_tournament,
     format_utc_to_msk,
     get_bracket_match_by_id,
+    get_effective_tournament_captain_id,
     get_team_members,
+    get_tournament_team_members,
     get_tournament_by_id,
     get_tournament_manager_chat_ids,
     get_tournament_map_pool,
     get_user,
     get_user_by_id,
     is_captain,
+    is_tournament_captain,
     normalize_sport_name,
     parse_utc_storage_datetime,
     resolve_bracket_match_format,
@@ -335,9 +338,11 @@ def _write_session_state(conn: sqlite3.Connection, session_id: int, resolution: 
     ))
 
 
-def _team_captain_id(team_id: int | None) -> int | None:
+def _team_captain_id(tournament_id: int | None, team_id: int | None) -> int | None:
     if not team_id:
         return None
+    if tournament_id:
+        return get_effective_tournament_captain_id(tournament_id, team_id)
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT captain_id FROM teams WHERE id=?", (team_id,))
@@ -369,8 +374,8 @@ def get_match_veto_details(bracket_match_id: int) -> dict[str, Any] | None:
         "maps": series_maps,
         "pool": pool_rows,
         "available_maps": _remaining_pool(pool_rows, actions),
-        "captain1": get_user_by_id(_team_captain_id(match_payload.get("team1_id"))) if match_payload.get("team1_id") else None,
-        "captain2": get_user_by_id(_team_captain_id(match_payload.get("team2_id"))) if match_payload.get("team2_id") else None,
+        "captain1": get_user_by_id(_team_captain_id(match_payload.get("tournament_id"), match_payload.get("team1_id"))) if match_payload.get("team1_id") else None,
+        "captain2": get_user_by_id(_team_captain_id(match_payload.get("tournament_id"), match_payload.get("team2_id"))) if match_payload.get("team2_id") else None,
     }
 
 
@@ -512,6 +517,8 @@ def start_veto_session(
     if not session or not match:
         return False, "Сессия veto недоступна для этого матча."
     match_payload = dict(match)
+    if match_payload.get("status") != "pending" or (match_payload.get("result_type") or "regular") == "technical":
+        return False, "Матч уже завершен."
     due_reached = _match_due(match_payload)
     is_system_start = started_by_kind == START_KIND_SYSTEM
     if not due_reached and is_system_start:
@@ -650,7 +657,7 @@ def perform_veto_action(bracket_match_id: int, actor_telegram_id: int, map_key: 
     if not actor:
         return False, "Пользователь не найден."
 
-    if not is_captain(actor["id"], session["current_team_id"]):
+    if not is_tournament_captain(actor_telegram_id, session["tournament_id"], session["current_team_id"]):
         return False, "Сейчас ход другого капитана."
 
     normalized_key = (map_key or "").strip()
@@ -722,6 +729,7 @@ def cancel_veto_session(bracket_match_id: int, actor_telegram_id: int | None = N
             current_team_id=NULL,
             current_action_type=NULL,
             cancelled_at=CURRENT_TIMESTAMP,
+            auto_start_consumed=1,
             updated_at=CURRENT_TIMESTAMP
         WHERE bracket_match_id=?
     """, (STATUS_CANCELLED, bracket_match_id))
@@ -742,6 +750,8 @@ def reset_veto_session(bracket_match_id: int, actor_telegram_id: int | None = No
     match = get_bracket_match_by_id(bracket_match_id)
     if not session or not match:
         return False, "Сессия не найдена."
+    if match["status"] != "pending" or (match["result_type"] or "regular") == "technical":
+        return False, "Нельзя сбросить pick/ban для завершенного матча."
     if has_match_results_for_bracket_match(bracket_match_id):
         return False, "Нельзя сбросить pick/ban после сохранения результатов по картам."
 
@@ -776,6 +786,37 @@ def reset_veto_session(bracket_match_id: int, actor_telegram_id: int | None = No
             team_id, map_key, map_name
         )
         VALUES (?, 0, 'reset', ?, 'admin', NULL, NULL, NULL)
+    """, (session["id"], actor["id"] if actor else None))
+    conn.commit()
+    conn.close()
+    return True, None
+
+
+def close_veto_for_technical_result(bracket_match_id: int, actor_telegram_id: int | None = None) -> tuple[bool, str | None]:
+    session = _fetch_session(bracket_match_id)
+    if not session:
+        return True, None
+
+    actor = get_user(actor_telegram_id) if actor_telegram_id else None
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE match_veto_sessions
+        SET status=CASE WHEN status = ? THEN ? ELSE ? END,
+            current_step_index=NULL,
+            current_team_id=NULL,
+            current_action_type=NULL,
+            cancelled_at=CASE WHEN status = ? THEN cancelled_at ELSE CURRENT_TIMESTAMP END,
+            auto_start_consumed=1,
+            updated_at=CURRENT_TIMESTAMP
+        WHERE bracket_match_id=?
+    """, (STATUS_COMPLETED, STATUS_COMPLETED, STATUS_CANCELLED, STATUS_COMPLETED, bracket_match_id))
+    cur.execute("""
+        INSERT INTO match_veto_actions (
+            session_id, step_index, action_type, actor_user_id, actor_role,
+            team_id, map_key, map_name
+        )
+        VALUES (?, 0, 'technical_result', ?, 'admin', NULL, NULL, NULL)
     """, (session["id"], actor["id"] if actor else None))
     conn.commit()
     conn.close()
@@ -829,10 +870,10 @@ def _manager_chat_ids_for_tournament(tournament_id: int) -> list[int]:
     return list(chat_ids)
 
 
-def _captain_chat_ids(team1_id: int | None, team2_id: int | None) -> list[int]:
+def _captain_chat_ids(tournament_id: int | None, team1_id: int | None, team2_id: int | None) -> list[int]:
     chat_ids: set[int] = set()
     for team_id in (team1_id, team2_id):
-        captain_id = _team_captain_id(team_id)
+        captain_id = _team_captain_id(tournament_id, team_id)
         if not captain_id:
             continue
         user = get_user_by_id(captain_id)
@@ -841,12 +882,13 @@ def _captain_chat_ids(team1_id: int | None, team2_id: int | None) -> list[int]:
     return list(chat_ids)
 
 
-def _all_team_member_chat_ids(team1_id: int | None, team2_id: int | None) -> list[int]:
+def _all_team_member_chat_ids(tournament_id: int | None, team1_id: int | None, team2_id: int | None) -> list[int]:
     chat_ids: set[int] = set()
     for team_id in (team1_id, team2_id):
         if not team_id:
             continue
-        for player in get_team_members(team_id):
+        players = get_tournament_team_members(tournament_id, team_id) if tournament_id else get_team_members(team_id)
+        for player in players:
             telegram_id = player.get("telegram_id") if isinstance(player, dict) else (player["telegram_id"] if "telegram_id" in player.keys() else None)
             if telegram_id:
                 chat_ids.add(int(telegram_id))
@@ -859,9 +901,9 @@ def get_veto_viewer_context(viewer_telegram_id: int, details: dict[str, Any]) ->
     user = get_user(viewer_telegram_id)
     if not user:
         return is_manager, None
-    if match.get("team1_id") and is_captain(user["id"], match["team1_id"]):
+    if match.get("team1_id") and is_tournament_captain(viewer_telegram_id, match["tournament_id"], match["team1_id"]):
         return is_manager, match["team1_id"]
-    if match.get("team2_id") and is_captain(user["id"], match["team2_id"]):
+    if match.get("team2_id") and is_tournament_captain(viewer_telegram_id, match["tournament_id"], match["team2_id"]):
         return is_manager, match["team2_id"]
     return is_manager, None
 
@@ -874,6 +916,27 @@ def format_veto_text(summary: dict[str, Any]) -> str:
     available = summary["available_rows"]
     banned = summary["banned"]
     picks = summary["picks"]
+
+    if (match.get("result_type") or "regular") == "technical":
+        loser_name = match.get("team1_name") if match.get("technical_loser_id") == match.get("team1_id") else match.get("team2_name")
+        lines = [
+            "Map pick / ban",
+            "",
+            f"Турнир: {match.get('tournament_name') or 'Турнир'}",
+            f"Раунд: {match.get('round_name') or match.get('round_number') or '-'}",
+            f"Матч: {match.get('team1_name') or 'Команда 1'} vs {match.get('team2_name') or 'Команда 2'}",
+            "Статус матча: тех.поражение",
+            f"Проигравшая сторона: {loser_name or '—'}",
+        ]
+        reason = (match.get("technical_reason") or "").strip()
+        if reason:
+            lines.append(f"Причина: {reason}")
+        if maps:
+            lines.extend(["", "Определенные карты до тех.поражения:"])
+            for row in maps:
+                suffix = " (decider)" if row["selection_type"] == "decider" else " (pick)"
+                lines.append(f"{row['map_order']}. {row['map_name']}{suffix}")
+        return "\n".join(lines)
 
     lines = [
         "Map pick / ban",
@@ -921,6 +984,13 @@ def build_veto_keyboard_for_user(viewer_telegram_id: int, summary: dict[str, Any
     session = details.get("session")
     is_manager, captain_team_id = get_veto_viewer_context(viewer_telegram_id, details)
     builder = InlineKeyboardBuilder()
+
+    if (match.get("result_type") or "regular") == "technical":
+        builder.button(text="Обновить", callback_data=f"veto_open_{match['id']}")
+        if is_manager:
+            builder.button(text="К матчу", callback_data=f"bracket_match_{match['id']}_{match['tournament_id']}")
+        builder.adjust(1)
+        return builder.as_markup()
 
     if session and session.get("status") in {STATUS_NOT_READY, STATUS_READY} and is_manager:
         builder.button(text="Запустить пик карт", callback_data=f"veto_admin_start_panel_{match['id']}")
@@ -1068,7 +1138,7 @@ async def notify_veto_completed(bot: Bot, bracket_match_id: int):
     if not text or not details:
         return
     match = details["match"]
-    chat_ids = set(_all_team_member_chat_ids(match.get("team1_id"), match.get("team2_id")))
+    chat_ids = set(_all_team_member_chat_ids(match.get("tournament_id"), match.get("team1_id"), match.get("team2_id")))
     chat_ids.update(_manager_chat_ids_for_tournament(match["tournament_id"]))
     await _safe_send(bot, list(chat_ids), text)
 
@@ -1104,7 +1174,7 @@ async def notify_captains_veto_started(bot: Bot, bracket_match_id: int):
     if not details or not details.get("session"):
         return
     session = details["session"]
-    chat_ids = _captain_chat_ids(session["team1_id"], session["team2_id"])
+    chat_ids = _captain_chat_ids(session["tournament_id"], session["team1_id"], session["team2_id"])
     if not chat_ids:
         return
     for chat_id in chat_ids:

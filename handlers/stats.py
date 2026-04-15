@@ -209,9 +209,10 @@ async def show_player_history_page(callback: CallbackQuery, sport: str, offset: 
         team2 = match["team2_name"] or "Команда 2"
         score1 = _safe_series_score(match["score1"])
         score2 = _safe_series_score(match["score2"])
+        prefix = "🚫" if (match["result_type"] or "regular") == "technical" else icon
 
         builder.button(
-            text=f"{icon} {tournament} | {team1} {score1}:{score2} {team2}",
+            text=f"{prefix} {tournament} | {team1} {score1}:{score2} {team2}",
             callback_data=_history_match_callback(sport, source, match["match_id"], offset),
         )
 
@@ -249,6 +250,25 @@ async def show_match_history_card(callback: CallbackQuery, sport: str, source: s
     score1 = _safe_series_score(details.get("score1"))
     score2 = _safe_series_score(details.get("score2"))
     tournament_name = details.get("tournament_name") or "Турнир"
+
+    if details.get("is_technical_result"):
+        loser_name = team1_name if details.get("technical_loser_id") == details.get("team1_id") else team2_name
+        winner_name = team2_name if details.get("technical_loser_id") == details.get("team1_id") else team1_name
+        reason = (details.get("technical_reason") or "").strip()
+        text = (
+            f"🏆 {tournament_name}\n"
+            f"🚫 Тех.поражение\n"
+            f"📊 Счет матча: {team1_name} {score1}:{score2} {team2_name}\n"
+            f"🏆 Победитель: {winner_name}\n"
+            f"❌ Проигравшая сторона: {loser_name}\n"
+        )
+        if reason:
+            text += f"\n📝 Причина: {reason}\n"
+        builder = InlineKeyboardBuilder()
+        builder.button(text="🔙 К списку", callback_data=_history_page_callback(sport, return_offset))
+        builder.adjust(1)
+        await callback.message.edit_text(text, reply_markup=builder.as_markup())
+        return
 
     if sport == "CS2":
         maps = details.get("maps", [])
@@ -485,4 +505,3 @@ async def history_map_compat(callback: CallbackQuery):
         await callback.answer("Ошибка переключения карты", show_alert=True)
         return
     await show_match_history_card(callback, "CS2", source, match_id, return_offset, map_index=map_index)
-
