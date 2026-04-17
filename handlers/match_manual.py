@@ -4,6 +4,7 @@
 """
 from datetime import datetime, timezone
 import os
+from typing import Any
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -32,6 +33,13 @@ from razryad_arena_utils import (
 from utils.bracket_utils import advance_winner
 from utils.bracket_visualizer import generate_bracket_png
 from utils.cs2_maps import CS2_MAPS, get_cs2_map_name
+from utils.demo_import import (
+    DemoImportError,
+    auto_match_demo_players,
+    finalize_demo_import_payload,
+    is_demo_source_message,
+    parse_demo_source_message,
+)
 from utils.notifications import notify_bracket_match_result
 from utils.site_sync import request_site_sync
 from utils.veto_service import close_veto_for_technical_result, get_completed_series_maps_for_match, get_match_veto_details, refresh_veto_messages
@@ -92,6 +100,46 @@ def _summary_keyboard(tournament_id: int):
 def _save_keyboard(tournament_id: int):
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Сохранить карту", callback_data="manual_save_stats")
+    builder.button(text="❌ Отмена", callback_data=f"view_bracket_{tournament_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def _input_method_keyboard(tournament_id: int):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📥/🔗 Импорт из демки", callback_data="manual_method_demo")
+    builder.button(text="✍️ Вручную", callback_data="manual_method_manual")
+    builder.button(text="❌ Отмена", callback_data=f"view_bracket_{tournament_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def _demo_confirm_keyboard(tournament_id: int, overwrite_required: bool = False):
+    builder = InlineKeyboardBuilder()
+    if overwrite_required:
+        builder.button(text="♻️ Подтвердить перезапись карты", callback_data="manual_demo_confirm")
+    else:
+        builder.button(text="✅ Импортировать карту", callback_data="manual_demo_confirm")
+    builder.button(text="❌ Отмена", callback_data=f"view_bracket_{tournament_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def _demo_mapping_keyboard(
+    tournament_id: int,
+    candidates: list[dict[str, Any]],
+    team1_id: int,
+    team1_name: str,
+    team2_name: str,
+):
+    builder = InlineKeyboardBuilder()
+    for player in candidates:
+        team_name = team1_name if int(player["team_id"]) == int(team1_id) else team2_name
+        username = f"@{player['username']}" if player.get("username") else "без_username"
+        builder.button(
+            text=f"{player.get('first_name') or 'Игрок'} ({team_name}) {username}",
+            callback_data=f"manual_demo_map_{int(player['id'])}",
+        )
     builder.button(text="❌ Отмена", callback_data=f"view_bracket_{tournament_id}")
     builder.adjust(1)
     return builder.as_markup()
@@ -165,11 +213,504 @@ def _fetch_players(team1_id: int, team2_id: int, tournament_id: int | None = Non
     return rows
 
 
+def _fetch_saved_map_results(match_id: int) -> list[dict]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT map_number, map_name, team1_score, team2_score, winner_id
+        FROM match_map_results
+        WHERE match_source='bracket' AND match_id=?
+        ORDER BY map_number
+        """,
+        (match_id,),
+    )
+    rows = [dict(row) for row in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def _normalize_map_compare(name: str | None) -> str:
+    return "".join(ch for ch in str(name or "").strip().lower() if ch.isalnum())
+
+
+def _build_cs2_series_state(saved_map_results: list[dict], team1_id: int) -> dict[str, Any]:
+    team1_wins = 0
+    team2_wins = 0
+    max_map_number = 0
+    for row in saved_map_results:
+        map_number = int(row.get("map_number") or 0)
+        max_map_number = max(max_map_number, map_number)
+        if int(row.get("winner_id") or 0) == int(team1_id):
+            team1_wins += 1
+        else:
+            team2_wins += 1
+    return {
+        "team1_wins": team1_wins,
+        "team2_wins": team2_wins,
+        "current_map_number": max_map_number + 1 if max_map_number else 1,
+        "map_results": saved_map_results,
+        "existing_map_numbers": [int(row.get("map_number") or 0) for row in saved_map_results],
+    }
+
+
+def _build_cs2_format_keyboard(tournament_id: int):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="BO1", callback_data="manual_format_bo1")
+    builder.button(text="BO3", callback_data="manual_format_bo3")
+    builder.button(text="BO5", callback_data="manual_format_bo5")
+    builder.button(text="❌ Отмена", callback_data=f"view_bracket_{tournament_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
 def _get_steam_label(steam_id: str | None) -> str:
     if not steam_id:
         return "Steam: ❌"
     profile_name = get_steam_profile_name(steam_id)
     return f"Steam: {profile_name}" if profile_name else "Steam: [профиль]"
+
+
+async def _prompt_cs2_format_selection(target: Message | CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await state.set_state(ManualMatchInput.format)
+    text = (
+        "✏️ Ввод результата\n\n"
+        f"🔵 {data.get('team1_name')} vs 🔴 {data.get('team2_name')}\n"
+        f"📌 Раунд: {data.get('round_name')}\n\n"
+        "Выберите формат:"
+    )
+    if isinstance(target, CallbackQuery):
+        await target.message.answer(text, reply_markup=_build_cs2_format_keyboard(data.get("tournament_id")))
+    else:
+        await target.answer(text, reply_markup=_build_cs2_format_keyboard(data.get("tournament_id")))
+
+
+async def _show_cs2_input_method(target: Message | CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    maps_text = ""
+    if data.get("map_results"):
+        lines = [
+            f"{row['map_number']}. {row.get('map_name') or 'Карта'} - {row.get('team1_score', 0)}:{row.get('team2_score', 0)}"
+            for row in data.get("map_results", [])
+        ]
+        maps_text = "\n\nУже сохранены карты:\n" + "\n".join(lines)
+
+    format_text = f"\n📊 Формат: {data.get('match_format')}" if data.get("match_format") else ""
+    text = (
+        "✏️ Ввод результата\n\n"
+        f"🔵 {data.get('team1_name')} vs 🔴 {data.get('team2_name')}\n"
+        f"📌 Раунд: {data.get('round_name')}{format_text}\n"
+        f"📈 Текущий счет серии: {data.get('team1_wins', 0)}:{data.get('team2_wins', 0)}\n"
+        f"🗺 Следующая карта: {data.get('current_map_number', 1)}"
+        f"{maps_text}\n\n"
+        "Выберите способ ввода:"
+    )
+    await state.set_state(ManualMatchInput.input_method)
+    if isinstance(target, CallbackQuery):
+        await target.message.answer(text, reply_markup=_input_method_keyboard(data.get("tournament_id")))
+    else:
+        await target.answer(text, reply_markup=_input_method_keyboard(data.get("tournament_id")))
+
+
+async def _start_cs2_manual_flow(target: Message | CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    predefined_maps = data.get("predefined_maps") or []
+    if predefined_maps:
+        maps_text = "\n".join(f"{row['map_order']}. {row['map_name']}" for row in predefined_maps)
+        prompt = (
+            "✏️ Ввод результата\n\n"
+            f"🔵 {data.get('team1_name')} vs 🔴 {data.get('team2_name')}\n"
+            f"📌 Раунд: {data.get('round_name')}\n"
+            f"📊 Формат: {data.get('match_format')}\n\n"
+            "Карты уже определены через pick/ban:\n"
+            f"{maps_text}"
+        )
+        if isinstance(target, CallbackQuery):
+            await target.message.answer(prompt)
+        else:
+            await target.answer(prompt)
+        await _show_map_selection(target, state)
+        return
+
+    if data.get("total_maps"):
+        prompt = (
+            "✏️ Ввод результата\n\n"
+            f"🔵 {data.get('team1_name')} vs 🔴 {data.get('team2_name')}\n"
+            f"📌 Раунд: {data.get('round_name')}\n"
+            f"📊 Формат: {data.get('match_format')}\n\n"
+            "Выберите карту:"
+        )
+        if isinstance(target, CallbackQuery):
+            await target.message.answer(prompt)
+        else:
+            await target.answer(prompt)
+        await _show_map_selection(target, state)
+        return
+
+    await _prompt_cs2_format_selection(target, state)
+
+
+async def _show_demo_input_prompt(target: Message | CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    text = (
+        "📥 Импорт из демки\n\n"
+        "Отправьте одним сообщением:\n"
+        "• .dem или .zip файлом\n"
+        "• либо публичную ссылку на .dem/.zip\n\n"
+        "После этого бот автоматически сопоставит игроков по SteamID, а несовпавших предложит связать вручную."
+    )
+    await state.set_state(ManualMatchInput.demo_input)
+    if isinstance(target, CallbackQuery):
+        await target.message.answer(text, reply_markup=_cancel_keyboard(data.get("tournament_id")))
+    else:
+        await target.answer(text, reply_markup=_cancel_keyboard(data.get("tournament_id")))
+
+
+def _infer_demo_team_target_id(
+    demo_players: list[dict[str, Any]],
+    expected_players: list[dict[str, Any]],
+    mappings: dict[str, int],
+    team_index: int,
+) -> int | None:
+    expected_by_id = {int(player["id"]): dict(player) for player in expected_players}
+    team_ids = {
+        int(expected_by_id[mappings[player["steamid"]]]["team_id"])
+        for player in demo_players
+        if player["team_index"] == team_index
+        and player.get("steamid") in mappings
+        and mappings[player["steamid"]] in expected_by_id
+    }
+    if len(team_ids) == 1:
+        return team_ids.pop()
+    return None
+
+
+def _build_demo_candidates(
+    demo_player: dict[str, Any],
+    expected_players: list[dict[str, Any]],
+    mappings: dict[str, int],
+    team1_id: int,
+    team2_id: int,
+    demo_players: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    used_user_ids = {int(user_id) for user_id in mappings.values()}
+    inferred_team_id = _infer_demo_team_target_id(
+        demo_players,
+        expected_players,
+        mappings,
+        int(demo_player["team_index"]),
+    )
+    candidates: list[dict[str, Any]] = []
+    for player in expected_players:
+        player_id = int(player["id"])
+        player_team_id = int(player["team_id"])
+        if player_id in used_user_ids:
+            continue
+        if player_team_id not in {int(team1_id), int(team2_id)}:
+            continue
+        if inferred_team_id is not None and player_team_id != int(inferred_team_id):
+            continue
+        candidates.append(dict(player))
+    return candidates
+
+
+async def _show_demo_mapping_prompt(target: Message | CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    unresolved = data.get("demo_unresolved_players") or []
+    mapping_index = int(data.get("demo_mapping_index") or 0)
+    if mapping_index >= len(unresolved):
+        await _show_demo_preview(target, state)
+        return
+
+    current_player = unresolved[mapping_index]
+    expected_players = data.get("demo_expected_players") or []
+    mappings = data.get("demo_mappings") or {}
+    candidates = _build_demo_candidates(
+        current_player,
+        expected_players,
+        mappings,
+        data.get("team1_id"),
+        data.get("team2_id"),
+        data.get("demo_players") or [],
+    )
+    if not candidates:
+        text = "❌ Не осталось доступных игроков для сопоставления. Отмените импорт и попробуйте снова."
+        if isinstance(target, CallbackQuery):
+            await target.message.answer(text, reply_markup=_cancel_keyboard(data.get("tournament_id")))
+        else:
+            await target.answer(text, reply_markup=_cancel_keyboard(data.get("tournament_id")))
+        return
+
+    text = (
+        f"🔗 Ручное сопоставление {mapping_index + 1}/{len(unresolved)}\n\n"
+        f"Игрок из демки: {current_player.get('name')}\n"
+        f"SteamID: {current_player.get('steamid')}\n"
+        f"Команда в демке: {current_player.get('team_name')}\n\n"
+        "Выберите игрока матча:"
+    )
+    await state.set_state(ManualMatchInput.demo_mapping)
+    if isinstance(target, CallbackQuery):
+        await target.message.answer(
+            text,
+            reply_markup=_demo_mapping_keyboard(
+                data.get("tournament_id"),
+                candidates,
+                data.get("team1_id"),
+                data.get("team1_name"),
+                data.get("team2_name"),
+            ),
+        )
+    else:
+        await target.answer(
+            text,
+            reply_markup=_demo_mapping_keyboard(
+                data.get("tournament_id"),
+                candidates,
+                data.get("team1_id"),
+                data.get("team1_name"),
+                data.get("team2_name"),
+            ),
+        )
+
+
+def _build_demo_preview_text(data: dict[str, Any], payload: dict[str, Any]) -> str:
+    lines = [
+        "📥 Предпросмотр импорта демки",
+        "",
+        f"Источник: {data.get('demo_source_label')}",
+        f"Карта: {payload.get('map_name')}",
+        f"Счет карты: {data.get('team1_name')} {payload.get('team1_score')} : {payload.get('team2_score')} {data.get('team2_name')}",
+        f"Карта серии: {data.get('current_map_number', 1)}/{data.get('total_maps', 1)}",
+        "",
+        "Сопоставленные игроки:",
+    ]
+    for stat in sorted(payload.get("player_stats", []), key=lambda item: (item["team_id"], -(item["kills"] or 0), item.get("user_name") or "")):
+        team_name = data.get("team1_name") if int(stat["team_id"]) == int(data.get("team1_id")) else data.get("team2_name")
+        username = f"@{stat['username']}" if stat.get("username") else "без_username"
+        lines.append(
+            f"• {stat.get('demo_name')} [{stat.get('steamid')}] → {stat.get('user_name')} ({team_name}, {username})"
+        )
+    if data.get("demo_overwrite_required"):
+        lines.extend(["", "⚠️ Для этой карты уже есть сохраненные данные. Они будут перезаписаны."])
+    return "\n".join(lines)
+
+
+async def _show_demo_preview(target: Message | CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    try:
+        payload = finalize_demo_import_payload(
+            data.get("demo_parsed_result") or {},
+            data.get("demo_expected_players") or [],
+            data.get("demo_mappings") or {},
+            int(data.get("team1_id") or 0),
+            int(data.get("team2_id") or 0),
+        )
+    except DemoImportError as exc:
+        if isinstance(target, CallbackQuery):
+            await target.message.answer(f"❌ {exc}", reply_markup=_cancel_keyboard(data.get("tournament_id")))
+        else:
+            await target.answer(f"❌ {exc}", reply_markup=_cancel_keyboard(data.get("tournament_id")))
+        return
+
+    expected_maps = data.get("predefined_maps") or []
+    map_number = int(data.get("current_map_number") or 1)
+    if expected_maps and 1 <= map_number <= len(expected_maps):
+        expected_name = expected_maps[map_number - 1]["map_name"]
+        if _normalize_map_compare(payload["map_name"]) != _normalize_map_compare(expected_name):
+            text = (
+                "❌ Карта из демки не совпадает с ожидаемой картой серии.\n\n"
+                f"Ожидается: {expected_name}\n"
+                f"В демке: {payload['map_name']}"
+            )
+            if isinstance(target, CallbackQuery):
+                await target.message.answer(text, reply_markup=_cancel_keyboard(data.get("tournament_id")))
+            else:
+                await target.answer(text, reply_markup=_cancel_keyboard(data.get("tournament_id")))
+            return
+
+    overwrite_required = map_number in set(data.get("existing_map_numbers") or [])
+    await state.update_data(
+        current_map=payload["map_name"],
+        team1_score=payload["team1_score"],
+        team2_score=payload["team2_score"],
+        player_stats_list=payload["player_stats"],
+        demo_ready_payload=payload,
+        demo_overwrite_required=overwrite_required,
+    )
+    await state.set_state(ManualMatchInput.demo_confirm)
+    if isinstance(target, CallbackQuery):
+        await target.message.answer(
+            _build_demo_preview_text(await state.get_data(), payload),
+            reply_markup=_demo_confirm_keyboard(data.get("tournament_id"), overwrite_required),
+        )
+    else:
+        await target.answer(
+            _build_demo_preview_text(await state.get_data(), payload),
+            reply_markup=_demo_confirm_keyboard(data.get("tournament_id"), overwrite_required),
+        )
+
+
+def _save_cs2_map_stats(
+    match_id: int,
+    map_number: int,
+    map_name: str,
+    team1_score: int,
+    team2_score: int,
+    team1_id: int,
+    team2_id: int,
+    players_stats: list[dict[str, Any]],
+) -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM player_match_stats WHERE match_source='bracket' AND match_id=? AND map_number=?",
+        (match_id, map_number),
+    )
+    for p in players_stats:
+        cur.execute(
+            """
+            INSERT OR REPLACE INTO player_match_stats
+            (match_id, match_source, user_id, team_id, kills, deaths, assists, adr, hs, rating_3_0, mvps, map_name, map_number)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                match_id,
+                "bracket",
+                p["user_id"],
+                p["team_id"],
+                p["kills"],
+                p["deaths"],
+                p["assists"],
+                p.get("adr", 0),
+                p.get("hs", 0),
+                0.0,
+                0,
+                map_name,
+                map_number,
+            ),
+        )
+
+    winner_id = _winner_from_score(team1_score, team2_score, team1_id, team2_id)
+    cur.execute(
+        """
+        INSERT INTO match_map_results
+        (match_source, match_id, map_number, map_name, team1_score, team2_score, winner_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(match_source, match_id, map_number) DO UPDATE SET
+            map_name=excluded.map_name,
+            team1_score=excluded.team1_score,
+            team2_score=excluded.team2_score,
+            winner_id=excluded.winner_id,
+            updated_at=CURRENT_TIMESTAMP
+        """,
+        (
+            "bracket",
+            match_id,
+            map_number,
+            map_name,
+            team1_score,
+            team2_score,
+            winner_id,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return winner_id
+
+
+async def _after_cs2_map_saved(
+    callback: CallbackQuery,
+    state: FSMContext,
+    map_name: str,
+    team1_score: int,
+    team2_score: int,
+    players_stats: list[dict[str, Any]],
+) -> bool:
+    data = await state.get_data()
+    match_id = data.get("bracket_match_id")
+    map_number = int(data.get("current_map_number", 1))
+    team1_id = data.get("team1_id")
+    team2_id = data.get("team2_id")
+    winner_id = _save_cs2_map_stats(
+        match_id,
+        map_number,
+        map_name,
+        team1_score,
+        team2_score,
+        team1_id,
+        team2_id,
+        players_stats,
+    )
+
+    team1_wins = int(data.get("team1_wins", 0))
+    team2_wins = int(data.get("team2_wins", 0))
+    if winner_id == team1_id:
+        team1_wins += 1
+    else:
+        team2_wins += 1
+
+    map_results = [row for row in list(data.get("map_results", [])) if int(row.get("map_number") or 0) != map_number]
+    map_results.append(
+        {
+            "map_number": map_number,
+            "map_name": map_name,
+            "team1_score": team1_score,
+            "team2_score": team2_score,
+            "winner_id": winner_id,
+        }
+    )
+    map_results.sort(key=lambda item: int(item.get("map_number") or 0))
+
+    maps_to_win = int(data.get("maps_to_win", 1) or 1)
+    total_maps = int(data.get("total_maps", 1) or 1)
+    existing_map_numbers = sorted({int(num) for num in (data.get("existing_map_numbers") or [])} | {map_number})
+
+    await state.update_data(
+        team1_wins=team1_wins,
+        team2_wins=team2_wins,
+        map_results=map_results,
+        existing_map_numbers=existing_map_numbers,
+    )
+
+    if team1_wins >= maps_to_win or team2_wins >= maps_to_win or map_number >= total_maps:
+        await _finalize_series(callback, state)
+        return True
+
+    await state.update_data(
+        current_map_number=map_number + 1,
+        current_map=None,
+        team1_score=0,
+        team2_score=0,
+        all_players=[],
+        player_stats_list=[],
+        current_player=None,
+        current_player_index=0,
+        demo_ready_payload=None,
+        demo_source_label=None,
+        demo_overwrite_required=False,
+        demo_parsed_result=None,
+        demo_expected_players=[],
+        demo_players=[],
+        demo_mappings={},
+        demo_unresolved_players=[],
+        demo_mapping_index=0,
+    )
+
+    text = (
+        f"✅ Карта {map_number} сохранена.\n\n"
+        f"Текущий счет серии:\n"
+        f"🔵 {data.get('team1_name')}: {team1_wins}\n"
+        f"🔴 {data.get('team2_name')}: {team2_wins}\n\n"
+        f"Нужно побед: {maps_to_win}"
+    )
+    await callback.message.answer(text)
+    next_data = await state.get_data()
+    if next_data.get("input_mode") == "demo":
+        await _show_cs2_input_method(callback, state)
+    else:
+        await _show_map_selection(callback, state)
+    return False
 
 
 async def _prompt_map_score_input(target: Message | CallbackQuery, state: FSMContext, map_name: str):
@@ -392,6 +933,8 @@ async def start_manual_input_by_match(callback: CallbackQuery, state: FSMContext
     sport_mode = normalize_sport_name(tournament["sport"]) if tournament else "CS2"
     veto_series_maps = get_completed_series_maps_for_match(match_id) if sport_mode == "CS2" else []
     effective_match_format = resolve_bracket_match_format(match_id).upper() if sport_mode == "CS2" else None
+    saved_map_results = _fetch_saved_map_results(match_id) if sport_mode == "CS2" else []
+    series_state = _build_cs2_series_state(saved_map_results, match["team1_id"]) if sport_mode == "CS2" else {}
 
     await state.update_data(
         bracket_match_id=match_id,
@@ -400,11 +943,14 @@ async def start_manual_input_by_match(callback: CallbackQuery, state: FSMContext
         team2_id=match["team2_id"],
         team1_name=match["team1_name"],
         team2_name=match["team2_name"],
+        round_name=match["round_name"],
         sport_mode=sport_mode,
-        team1_wins=0,
-        team2_wins=0,
-        current_map_number=1,
-        map_results=[],
+        input_mode=None,
+        team1_wins=series_state.get("team1_wins", 0),
+        team2_wins=series_state.get("team2_wins", 0),
+        current_map_number=series_state.get("current_map_number", 1),
+        map_results=series_state.get("map_results", []),
+        existing_map_numbers=series_state.get("existing_map_numbers", []),
         predefined_maps=veto_series_maps,
         match_format=effective_match_format,
     )
@@ -430,22 +976,8 @@ async def start_manual_input_by_match(callback: CallbackQuery, state: FSMContext
             match_format=format_label,
             total_maps=total_maps,
             maps_to_win=_series_required_wins(total_maps),
-            current_map_number=1,
-            map_results=[],
         )
-        maps_text = "\n".join(
-            f"{row['map_order']}. {row['map_name']}"
-            for row in veto_series_maps
-        )
-        await callback.message.answer(
-            "✏️ Ввод результата\n\n"
-            f"🔵 {match['team1_name']} vs 🔴 {match['team2_name']}\n"
-            f"📌 Раунд: {match['round_name']}\n"
-            f"📊 Формат: {format_label}\n\n"
-            "Карты уже определены через pick/ban:\n"
-            f"{maps_text}"
-        )
-        await _show_map_selection(callback, state)
+        await _show_cs2_input_method(callback, state)
         await callback.answer()
         return
 
@@ -455,36 +987,12 @@ async def start_manual_input_by_match(callback: CallbackQuery, state: FSMContext
             match_format=effective_match_format,
             total_maps=total_maps,
             maps_to_win=_series_required_wins(total_maps),
-            current_map_number=1,
-            map_results=[],
         )
-        await callback.message.answer(
-            "✏️ Ввод результата\n\n"
-            f"🔵 {match['team1_name']} vs 🔴 {match['team2_name']}\n"
-            f"📌 Раунд: {match['round_name']}\n"
-            f"📊 Формат: {effective_match_format}\n\n"
-            "Выберите карту:"
-        )
-        await _show_map_selection(callback, state)
+        await _show_cs2_input_method(callback, state)
         await callback.answer()
         return
 
-    text = (
-        "✏️ Ввод результата\n\n"
-        f"🔵 {match['team1_name']} vs 🔴 {match['team2_name']}\n"
-        f"📌 Раунд: {match['round_name']}\n\n"
-        "Выберите формат:"
-    )
-
-    builder = InlineKeyboardBuilder()
-    builder.button(text="BO1", callback_data="manual_format_bo1")
-    builder.button(text="BO3", callback_data="manual_format_bo3")
-    builder.button(text="BO5", callback_data="manual_format_bo5")
-    builder.button(text="❌ Отмена", callback_data=f"view_bracket_{tournament_id}")
-    builder.adjust(1)
-
-    await state.set_state(ManualMatchInput.format)
-    await callback.message.answer(text, reply_markup=builder.as_markup())
+    await _show_cs2_input_method(callback, state)
     await callback.answer()
 
 
@@ -497,6 +1005,24 @@ async def start_manual_input(callback: CallbackQuery, state: FSMContext):
         return
     tournament_id = int(parts[4]) if len(parts) > 4 else None
     await start_manual_input_by_match(callback, state, match_id, tournament_id)
+
+
+@router.callback_query(ManualMatchInput.input_method, F.data == "manual_method_manual")
+async def choose_manual_method(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(input_mode="manual")
+    await _start_cs2_manual_flow(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(ManualMatchInput.input_method, F.data == "manual_method_demo")
+async def choose_demo_method(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(input_mode="demo")
+    data = await state.get_data()
+    if not data.get("total_maps"):
+        await _prompt_cs2_format_selection(callback, state)
+    else:
+        await _show_demo_input_prompt(callback, state)
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("manual_match_technical_"))
@@ -701,16 +1227,16 @@ async def confirm_technical_result(callback: CallbackQuery, state: FSMContext):
 async def select_format(callback: CallbackQuery, state: FSMContext):
     format_choice = callback.data.split("_")[2]
     total_maps = int(format_choice[2])
+    data = await state.get_data()
     await state.update_data(
         match_format=format_choice.upper(),
         total_maps=total_maps,
         maps_to_win=_series_required_wins(total_maps),
-        team1_wins=0,
-        team2_wins=0,
-        current_map_number=1,
-        map_results=[],
     )
-    await _show_map_selection(callback, state)
+    if data.get("input_mode") == "demo":
+        await _show_demo_input_prompt(callback, state)
+    else:
+        await _show_map_selection(callback, state)
     await callback.answer()
 
 
@@ -747,6 +1273,105 @@ async def input_custom_map_name(message: Message, state: FSMContext):
         return
 
     await _prompt_map_score_input(message, state, map_name)
+
+
+@router.message(ManualMatchInput.demo_input)
+async def input_demo_source(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text and _is_cancel(text):
+        await state.clear()
+        await message.answer("❌ Отменено")
+        return
+    if not is_demo_source_message(message):
+        await message.answer(
+            "❌ Отправьте .dem/.zip файлом или публичную ссылку на .dem/.zip.",
+            reply_markup=_cancel_keyboard((await state.get_data()).get("tournament_id")),
+        )
+        return
+
+    data = await state.get_data()
+    if not data.get("total_maps"):
+        await message.answer("❌ Сначала выберите формат серии.")
+        return
+    if int(data.get("current_map_number") or 1) > int(data.get("total_maps") or 1):
+        await message.answer("❌ Все карты серии уже заполнены.")
+        return
+
+    await message.answer("⏳ Обрабатываю демку, это может занять немного времени...")
+    try:
+        demo_result = await parse_demo_source_message(message.bot, message)
+    except DemoImportError as exc:
+        await message.answer(f"❌ {exc}", reply_markup=_cancel_keyboard(data.get("tournament_id")))
+        return
+
+    expected_players = _fetch_players(data.get("team1_id"), data.get("team2_id"), data.get("tournament_id"))
+    if not expected_players:
+        await message.answer("❌ Не удалось получить составы команд для сопоставления.")
+        return
+
+    try:
+        mapping_result = auto_match_demo_players(demo_result["parsed_result"], expected_players)
+    except DemoImportError as exc:
+        await message.answer(f"❌ {exc}", reply_markup=_cancel_keyboard(data.get("tournament_id")))
+        return
+
+    await state.update_data(
+        demo_source_label=demo_result["source_label"],
+        demo_parsed_result=demo_result["parsed_result"],
+        demo_expected_players=mapping_result["expected_players"],
+        demo_players=mapping_result["demo_players"],
+        demo_mappings=mapping_result["mappings"],
+        demo_unresolved_players=mapping_result["unresolved"],
+        demo_mapping_index=0,
+        demo_ready_payload=None,
+        demo_overwrite_required=False,
+    )
+
+    if mapping_result["unresolved"]:
+        await _show_demo_mapping_prompt(message, state)
+        return
+    await _show_demo_preview(message, state)
+
+
+@router.callback_query(ManualMatchInput.demo_mapping, F.data.startswith("manual_demo_map_"))
+async def map_demo_player(callback: CallbackQuery, state: FSMContext):
+    user_id = int(callback.data.rsplit("_", 1)[1])
+    data = await state.get_data()
+    unresolved = data.get("demo_unresolved_players") or []
+    mapping_index = int(data.get("demo_mapping_index") or 0)
+    if mapping_index >= len(unresolved):
+        await _show_demo_preview(callback, state)
+        await callback.answer()
+        return
+
+    current_player = unresolved[mapping_index]
+    mappings = dict(data.get("demo_mappings") or {})
+    mappings[current_player["steamid"]] = user_id
+    await state.update_data(
+        demo_mappings=mappings,
+        demo_mapping_index=mapping_index + 1,
+    )
+    await _show_demo_mapping_prompt(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(ManualMatchInput.demo_confirm, F.data == "manual_demo_confirm")
+async def confirm_demo_import(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    players_stats = data.get("player_stats_list") or []
+    map_name = data.get("current_map")
+    team1_score = int(data.get("team1_score") or 0)
+    team2_score = int(data.get("team2_score") or 0)
+    if not players_stats or not map_name:
+        await callback.answer("Нет данных для импорта.", show_alert=True)
+        return
+    if team1_score == team2_score:
+        await callback.answer("Ничейный счет карты недопустим.", show_alert=True)
+        return
+
+    finished = await _after_cs2_map_saved(callback, state, map_name, team1_score, team2_score, players_stats)
+    if not finished:
+        await callback.answer()
 
 
 @router.message(ManualMatchInput.score_input)
@@ -1022,106 +1647,9 @@ async def save_manual_stats(callback: CallbackQuery, state: FSMContext):
         await _finalize_non_cs2_match(callback, state)
         return
 
-    conn = get_connection()
-    cur = conn.cursor()
-    for p in players_stats:
-        cur.execute(
-            """
-            INSERT OR REPLACE INTO player_match_stats
-            (match_id, match_source, user_id, team_id, kills, deaths, assists, adr, hs, rating_3_0, mvps, map_name, map_number)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                match_id,
-                "bracket",
-                p["user_id"],
-                p["team_id"],
-                p["kills"],
-                p["deaths"],
-                p["assists"],
-                p.get("adr", 0),
-                p.get("hs", 0),
-                0.0,
-                0,
-                map_name,
-                map_number,
-            ),
-        )
-
-    # Сохраняем результат карты для истории матчей.
-    winner_id = _winner_from_score(team1_score, team2_score, team1_id, team2_id)
-    cur.execute(
-        """
-        INSERT INTO match_map_results
-        (match_source, match_id, map_number, map_name, team1_score, team2_score, winner_id, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        ON CONFLICT(match_source, match_id, map_number) DO UPDATE SET
-            map_name=excluded.map_name,
-            team1_score=excluded.team1_score,
-            team2_score=excluded.team2_score,
-            winner_id=excluded.winner_id,
-            updated_at=CURRENT_TIMESTAMP
-        """,
-        (
-            "bracket",
-            match_id,
-            map_number,
-            map_name,
-            team1_score,
-            team2_score,
-            winner_id,
-        ),
-    )
-    conn.commit()
-    conn.close()
-
-    team1_wins = data.get("team1_wins", 0)
-    team2_wins = data.get("team2_wins", 0)
-    if winner_id == team1_id:
-        team1_wins += 1
-    else:
-        team2_wins += 1
-
-    map_results = data.get("map_results", [])
-    map_results.append(
-        {
-            "map_number": map_number,
-            "map_name": map_name,
-            "team1_score": team1_score,
-            "team2_score": team2_score,
-            "winner_id": winner_id,
-        }
-    )
-
-    await state.update_data(team1_wins=team1_wins, team2_wins=team2_wins, map_results=map_results)
-    maps_to_win = data.get("maps_to_win", 1)
-    total_maps = data.get("total_maps", 1)
-
-    if team1_wins >= maps_to_win or team2_wins >= maps_to_win or map_number >= total_maps:
-        await _finalize_series(callback, state)
-        return
-
-    await state.update_data(
-        current_map_number=map_number + 1,
-        current_map=None,
-        team1_score=0,
-        team2_score=0,
-        all_players=[],
-        player_stats_list=[],
-        current_player=None,
-        current_player_index=0,
-    )
-
-    text = (
-        f"✅ Карта {map_number} сохранена.\n\n"
-        f"Текущий счет серии:\n"
-        f"🔵 {data.get('team1_name')}: {team1_wins}\n"
-        f"🔴 {data.get('team2_name')}: {team2_wins}\n\n"
-        f"Нужно побед: {maps_to_win}"
-    )
-    await callback.message.answer(text)
-    await _show_map_selection(callback, state)
-    await callback.answer()
+    finished = await _after_cs2_map_saved(callback, state, map_name, team1_score, team2_score, players_stats)
+    if not finished:
+        await callback.answer()
 
 
 async def _finalize_non_cs2_match(callback: CallbackQuery, state: FSMContext):
