@@ -297,12 +297,17 @@ async def _show_cs2_input_method(target: Message | CallbackQuery, state: FSMCont
         maps_text = "\n\nУже сохранены карты:\n" + "\n".join(lines)
 
     format_text = f"\n📊 Формат: {data.get('match_format')}" if data.get("match_format") else ""
+    current_map_label = f"карта {data.get('current_map_number', 1)}"
+    predefined_maps = data.get("predefined_maps") or []
+    map_number = int(data.get("current_map_number") or 1)
+    if predefined_maps and 1 <= map_number <= len(predefined_maps):
+        current_map_label = f"{map_number}. {predefined_maps[map_number - 1]['map_name']}"
     text = (
         "✏️ Ввод результата\n\n"
         f"🔵 {data.get('team1_name')} vs 🔴 {data.get('team2_name')}\n"
         f"📌 Раунд: {data.get('round_name')}{format_text}\n"
         f"📈 Текущий счет серии: {data.get('team1_wins', 0)}:{data.get('team2_wins', 0)}\n"
-        f"🗺 Следующая карта: {data.get('current_map_number', 1)}"
+        f"🗺 Сейчас нужно загрузить демо для: {current_map_label}"
         f"{maps_text}\n\n"
         "Выберите способ ввода:"
     )
@@ -353,8 +358,16 @@ async def _start_cs2_manual_flow(target: Message | CallbackQuery, state: FSMCont
 
 async def _show_demo_input_prompt(target: Message | CallbackQuery, state: FSMContext):
     data = await state.get_data()
+    predefined_maps = data.get("predefined_maps") or []
+    map_number = int(data.get("current_map_number") or 1)
+    current_map_hint = ""
+    if predefined_maps and 1 <= map_number <= len(predefined_maps):
+        current_map_hint = f"\nОжидаемая карта сейчас: {map_number}. {predefined_maps[map_number - 1]['map_name']}\n"
+    else:
+        current_map_hint = f"\nСейчас импортируется карта серии №{map_number}.\n"
     text = (
         "📥 Импорт из демки\n\n"
+        f"{current_map_hint}\n"
         "Отправьте одним сообщением:\n"
         "• .dem или .zip файлом\n"
         "• либо публичную ссылку на .dem/.zip\n\n"
@@ -375,11 +388,11 @@ def _infer_demo_team_target_id(
 ) -> int | None:
     expected_by_id = {int(player["id"]): dict(player) for player in expected_players}
     team_ids = {
-        int(expected_by_id[mappings[player["steamid"]]]["team_id"])
+        int(expected_by_id[mappings[player["demo_key"]]]["team_id"])
         for player in demo_players
         if player["team_index"] == team_index
-        and player.get("steamid") in mappings
-        and mappings[player["steamid"]] in expected_by_id
+        and player.get("demo_key") in mappings
+        and mappings[player["demo_key"]] in expected_by_id
     }
     if len(team_ids) == 1:
         return team_ids.pop()
@@ -1346,7 +1359,7 @@ async def map_demo_player(callback: CallbackQuery, state: FSMContext):
 
     current_player = unresolved[mapping_index]
     mappings = dict(data.get("demo_mappings") or {})
-    mappings[current_player["steamid"]] = user_id
+    mappings[current_player["demo_key"]] = user_id
     await state.update_data(
         demo_mappings=mappings,
         demo_mapping_index=mapping_index + 1,

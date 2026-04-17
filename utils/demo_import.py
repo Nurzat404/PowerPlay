@@ -289,10 +289,12 @@ def flatten_demo_players(parsed_result: dict[str, Any]) -> list[dict[str, Any]]:
 
     players: list[dict[str, Any]] = []
     for team_index, team in enumerate(teams):
-        for player in team.get("players") or []:
+        for player_index, player in enumerate(team.get("players") or []):
+            steamid = _normalize_steam_id(player.get("steamid"))
             players.append(
                 {
-                    "steamid": _normalize_steam_id(player.get("steamid")),
+                    "demo_key": f"{team_index}:{player_index}:{steamid or 'unknown'}",
+                    "steamid": steamid,
                     "name": player.get("name") or player.get("steam_name") or player.get("demo_name") or "Игрок",
                     "team_index": team_index,
                     "team_name": team.get("name") or f"Команда {team_index + 1}",
@@ -324,7 +326,7 @@ def auto_match_demo_players(parsed_result: dict[str, Any], expected_players: lis
         steam_id = demo_player.get("steamid")
         matched_user = steam_to_user.get(steam_id) if steam_id else None
         if matched_user and int(matched_user["id"]) not in used_user_ids:
-            mappings[steam_id] = int(matched_user["id"])
+            mappings[demo_player["demo_key"]] = int(matched_user["id"])
             used_user_ids.add(int(matched_user["id"]))
         else:
             unresolved.append(demo_player)
@@ -347,7 +349,7 @@ def finalize_demo_import_payload(
     demo_players = flatten_demo_players(parsed_result)
     expected_by_id = {int(player["id"]): dict(player) for player in expected_players}
 
-    missing = [player for player in demo_players if not player.get("steamid") or player["steamid"] not in mappings]
+    missing = [player for player in demo_players if player["demo_key"] not in mappings]
     if missing:
         raise DemoImportError("Не все игроки из демки сопоставлены с участниками матча.")
 
@@ -357,7 +359,9 @@ def finalize_demo_import_payload(
         for demo_player in demo_players:
             if demo_player["team_index"] != team_index:
                 continue
-            user_id = mappings[demo_player["steamid"]]
+            user_id = mappings.get(demo_player["demo_key"])
+            if user_id is None:
+                raise DemoImportError(f"Нет сопоставления для игрока {demo_player.get('name')} [{demo_player.get('steamid') or 'без SteamID'}].")
             user = expected_by_id.get(int(user_id))
             if not user:
                 raise DemoImportError("Найдено сопоставление с несуществующим игроком матча.")
@@ -388,7 +392,9 @@ def finalize_demo_import_payload(
 
     player_stats: list[dict[str, Any]] = []
     for demo_player in demo_players:
-        user_id = mappings[demo_player["steamid"]]
+        user_id = mappings.get(demo_player["demo_key"])
+        if user_id is None:
+            raise DemoImportError(f"Нет сопоставления для игрока {demo_player.get('name')} [{demo_player.get('steamid') or 'без SteamID'}].")
         user = expected_by_id[user_id]
         player_stats.append(
             {
