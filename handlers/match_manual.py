@@ -585,8 +585,11 @@ def _build_demo_preview_text(data: dict[str, Any], payload: dict[str, Any]) -> s
     for stat in sorted(payload.get("player_stats", []), key=lambda item: (item["team_id"], -(item["kills"] or 0), item.get("user_name") or "")):
         team_name = data.get("team1_name") if int(stat["team_id"]) == int(data.get("team1_id")) else data.get("team2_name")
         username = f"@{stat['username']}" if stat.get("username") else "без_username"
+        steam_display = stat.get("demo_name") or stat.get("steamid") or "без Steam"
         lines.append(
-            f"• {stat.get('demo_name')} [{stat.get('steamid')}] → {stat.get('user_name')} ({team_name}, {username})"
+            f"• {stat.get('user_name')} ({team_name}, {username})\n"
+            f"  Steam: {steam_display} [{stat.get('steamid') or 'без SteamID'}]\n"
+            f"  K:{stat.get('kills', 0)} D:{stat.get('deaths', 0)} A:{stat.get('assists', 0)} | ADR:{stat.get('adr', 0)} HS:{stat.get('hs', 0)}"
         )
     if data.get("demo_overwrite_required"):
         lines.extend(["", "⚠️ Для этой карты уже есть сохраненные данные. Они будут перезаписаны."])
