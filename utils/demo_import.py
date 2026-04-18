@@ -18,6 +18,9 @@ from utils.parse_demo import parse_demo
 
 
 MAX_URL_DOWNLOAD_BYTES = 512 * 1024 * 1024
+MAX_DOWNLOAD_SECONDS = 240
+MAX_PREPARE_SECONDS = 30
+MAX_PARSE_SECONDS = 240
 SUPPORTED_DEMO_SUFFIXES = {".dem", ".zip"}
 SUPPORTED_SHARE_HOSTS = {"dropmefiles.com", "www.dropmefiles.com"}
 
@@ -101,15 +104,29 @@ async def parse_demo_source_message(bot: Bot, message: Message, temp_root: str |
     )
     work_path = Path(work_dir)
     try:
-        source_path, source_label = await _download_source(bot, message, work_path)
-        demo_path = await asyncio.to_thread(_prepare_demo_file, source_path, work_path)
-        parsed = await asyncio.to_thread(parse_demo, str(demo_path), None)
+        source_path, source_label = await asyncio.wait_for(
+            _download_source(bot, message, work_path),
+            timeout=MAX_DOWNLOAD_SECONDS,
+        )
+        demo_path = await asyncio.wait_for(
+            asyncio.to_thread(_prepare_demo_file, source_path, work_path),
+            timeout=MAX_PREPARE_SECONDS,
+        )
+        parsed = await asyncio.wait_for(
+            asyncio.to_thread(parse_demo, str(demo_path), None),
+            timeout=MAX_PARSE_SECONDS,
+        )
         return {
             "source_label": source_label,
             "parsed_result": parsed,
         }
     except DemoImportError:
         raise
+    except asyncio.TimeoutError as exc:
+        raise DemoImportError(
+            "Обработка демки заняла слишком много времени. "
+            "Попробуйте прямой файл/ссылку побыстрее или демку меньшего размера."
+        ) from exc
     except Exception as exc:
         if "UnknownFile" in str(exc):
             raise DemoImportError(
