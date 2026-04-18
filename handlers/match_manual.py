@@ -236,6 +236,10 @@ def _normalize_map_compare(name: str | None) -> str:
     return "".join(ch for ch in str(name or "").strip().lower() if ch.isalnum())
 
 
+def _normalize_team_compare(name: str | None) -> str:
+    return "".join(ch for ch in str(name or "").strip().lower() if ch.isalnum())
+
+
 def _build_cs2_series_state(saved_map_results: list[dict], team1_id: int) -> dict[str, Any]:
     team1_wins = 0
     team2_wins = 0
@@ -408,20 +412,89 @@ def _infer_demo_team_target_id(
     return None
 
 
+def _resolve_demo_team_target_id(
+    demo_player: dict[str, Any],
+    demo_players: list[dict[str, Any]],
+    expected_players: list[dict[str, Any]],
+    mappings: dict[str, int],
+    team1_id: int,
+    team2_id: int,
+    team1_name: str,
+    team2_name: str,
+) -> int | None:
+    inferred_team_id = _infer_demo_team_target_id(
+        demo_players,
+        expected_players,
+        mappings,
+        int(demo_player["team_index"]),
+    )
+    if inferred_team_id is not None:
+        return inferred_team_id
+
+    demo_team_name = _normalize_team_compare(demo_player.get("team_name"))
+    normalized_team1 = _normalize_team_compare(team1_name)
+    normalized_team2 = _normalize_team_compare(team2_name)
+    if demo_team_name and normalized_team1 and demo_team_name == normalized_team1:
+        return int(team1_id)
+    if demo_team_name and normalized_team2 and demo_team_name == normalized_team2:
+        return int(team2_id)
+
+    other_team_index = 1 if int(demo_player["team_index"]) == 0 else 0
+    other_team_id = _infer_demo_team_target_id(demo_players, expected_players, mappings, other_team_index)
+    if other_team_id == int(team1_id):
+        return int(team2_id)
+    if other_team_id == int(team2_id):
+        return int(team1_id)
+
+    used_user_ids = {int(user_id) for user_id in mappings.values()}
+    remaining_counts = {
+        int(team1_id): 0,
+        int(team2_id): 0,
+    }
+    for player in expected_players:
+        player_id = int(player["id"])
+        player_team_id = int(player["team_id"])
+        if player_id in used_user_ids:
+            continue
+        if player_team_id in remaining_counts:
+            remaining_counts[player_team_id] += 1
+
+    unresolved_same_demo_team = sum(
+        1
+        for player in demo_players
+        if int(player["team_index"]) == int(demo_player["team_index"]) and player.get("demo_key") not in mappings
+    )
+    matching_teams = [
+        team_id
+        for team_id, count in remaining_counts.items()
+        if count == unresolved_same_demo_team and count > 0
+    ]
+    if len(matching_teams) == 1:
+        return int(matching_teams[0])
+
+    return None
+
+
 def _build_demo_candidates(
     demo_player: dict[str, Any],
     expected_players: list[dict[str, Any]],
     mappings: dict[str, int],
     team1_id: int,
     team2_id: int,
+    team1_name: str,
+    team2_name: str,
     demo_players: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     used_user_ids = {int(user_id) for user_id in mappings.values()}
-    inferred_team_id = _infer_demo_team_target_id(
+    inferred_team_id = _resolve_demo_team_target_id(
+        demo_player,
         demo_players,
         expected_players,
         mappings,
-        int(demo_player["team_index"]),
+        int(team1_id),
+        int(team2_id),
+        team1_name,
+        team2_name,
     )
     candidates: list[dict[str, Any]] = []
     for player in expected_players:
@@ -454,6 +527,8 @@ async def _show_demo_mapping_prompt(target: Message | CallbackQuery, state: FSMC
         mappings,
         data.get("team1_id"),
         data.get("team2_id"),
+        data.get("team1_name"),
+        data.get("team2_name"),
         data.get("demo_players") or [],
     )
     if not candidates:
