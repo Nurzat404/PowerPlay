@@ -17,6 +17,7 @@ from handlers.states import ManualMatchInput, BracketTechnicalResultInput
 from razryad_arena_utils import (
     apply_bracket_technical_result,
     can_manage_bracket_match,
+    clear_bracket_match_stats,
     get_user,
     get_steam_profile_name,
     get_tournament_team_members,
@@ -108,10 +109,15 @@ def _save_keyboard(tournament_id: int):
     return builder.as_markup()
 
 
-def _input_method_keyboard(tournament_id: int):
+def _input_method_keyboard(tournament_id: int, match_id: int | None = None, has_saved_maps: bool = False):
     builder = InlineKeyboardBuilder()
     builder.button(text="📥/🔗 Импорт из демки", callback_data="manual_method_demo")
     builder.button(text="✍️ Вручную", callback_data="manual_method_manual")
+    if has_saved_maps and match_id:
+        builder.button(
+            text="🧹 Очистить сохраненные карты",
+            callback_data=f"manual_clear_saved_maps_{match_id}_{tournament_id}",
+        )
     builder.button(text="❌ Отмена", callback_data=f"view_bracket_{tournament_id}")
     builder.adjust(1)
     return builder.as_markup()
@@ -124,6 +130,17 @@ def _demo_confirm_keyboard(tournament_id: int, overwrite_required: bool = False)
     else:
         builder.button(text="✅ Импортировать карту", callback_data="manual_demo_confirm")
     builder.button(text="❌ Отмена", callback_data=f"view_bracket_{tournament_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def _clear_saved_maps_confirm_keyboard(match_id: int, tournament_id: int):
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text="🧹 Да, очистить",
+        callback_data=f"manual_clear_saved_maps_confirm_{match_id}_{tournament_id}",
+    )
+    builder.button(text="❌ Нет", callback_data=f"manual_match_result_{match_id}_{tournament_id}")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -318,11 +335,27 @@ async def _show_cs2_input_method(target: Message | CallbackQuery, state: FSMCont
         f"{maps_text}\n\n"
         "Выберите способ ввода:"
     )
+    if data.get("map_results"):
+        text += "\n\nЕсли хотите начать заново, можно очистить сохраненные карты этой серии."
     await state.set_state(ManualMatchInput.input_method)
     if isinstance(target, CallbackQuery):
-        await target.message.answer(text, reply_markup=_input_method_keyboard(data.get("tournament_id")))
+        await target.message.answer(
+            text,
+            reply_markup=_input_method_keyboard(
+                data.get("tournament_id"),
+                data.get("bracket_match_id"),
+                bool(data.get("map_results")),
+            ),
+        )
     else:
-        await target.answer(text, reply_markup=_input_method_keyboard(data.get("tournament_id")))
+        await target.answer(
+            text,
+            reply_markup=_input_method_keyboard(
+                data.get("tournament_id"),
+                data.get("bracket_match_id"),
+                bool(data.get("map_results")),
+            ),
+        )
 
 
 async def _start_cs2_manual_flow(target: Message | CallbackQuery, state: FSMContext):
@@ -1114,6 +1147,75 @@ async def start_manual_input(callback: CallbackQuery, state: FSMContext):
         return
     tournament_id = int(parts[4]) if len(parts) > 4 else None
     await start_manual_input_by_match(callback, state, match_id, tournament_id)
+
+
+@router.callback_query(F.data.regexp(r"^manual_clear_saved_maps_confirm_\d+_\d+$"))
+async def confirm_clear_saved_maps(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    match_id = int(parts[5])
+    tournament_id = int(parts[6])
+    if not can_manage_bracket_match(callback.from_user.id, match_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+
+    match = _fetch_bracket_match(match_id)
+    if not match:
+        await callback.answer("Матч не найден.", show_alert=True)
+        return
+    match = dict(match)
+    if match.get("status") == "completed":
+        await callback.answer("Нельзя очистить уже завершенный матч.", show_alert=True)
+        return
+
+    saved_map_results = _fetch_saved_map_results(match_id)
+    if not saved_map_results:
+        await callback.answer("Сохранять уже нечего: карт нет.", show_alert=True)
+        await start_manual_input_by_match(callback, state, match_id, tournament_id)
+        return
+
+    clear_bracket_match_stats(match_id)
+    current_state = await state.get_data()
+    if int(current_state.get("bracket_match_id") or 0) == match_id:
+        await state.clear()
+
+    await callback.message.answer("✅ Сохраненные карты и статистика очищены. Можно вводить результат заново.")
+    await start_manual_input_by_match(callback, state, match_id, tournament_id)
+
+
+@router.callback_query(F.data.regexp(r"^manual_clear_saved_maps_\d+_\d+$"))
+async def prompt_clear_saved_maps(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    match_id = int(parts[4])
+    tournament_id = int(parts[5])
+    if not can_manage_bracket_match(callback.from_user.id, match_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+
+    match = _fetch_bracket_match(match_id)
+    if not match:
+        await callback.answer("Матч не найден.", show_alert=True)
+        return
+    match = dict(match)
+    if match.get("status") == "completed":
+        await callback.answer("Нельзя очистить уже завершенный матч.", show_alert=True)
+        return
+
+    saved_map_results = _fetch_saved_map_results(match_id)
+    if not saved_map_results:
+        await callback.answer("Сохраненных карт нет.", show_alert=True)
+        return
+
+    text = (
+        "🧹 Очистить сохраненные результаты?\n\n"
+        "Будут удалены все уже введенные карты и статистика игроков для этого матча.\n"
+        "Pick/ban при этом не сбрасывается.\n\n"
+        "После очистки можно заново загрузить другие демки или ввести результат вручную."
+    )
+    await callback.message.answer(
+        text,
+        reply_markup=_clear_saved_maps_confirm_keyboard(match_id, tournament_id),
+    )
+    await callback.answer()
 
 
 @router.callback_query(ManualMatchInput.input_method, F.data == "manual_method_manual")

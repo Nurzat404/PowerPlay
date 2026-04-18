@@ -99,8 +99,14 @@ def _build_counted_rounds(parser: DemoParser, match_end_tick: int) -> list[dict[
     if round_end_df.empty:
         raise ValueError("Could not find round_officially_ended events in demo.")
 
+    live_match_start_tick = _extract_live_match_start_tick(parser)
     checkpoint_ticks = sorted(
-        {int(tick) for tick in round_end_df["tick"].tolist()} | {int(match_end_tick)}
+        {
+            int(tick)
+            for tick in round_end_df["tick"].tolist()
+            if live_match_start_tick is None or int(tick) >= live_match_start_tick
+        }
+        | {int(match_end_tick)}
     )
     checkpoints_df = parser.parse_ticks([TOTAL_ROUNDS_PROP], ticks=checkpoint_ticks)
     checkpoints_df = (
@@ -118,7 +124,11 @@ def _build_counted_rounds(parser: DemoParser, match_end_tick: int) -> list[dict[
             rounds.append(
                 {
                     "round_no": 1,
-                    "start_tick": _infer_first_round_start_tick(parser, first_tick),
+                    "start_tick": _infer_first_round_start_tick(
+                        parser,
+                        first_tick,
+                        live_match_start_tick,
+                    ),
                     "end_tick": first_tick,
                 }
             )
@@ -144,7 +154,23 @@ def _build_counted_rounds(parser: DemoParser, match_end_tick: int) -> list[dict[
     return rounds
 
 
-def _infer_first_round_start_tick(parser: DemoParser, first_checkpoint_tick: int) -> int:
+def _extract_live_match_start_tick(parser: DemoParser) -> int | None:
+    begin_new_match_df = parser.parse_event("begin_new_match")
+    if isinstance(begin_new_match_df, pd.DataFrame) and not begin_new_match_df.empty:
+        return int(begin_new_match_df["tick"].max())
+
+    announce_df = parser.parse_event("round_announce_match_start")
+    if isinstance(announce_df, pd.DataFrame) and not announce_df.empty:
+        return int(announce_df["tick"].max())
+
+    return None
+
+
+def _infer_first_round_start_tick(
+    parser: DemoParser,
+    first_checkpoint_tick: int,
+    live_match_start_tick: int | None = None,
+) -> int:
     candidate_ticks: list[int] = []
     for event_name in (
         "round_freeze_end",
@@ -156,7 +182,13 @@ def _infer_first_round_start_tick(parser: DemoParser, first_checkpoint_tick: int
         event_df = parser.parse_event(event_name)
         if isinstance(event_df, pd.DataFrame) and not event_df.empty:
             candidate_ticks.extend(
-                int(tick) for tick in event_df["tick"].tolist() if int(tick) < first_checkpoint_tick
+                int(tick)
+                for tick in event_df["tick"].tolist()
+                if int(tick) < first_checkpoint_tick
+                and (
+                    live_match_start_tick is None
+                    or int(tick) >= max(live_match_start_tick - 1, 0)
+                )
             )
 
     if not candidate_ticks:

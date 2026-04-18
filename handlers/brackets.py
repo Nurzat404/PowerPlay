@@ -57,6 +57,23 @@ def _schedule_missing(match: dict) -> bool:
     return not (match.get("scheduled_at_utc") and match.get("location"))
 
 
+def _has_saved_bracket_map_results(match_id: int) -> bool:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT 1
+        FROM match_map_results
+        WHERE match_source='bracket' AND match_id=?
+        LIMIT 1
+        """,
+        (match_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
+
+
 def _schedule_cancel_keyboard(tournament_id: int):
     builder = InlineKeyboardBuilder()
     builder.button(text="❌ Отмена", callback_data=f"bracket_schedule_cancel_{tournament_id}")
@@ -679,6 +696,8 @@ async def bracket_match_menu(callback: CallbackQuery, state: FSMContext):
     builder = InlineKeyboardBuilder()
     if not schedule_missing:
         builder.button(text="✏️ Ввести результат", callback_data=f"manual_match_result_{match_id}_{tournament_id}")
+    if _has_saved_bracket_map_results(match_id):
+        builder.button(text="🧹 Очистить результаты", callback_data=f"manual_clear_saved_maps_{match_id}_{tournament_id}")
     builder.button(text="🚫 Тех.поражение", callback_data=f"manual_match_technical_{match_id}_{tournament_id}")
     builder.button(text="📢 Сообщение участникам матча", callback_data=f"bracket_match_broadcast_{match_id}_{tournament_id}")
     if not schedule_locked:
