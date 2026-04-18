@@ -47,6 +47,7 @@ from utils.veto_service import close_veto_for_technical_result, get_completed_se
 
 router = Router()
 logger = logging.getLogger(__name__)
+DEMO_IMPORT_TOTAL_TIMEOUT_SECONDS = 180
 
 CS2_MAP_OPTIONS = [(row["key"], row["name"]) for row in CS2_MAPS]
 CUSTOM_CS2_MAP_TOKEN = "custom"
@@ -1407,9 +1408,19 @@ async def input_demo_source(message: Message, state: FSMContext):
 
     await message.answer("⏳ Обрабатываю демку, это может занять немного времени...")
     try:
-        demo_result = await parse_demo_source_message(message.bot, message)
+        demo_result = await asyncio.wait_for(
+            parse_demo_source_message(message.bot, message),
+            timeout=DEMO_IMPORT_TOTAL_TIMEOUT_SECONDS,
+        )
     except DemoImportError as exc:
         await message.answer(f"❌ {exc}", reply_markup=_cancel_keyboard(data.get("tournament_id")))
+        return
+    except asyncio.TimeoutError:
+        await message.answer(
+            "❌ Обработка демки заняла слишком много времени. "
+            "Попробуйте прямую ссылку или файл меньшего размера.",
+            reply_markup=_cancel_keyboard(data.get("tournament_id")),
+        )
         return
     except Exception:
         logger.exception("Unexpected error while parsing demo source")
