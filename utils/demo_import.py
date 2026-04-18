@@ -42,6 +42,28 @@ def _normalize_steam_id(value: Any) -> str | None:
     return text
 
 
+def _steam_lookup_variants(value: Any) -> list[str]:
+    normalized = _normalize_steam_id(value)
+    if not normalized:
+        return []
+
+    raw = str(value).strip().rstrip("/") if value is not None else ""
+    variants: list[str] = []
+    for item in (normalized, raw):
+        if item and item not in variants:
+            variants.append(item)
+
+    steam_id64 = normalized if normalized.isdigit() and len(normalized) >= 17 else None
+    if steam_id64:
+        canonical = f"https://steamcommunity.com/profiles/{steam_id64}"
+        canonical_slash = canonical + "/"
+        for item in (steam_id64[:17], canonical, canonical_slash):
+            if item not in variants:
+                variants.append(item)
+
+    return variants
+
+
 def _suffix_from_name(name: str | None) -> str:
     if not name:
         return ""
@@ -314,17 +336,20 @@ def auto_match_demo_players(parsed_result: dict[str, Any], expected_players: lis
 
     steam_to_user: dict[str, dict[str, Any]] = {}
     for player in expected_rows:
-        steam_id = _normalize_steam_id(player.get("steam_id"))
-        if steam_id and steam_id not in steam_to_user:
-            steam_to_user[steam_id] = player
+        for variant in _steam_lookup_variants(player.get("steam_id")):
+            if variant not in steam_to_user:
+                steam_to_user[variant] = player
 
     mappings: dict[str, int] = {}
     used_user_ids: set[int] = set()
     unresolved: list[dict[str, Any]] = []
 
     for demo_player in demo_players:
-        steam_id = demo_player.get("steamid")
-        matched_user = steam_to_user.get(steam_id) if steam_id else None
+        matched_user = None
+        for variant in _steam_lookup_variants(demo_player.get("steamid")):
+            matched_user = steam_to_user.get(variant)
+            if matched_user:
+                break
         if matched_user and int(matched_user["id"]) not in used_user_ids:
             mappings[demo_player["demo_key"]] = int(matched_user["id"])
             used_user_ids.add(int(matched_user["id"]))
