@@ -3,6 +3,7 @@
 Поддерживает BO1/BO3/BO5 по картам.
 """
 from datetime import datetime, timezone
+import logging
 import os
 from typing import Any
 
@@ -45,6 +46,7 @@ from utils.site_sync import request_site_sync
 from utils.veto_service import close_veto_for_technical_result, get_completed_series_maps_for_match, get_match_veto_details, refresh_veto_messages
 
 router = Router()
+logger = logging.getLogger(__name__)
 
 CS2_MAP_OPTIONS = [(row["key"], row["name"]) for row in CS2_MAPS]
 CUSTOM_CS2_MAP_TOKEN = "custom"
@@ -387,13 +389,20 @@ def _infer_demo_team_target_id(
     team_index: int,
 ) -> int | None:
     expected_by_id = {int(player["id"]): dict(player) for player in expected_players}
-    team_ids = {
-        int(expected_by_id[mappings[player["demo_key"]]]["team_id"])
-        for player in demo_players
-        if player["team_index"] == team_index
-        and player.get("demo_key") in mappings
-        and mappings[player["demo_key"]] in expected_by_id
-    }
+    team_ids: set[int] = set()
+    for player in demo_players:
+        if player["team_index"] != team_index:
+            continue
+        demo_key = player.get("demo_key")
+        if not demo_key:
+            continue
+        user_id = mappings.get(demo_key)
+        if user_id is None:
+            continue
+        expected_player = expected_by_id.get(int(user_id))
+        if not expected_player:
+            continue
+        team_ids.add(int(expected_player["team_id"]))
     if len(team_ids) == 1:
         return team_ids.pop()
     return None
@@ -524,6 +533,14 @@ async def _show_demo_preview(target: Message | CallbackQuery, state: FSMContext)
             await target.message.answer(f"❌ {exc}", reply_markup=_cancel_keyboard(data.get("tournament_id")))
         else:
             await target.answer(f"❌ {exc}", reply_markup=_cancel_keyboard(data.get("tournament_id")))
+        return
+    except Exception:
+        logger.exception("Unexpected error while building demo import preview")
+        text = "❌ Произошла ошибка при подготовке предпросмотра демки."
+        if isinstance(target, CallbackQuery):
+            await target.message.answer(text, reply_markup=_cancel_keyboard(data.get("tournament_id")))
+        else:
+            await target.answer(text, reply_markup=_cancel_keyboard(data.get("tournament_id")))
         return
 
     expected_maps = data.get("predefined_maps") or []
@@ -1316,6 +1333,13 @@ async def input_demo_source(message: Message, state: FSMContext):
     except DemoImportError as exc:
         await message.answer(f"❌ {exc}", reply_markup=_cancel_keyboard(data.get("tournament_id")))
         return
+    except Exception:
+        logger.exception("Unexpected error while parsing demo source")
+        await message.answer(
+            "❌ Не удалось обработать демку. Проверьте файл или ссылку и попробуйте снова.",
+            reply_markup=_cancel_keyboard(data.get("tournament_id")),
+        )
+        return
 
     expected_players = _fetch_players(data.get("team1_id"), data.get("team2_id"), data.get("tournament_id"))
     if not expected_players:
@@ -1326,6 +1350,13 @@ async def input_demo_source(message: Message, state: FSMContext):
         mapping_result = auto_match_demo_players(demo_result["parsed_result"], expected_players)
     except DemoImportError as exc:
         await message.answer(f"❌ {exc}", reply_markup=_cancel_keyboard(data.get("tournament_id")))
+        return
+    except Exception:
+        logger.exception("Unexpected error while auto-matching demo players")
+        await message.answer(
+            "❌ Произошла ошибка при сопоставлении игроков из демки.",
+            reply_markup=_cancel_keyboard(data.get("tournament_id")),
+        )
         return
 
     await state.update_data(
@@ -1341,9 +1372,23 @@ async def input_demo_source(message: Message, state: FSMContext):
     )
 
     if mapping_result["unresolved"]:
-        await _show_demo_mapping_prompt(message, state)
+        try:
+            await _show_demo_mapping_prompt(message, state)
+        except Exception:
+            logger.exception("Unexpected error while showing demo mapping prompt")
+            await message.answer(
+                "❌ Произошла ошибка при подготовке ручного сопоставления игроков.",
+                reply_markup=_cancel_keyboard(data.get("tournament_id")),
+            )
         return
-    await _show_demo_preview(message, state)
+    try:
+        await _show_demo_preview(message, state)
+    except Exception:
+        logger.exception("Unexpected error while showing demo preview")
+        await message.answer(
+            "❌ Произошла ошибка при подготовке предпросмотра демки.",
+            reply_markup=_cancel_keyboard(data.get("tournament_id")),
+        )
 
 
 @router.callback_query(ManualMatchInput.demo_mapping, F.data.startswith("manual_demo_map_"))
@@ -1364,7 +1409,14 @@ async def map_demo_player(callback: CallbackQuery, state: FSMContext):
         demo_mappings=mappings,
         demo_mapping_index=mapping_index + 1,
     )
-    await _show_demo_mapping_prompt(callback, state)
+    try:
+        await _show_demo_mapping_prompt(callback, state)
+    except Exception:
+        logger.exception("Unexpected error while continuing demo mapping")
+        await callback.message.answer(
+            "❌ Произошла ошибка при сопоставлении игроков из демки.",
+            reply_markup=_cancel_keyboard(data.get("tournament_id")),
+        )
     await callback.answer()
 
 
