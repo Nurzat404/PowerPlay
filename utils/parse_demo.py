@@ -436,8 +436,8 @@ def _compute_player_stats(
         player_stats.append(
             {
                 "steamid": steamid,
-                "name": display_names[steamid],
-                "steam_name": steam_names[steamid],
+                "name": display_names.get(steamid) or fallback_names.get(steamid) or steamid,
+                "steam_name": steam_names.get(steamid),
                 "demo_name": fallback_names.get(steamid),
                 "name_source": _pick_name_source(steamid, steam_names, fallback_names),
                 "team": player_team_map.get(steamid, ""),
