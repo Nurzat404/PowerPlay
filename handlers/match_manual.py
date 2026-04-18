@@ -2,6 +2,7 @@
 Ручной ввод результатов матчей турнирной сетки.
 Поддерживает BO1/BO3/BO5 по картам.
 """
+import asyncio
 from datetime import datetime, timezone
 import logging
 import os

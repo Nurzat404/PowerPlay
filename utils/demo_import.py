@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,9 @@ MAX_URL_DOWNLOAD_BYTES = 512 * 1024 * 1024
 MAX_DOWNLOAD_SECONDS = 240
 MAX_PREPARE_SECONDS = 30
 MAX_PARSE_SECONDS = 240
+MAX_DOWNLOAD_ATTEMPTS = 3
+REQUEST_CONNECT_TIMEOUT_SECONDS = 15
+REQUEST_READ_TIMEOUT_SECONDS = 45
 SUPPORTED_DEMO_SUFFIXES = {".dem", ".zip"}
 SUPPORTED_SHARE_HOSTS = {"dropmefiles.com", "www.dropmefiles.com"}
 
@@ -194,14 +198,20 @@ def _download_response_to_path(response: requests.Response, target: Path) -> Pat
             pass
 
     downloaded = 0
-    with target.open("wb") as file_obj:
-        for chunk in response.iter_content(chunk_size=1024 * 1024):
-            if not chunk:
-                continue
-            downloaded += len(chunk)
-            if downloaded > MAX_URL_DOWNLOAD_BYTES:
-                raise DemoImportError("Файл слишком большой для импорта по ссылке.")
-            file_obj.write(chunk)
+    try:
+        with target.open("wb") as file_obj:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                downloaded += len(chunk)
+                if downloaded > MAX_URL_DOWNLOAD_BYTES:
+                    raise DemoImportError("Файл слишком большой для импорта по ссылке.")
+                file_obj.write(chunk)
+    except requests.RequestException as exc:
+        raise DemoImportError("Соединение оборвалось во время скачивания демки.") from exc
+
+    if downloaded <= 0:
+        raise DemoImportError("По ссылке не удалось скачать файл демки.")
     return target
 
 
@@ -254,42 +264,81 @@ def _extract_dropmefiles_download_url(page_url: str, html: str) -> str | None:
 
 
 def _download_from_url(url: str, work_path: Path) -> Path:
-    try:
+    last_error: Exception | None = None
+    for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
         session = requests.Session()
-        response = session.get(url, stream=True, timeout=60, allow_redirects=True)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise DemoImportError("Не удалось скачать файл по ссылке.") from exc
-
-    parsed = urlparse(url)
-    suffix = _suffix_from_name(parsed.path)
-    content_type = (response.headers.get("Content-Type") or "").lower()
-    is_html_page = "text/html" in content_type or (suffix not in SUPPORTED_DEMO_SUFFIXES and _is_supported_share_url(url))
-    if is_html_page and _normalize_host(parsed.netloc) in SUPPORTED_SHARE_HOSTS:
-        try:
-            html = response.text
-        except Exception as exc:
-            raise DemoImportError("Не удалось прочитать страницу загрузки.") from exc
-        download_url = _extract_dropmefiles_download_url(str(response.url or url), html)
-        if not download_url:
-            raise DemoImportError("Не удалось найти ссылку скачивания на DropMeFiles.")
+        session.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept": "*/*",
+                "Accept-Language": "ru,en-US;q=0.9,en;q=0.8",
+            }
+        )
+        response: requests.Response | None = None
         try:
             response = session.get(
-                download_url,
+                url,
                 stream=True,
-                timeout=60,
+                timeout=(REQUEST_CONNECT_TIMEOUT_SECONDS, REQUEST_READ_TIMEOUT_SECONDS),
                 allow_redirects=True,
-                headers={"Referer": str(response.url or url)},
             )
             response.raise_for_status()
-        except requests.RequestException as exc:
-            raise DemoImportError("Не удалось скачать файл с DropMeFiles.") from exc
 
-    suffix = _resolve_target_suffix(url, response)
-    if suffix not in SUPPORTED_DEMO_SUFFIXES:
-        raise DemoImportError("По ссылке не найден .dem или .zip файл.")
-    target = work_path / f"source{suffix}"
-    return _download_response_to_path(response, target)
+            parsed = urlparse(url)
+            suffix = _suffix_from_name(parsed.path)
+            content_type = (response.headers.get("Content-Type") or "").lower()
+            is_html_page = "text/html" in content_type or (
+                suffix not in SUPPORTED_DEMO_SUFFIXES and _is_supported_share_url(url)
+            )
+            if is_html_page and _normalize_host(parsed.netloc) in SUPPORTED_SHARE_HOSTS:
+                try:
+                    html = response.text
+                except Exception as exc:
+                    raise DemoImportError("Не удалось прочитать страницу загрузки.") from exc
+                download_url = _extract_dropmefiles_download_url(str(response.url or url), html)
+                if not download_url:
+                    raise DemoImportError("Не удалось найти ссылку скачивания на DropMeFiles.")
+                response.close()
+                response = session.get(
+                    download_url,
+                    stream=True,
+                    timeout=(REQUEST_CONNECT_TIMEOUT_SECONDS, REQUEST_READ_TIMEOUT_SECONDS),
+                    allow_redirects=True,
+                    headers={"Referer": str(url)},
+                )
+                response.raise_for_status()
+
+            suffix = _resolve_target_suffix(url, response)
+            if suffix not in SUPPORTED_DEMO_SUFFIXES:
+                raise DemoImportError("По ссылке не найден .dem или .zip файл.")
+            target = work_path / f"source{suffix}"
+            return _download_response_to_path(response, target)
+        except DemoImportError as exc:
+            last_error = exc
+            if attempt >= MAX_DOWNLOAD_ATTEMPTS:
+                break
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt >= MAX_DOWNLOAD_ATTEMPTS:
+                break
+        finally:
+            if response is not None:
+                response.close()
+            session.close()
+        time.sleep(attempt)
+
+    if isinstance(last_error, DemoImportError):
+        raise DemoImportError(
+            f"{last_error} Попробуйте повторить позже или использовать прямую ссылку/Telegram-файл."
+        ) from last_error
+    raise DemoImportError(
+        "Не удалось стабильно скачать файл по ссылке. "
+        "Файлообменник отвечает нестабильно: попробуйте повторить позже, прямую ссылку или Telegram-файл."
+    ) from last_error
 
 
 def _prepare_demo_file(source_path: Path, work_path: Path) -> Path:
