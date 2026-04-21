@@ -12,6 +12,7 @@ from pathlib import Path
 from sqlite3 import Row
 
 from database import DB_PATH, get_connection
+from utils.rating_service import build_site_rating_payload
 
 logger = logging.getLogger(__name__)
 
@@ -176,41 +177,7 @@ def export_site_data() -> dict[str, list[Path] | Path]:
         )
         tournaments.append(item)
 
-    rating_groups: list[dict] = []
-    for sport in sports:
-        sport_name = sport["name"]
-        month_row = cur.execute(
-            "SELECT month FROM ratings WHERE sport=? ORDER BY month DESC LIMIT 1",
-            (sport_name,),
-        ).fetchone()
-        month = month_row["month"] if month_row else None
-        items = _dict_rows(
-            cur.execute(
-                """
-                SELECT
-                  t.id,
-                  t.name,
-                  t.city,
-                  COALESCE(r.points, 0) AS points
-                FROM teams t
-                LEFT JOIN ratings r
-                  ON r.team_id = t.id
-                 AND r.sport = ?
-                 AND r.month = ?
-                WHERE t.sport = ?
-                ORDER BY points DESC, t.name
-                """,
-                (sport_name, month, sport_name),
-            ).fetchall()
-        )
-        rating_groups.append(
-            {
-                "sport": sport_name,
-                "sport_display": sport_map.get(sport_name, sport_name),
-                "month": month,
-                "items": items,
-            }
-        )
+    rating_payload = build_site_rating_payload()
 
     bracket_matches = _dict_rows(
         cur.execute(
@@ -256,7 +223,12 @@ def export_site_data() -> dict[str, list[Path] | Path]:
     ratings_path = LOCAL_DATA_DIR / "ratings.json"
     ratings_path.write_text(
         json.dumps(
-            {"generated_at": generated_at, "groups": rating_groups},
+            {
+                "generated_at": generated_at,
+                "groups": rating_payload.get("groups", []),
+                "seasons": rating_payload.get("seasons", {}),
+                "leaderboards": rating_payload.get("leaderboards", {}),
+            },
             ensure_ascii=False,
             indent=2,
         ),

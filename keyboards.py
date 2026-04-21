@@ -49,7 +49,7 @@ def teams_list_keyboard(teams, show_create=True):
     return builder.as_markup()
 
 
-def team_management_extended_keyboard(team_id, is_captain, is_open, notify_enabled, max_members):
+def team_management_extended_keyboard(team_id, is_captain, is_open, notify_enabled, max_members=None):
     builder = InlineKeyboardBuilder()
     # Кнопка выхода для всех
     builder.button(text="🚪 Выйти из команды",
@@ -57,6 +57,8 @@ def team_management_extended_keyboard(team_id, is_captain, is_open, notify_enabl
     if is_captain:
         builder.button(text="✏️ Изменить название",
                        callback_data=f"rename_team_{team_id}")
+        builder.button(text="🏙 Город",
+                       callback_data=f"edit_team_city_{team_id}")
         builder.button(text="👥 Добавить игроков",
                        callback_data=f"add_player_{team_id}")
         builder.button(text="🔗 Ссылка приглашения",
@@ -65,7 +67,8 @@ def team_management_extended_keyboard(team_id, is_captain, is_open, notify_enabl
                        callback_data=f"delete_team_{team_id}")
         builder.button(text="📋 Заявки в команду",
                        callback_data=f"team_requests_{team_id}")
-        builder.button(text=f"👤 Лимит: {max_members} чел.",
+        limit_label = max_members if max_members is not None else "?"
+        builder.button(text=f"👤 Лимит: {limit_label} чел.",
                        callback_data=f"edit_max_members_{team_id}")
         open_status = "🔓 Открыт" if is_open else "🔒 Закрыт"
         builder.button(
@@ -154,6 +157,48 @@ def ratings_sport_keyboard(sports_list):
     for name, display in sports_list:
         builder.button(text=display, callback_data=f"rating_sport_{name}")
     builder.button(text="🔙 Назад", callback_data="main_menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def ratings_entity_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="👤 Игроки", callback_data="ratings_entity_p")
+    builder.button(text="👥 Команды", callback_data="ratings_entity_t")
+    builder.button(text="🔙 Назад", callback_data="main_menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def ratings_sport_picker_keyboard(entity_type, sports_list):
+    builder = InlineKeyboardBuilder()
+    for name, display in sports_list:
+        builder.button(text=display, callback_data=f"ratings_sport_{entity_type}_{name}")
+    builder.button(text="🔙 Назад", callback_data="ratings")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def ratings_scope_keyboard(entity_type, sport_key):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🌍 Общий", callback_data=f"ratings_scope_{entity_type}_{sport_key}_o")
+    builder.button(text="🗓 Сезонный", callback_data=f"ratings_scope_{entity_type}_{sport_key}_s")
+    builder.button(text="🔙 Назад", callback_data=f"ratings_entity_{entity_type}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def ratings_format_keyboard(entity_type, sport_key, scope_key, season_id, options):
+    builder = InlineKeyboardBuilder()
+    for format_key, label in options:
+        if format_key == "general":
+            continue
+        token = format_key.replace("x", "x")
+        builder.button(
+            text=label,
+            callback_data=f"ratings_view_{entity_type}_{sport_key}_{scope_key}_{season_id}_{token}_0",
+        )
+    builder.button(text="🔙 Назад", callback_data=f"ratings_view_{entity_type}_{sport_key}_{scope_key}_{season_id}_g_0")
     builder.adjust(1)
     return builder.as_markup()
 
@@ -323,6 +368,85 @@ def admin_rating_team_actions_keyboard(team_id, sport):
                    callback_data=f"admin_rating_deduct_{team_id}_{sport}")
     builder.button(
         text="🔙 Назад", callback_data=f"admin_rating_list_teams_{sport}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_rating_scope_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🌍 Общий рейтинг", callback_data="admin_rating_scope_overall")
+    builder.button(text="🗓 Сезонный рейтинг", callback_data="admin_rating_scope_seasonal")
+    builder.button(text="🔙 Назад", callback_data="admin_menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_rating_entity_keyboard(scope_key: str):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="👤 Игроки", callback_data=f"admin_rating_entity_player")
+    builder.button(text="👥 Команды", callback_data=f"admin_rating_entity_team")
+    builder.button(text="🔙 Назад", callback_data="admin_rating")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_rating_sport_picker_keyboard(sports_list):
+    builder = InlineKeyboardBuilder()
+    for name, display in sports_list:
+        builder.button(text=display, callback_data=f"admin_rating_pick_sport_{name}")
+    builder.button(text="🔙 Назад", callback_data="admin_rating_back_entity")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_rating_format_picker_keyboard(options, *, allow_next_season: bool = False):
+    builder = InlineKeyboardBuilder()
+    for format_key, label in options:
+        if format_key == "general":
+            continue
+        builder.button(text=label, callback_data=f"admin_rating_pick_format_{format_key}")
+    if allow_next_season:
+        builder.button(text="➡️ Следующий сезон", callback_data="admin_rating_next_season")
+    builder.button(text="🔙 Назад", callback_data="admin_rating_back_entities_general")
+    builder.adjust(1)
+    return builder.as_markup()
+
+def admin_rating_entity_list_keyboard(items, *, entity_type: str, offset: int, has_prev: bool, has_next: bool, show_format_button: bool = False, show_next_season_button: bool = False, show_publish_button: bool = False):
+    builder = InlineKeyboardBuilder()
+    for item in items:
+        rating_value = int(item.get("rating_value") or 0)
+        if entity_type == "team":
+            label = f"{item['name']} — {rating_value}"
+        else:
+            username = item.get("username") or ""
+            base_label = f"{item.get('first_name') or 'Игрок'} (@{username})" if username else (item.get("first_name") or "Игрок")
+            label = f"{base_label} — {rating_value}"
+        builder.button(text=label[:60], callback_data=f"admin_rating_pick_entity_{item['id']}")
+
+    nav = []
+    if has_prev:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"admin_rating_page_{offset - 10}"))
+    if has_next:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"admin_rating_page_{offset + 10}"))
+    if nav:
+        builder.row(*nav)
+
+    if show_format_button:
+        builder.button(text="🗂 Формат", callback_data="admin_rating_open_formats")
+    if show_publish_button:
+        builder.button(text="📢 Опубликовать в канал", callback_data="admin_rating_publish_channel")
+    if show_next_season_button:
+        builder.button(text="➡️ Следующий сезон", callback_data="admin_rating_next_season")
+    builder.button(text="🔙 Назад", callback_data="admin_rating_back_format")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_rating_action_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Добавить очки", callback_data="admin_rating_action_add")
+    builder.button(text="➖ Снять очки", callback_data="admin_rating_action_sub")
+    builder.button(text="🔙 Назад", callback_data="admin_rating_back_entities")
     builder.adjust(1)
     return builder.as_markup()
 

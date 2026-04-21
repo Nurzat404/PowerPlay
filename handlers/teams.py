@@ -19,7 +19,8 @@ from razryad_arena_utils import (
     search_teams_by_name, search_teams_count, get_team_invite_status,
     get_teams_by_sport, get_teams_count_by_sport, get_team_members_count, get_team_max_members, update_team_max_members,
     get_sport_display_name, map_sports_to_display,
-    ensure_team_invite_token, set_team_invite_join_mode, set_team_invite_enabled
+    ensure_team_invite_token, set_team_invite_join_mode, set_team_invite_enabled,
+    is_team_member_blocked, set_team_city, rename_team as rename_team_record
 )
 from keyboards import (
     teams_list_keyboard, team_management_extended_keyboard, main_menu_keyboard,
@@ -30,6 +31,10 @@ from keyboards import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _display_optional_text(value: str | None, fallback: str = "не указан") -> str:
+    return (value or "").strip() or fallback
 
 
 async def get_team_card_data(team_id: int, user_id: int, bot: Bot | None = None):
@@ -69,7 +74,7 @@ async def get_team_card_data(team_id: int, user_id: int, bot: Bot | None = None)
     text = f"""
 Команда: {team['name']}
 Вид спорта: {sport_display}
-Город: {team['city']}
+Город: {_display_optional_text(team['city'])}
 Капитан: {captain_name}
 Участников: {members_count} / {max_members}
 Набор: {"📔 Открыт" if settings['is_open'] else "🔒 Закрыт"}
@@ -100,6 +105,7 @@ router = Router()
 class CreateTeam(StatesGroup):
     name = State()
     sport = State()
+    city = State()
     max_members = State()
 
 
@@ -113,6 +119,10 @@ class AddPlayer(StatesGroup):
 
 class EditMaxMembers(StatesGroup):
     new_max = State()
+
+
+class EditTeamCity(StatesGroup):
+    value = State()
 
 
 class SearchTeam(StatesGroup):
@@ -168,13 +178,25 @@ async def create_team_name(message: Message, state: FSMContext):
 async def create_team_sport_choice(callback: CallbackQuery, state: FSMContext):
     sport_name = callback.data.replace("create_team_sport_", "")
     await state.update_data(sport=sport_name)
-    await state.set_state(CreateTeam.max_members)
+    await state.set_state(CreateTeam.city)
     await callback.message.edit_text(
+        "Введите город команды или отправьте `-`, чтобы не указывать.",
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@router.message(CreateTeam.city)
+async def create_team_city(message: Message, state: FSMContext):
+    raw_city = (message.text or "").strip()
+    city = None if raw_city in {"", "-"} else raw_city
+    await state.update_data(city=city)
+    await state.set_state(CreateTeam.max_members)
+    await message.answer(
         "Введите максимальное количество участников команды (от 1 до 10):\n"
         "Можно ввести число или выбрать на клавиатуре.",
         reply_markup=input_number_keyboard()
     )
-    await callback.answer()
 
 
 @router.message(CreateTeam.max_members)
@@ -201,6 +223,7 @@ async def finish_create_team(user_id, message, state: FSMContext, max_members):
     data = await state.get_data()
     team_name = data['name']
     sport = data['sport']
+    city = data.get('city')
     user = get_user(user_id)
     if not user:
         await message.answer("Ошибка")
@@ -211,7 +234,7 @@ async def finish_create_team(user_id, message, state: FSMContext, max_members):
     cur.execute("""
         INSERT INTO teams (name, sport, city, captain_id, max_members)
         VALUES (?, ?, ?, ?, ?)
-    """, (team_name, sport, user['city'], user['id'], max_members))
+    """, (team_name, sport, city, user['id'], max_members))
     team_id = cur.lastrowid
     cur.execute(
         "INSERT INTO team_members (team_id, user_id) VALUES (?, ?)", (team_id, user['id']))
@@ -686,13 +709,42 @@ async def rename_team_name(message: Message, state: FSMContext):
         await message.answer("❌ Название команды должно быть не короче 3 символов. Попробуйте снова:")
         return
 
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("UPDATE teams SET name=? WHERE id=?", (new_name, team_id))
-    conn.commit()
-    conn.close()
+    rename_team_record(team_id, new_name)
     await state.clear()
     await message.answer("Название изменено!")
+    text, kb = await get_team_card_data(team_id, message.from_user.id, bot=message.bot)
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("edit_team_city_"))
+async def edit_team_city_start(callback: CallbackQuery, state: FSMContext):
+    team_id = int(callback.data.split("_")[3])
+    user = get_user(callback.from_user.id)
+    if not user or not is_captain(user['id'], team_id):
+        await callback.answer("Вы не капитан", show_alert=True)
+        return
+    await state.update_data(team_id=team_id)
+    await state.set_state(EditTeamCity.value)
+    await callback.message.edit_text(
+        "Введите новый город команды или отправьте `-`, чтобы очистить поле.",
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@router.message(EditTeamCity.value)
+async def edit_team_city_finish(message: Message, state: FSMContext):
+    data = await state.get_data()
+    team_id = data.get("team_id")
+    if not team_id:
+        await state.clear()
+        await message.answer("Ошибка: команда не найдена.")
+        return
+    raw_city = (message.text or "").strip()
+    city = None if raw_city in {"", "-"} else raw_city
+    set_team_city(team_id, city)
+    await state.clear()
+    await message.answer("Город команды обновлен.")
     text, kb = await get_team_card_data(team_id, message.from_user.id, bot=message.bot)
     await message.answer(text, reply_markup=kb)
 
@@ -800,7 +852,10 @@ async def add_player_username(message: Message, state: FSMContext):
     if current_count >= max_members:
         await message.answer("❌ В команде уже максимальное количество участников.")
         return
-    create_invite(team_id, user_to_add['id'])
+    if not create_invite(team_id, user_to_add['id']):
+        await message.answer("❌ Этот пользователь исключен из команды и не может вступить повторно.")
+        await state.clear()
+        return
     team = get_team_by_id(team_id)
     try:
         await message.bot.send_message(
@@ -840,7 +895,10 @@ async def accept_invite_handler(callback: CallbackQuery):
     if current_count >= max_members:
         await callback.answer("❌ В команде уже максимальное количество участников.", show_alert=True)
         return
-    accept_invite(team_id, user['id'])
+    if not accept_invite(team_id, user['id']):
+        await callback.message.edit_text("❌ Вы исключены из этой команды и не можете вступить повторно.")
+        await callback.answer()
+        return
     team = get_team_by_id(team_id)
     await callback.message.edit_text(f"Вы вступили в команду «{team['name']}»!")
     await callback.answer()
@@ -1036,7 +1094,7 @@ async def view_all_team(callback: CallbackQuery):
     text = f"""
 Команда: {team['name']}
 Вид спорта: {sport_display}
-Город: {team['city']}
+Город: {_display_optional_text(team['city'])}
 Капитан: {captain_name}
 Участников: {members_count} / {max_members}
 Набор: {"🔓 Открыт" if settings['is_open'] else "🔒 Закрыт"}
@@ -1079,7 +1137,7 @@ async def view_open_team(callback: CallbackQuery):
     # Проверяем, может ли пользователь подать заявку
     is_member = is_team_member(user['id'], team_id)
     has_request = has_pending_request(user['id'], team_id)
-    can_apply = not is_member and not has_request and settings['is_open']
+    can_apply = not is_member and not has_request and settings['is_open'] and not is_team_member_blocked(team_id, user['id'])
     sport_display = get_sport_display_name(team['sport'])
     token = (team['invite_token'] or '').strip() if 'invite_token' in team.keys() else ''
     invite_enabled_raw = team['invite_enabled'] if 'invite_enabled' in team.keys() else 1
@@ -1098,7 +1156,7 @@ async def view_open_team(callback: CallbackQuery):
     text = f"""
 Команда: {team['name']}
 Вид спорта: {sport_display}
-Город: {team['city']}
+Город: {_display_optional_text(team['city'])}
 Капитан: {captain_name}
 Участников: {members_count} / {max_members}
 Набор: {"🔓 Открыт" if settings['is_open'] else "🔒 Закрыт"}
@@ -1199,7 +1257,7 @@ async def view_search_team(callback: CallbackQuery):
 
     is_member = is_team_member(user['id'], team_id)
     has_request = has_pending_request(user['id'], team_id)
-    can_apply = not is_member and not has_request and settings['is_open']
+    can_apply = not is_member and not has_request and settings['is_open'] and not is_team_member_blocked(team_id, user['id'])
     sport_display = get_sport_display_name(team['sport'])
     token = (team['invite_token'] or '').strip() if 'invite_token' in team.keys() else ''
     invite_enabled_raw = team['invite_enabled'] if 'invite_enabled' in team.keys() else 1
@@ -1218,7 +1276,7 @@ async def view_search_team(callback: CallbackQuery):
     text = f"""
 Команда: {team['name']}
 Вид спорта: {sport_display}
-Город: {team['city']}
+Город: {_display_optional_text(team['city'])}
 Капитан: {captain_name}
 Участников: {members_count} / {max_members}
 Набор: {"🔓 Открыт" if settings['is_open'] else "🔒 Закрыт"}
@@ -1263,6 +1321,9 @@ async def team_join_direct(callback: CallbackQuery):
 
     if is_team_member(user['id'], team_id):
         await callback.answer("Вы уже в этой команде", show_alert=True)
+        return
+    if is_team_member_blocked(team_id, user['id']):
+        await callback.answer("Вы исключены из этой команды и не можете вступить повторно.", show_alert=True)
         return
 
     current_count = get_team_members_count(team_id)
@@ -1309,6 +1370,9 @@ async def apply_to_team(callback: CallbackQuery):
     if is_team_member(user['id'], team_id):
         await callback.answer("Вы уже в этой команде", show_alert=True)
         return
+    if is_team_member_blocked(team_id, user['id']):
+        await callback.answer("Вы исключены из этой команды и не можете отправить заявку повторно.", show_alert=True)
+        return
 
     # Проверка лимита – добавляем перед проверкой статуса
     current_count = get_team_members_count(team_id)
@@ -1344,7 +1408,9 @@ async def apply_to_team(callback: CallbackQuery):
         conn.close()
     else:
         # Создаём новую запись
-        create_team_request(team_id, user['id'])
+        if not create_team_request(team_id, user['id']):
+            await callback.answer("Вы исключены из этой команды и не можете отправить заявку повторно.", show_alert=True)
+            return
 
     team = get_team_by_id(team_id)
 
@@ -1427,7 +1493,9 @@ async def accept_request_handler(callback: CallbackQuery):
             await callback.answer("Заявка не найдена", show_alert=True)
             return
         team_id, user_id = req['team_id'], req['user_id']
-        accept_request(request_id)
+        if not accept_request(request_id):
+            await callback.answer("Пользователь исключен из команды и не может вступить повторно.", show_alert=True)
+            return
     else:
         team_id = int(parts[2])
         user_id = int(parts[3])
@@ -1446,7 +1514,9 @@ async def accept_request_handler(callback: CallbackQuery):
         if current_count >= max_members:
             await callback.answer("❌ В команде уже максимальное количество участников.", show_alert=True)
             return
-        accept_request(request_id)
+        if not accept_request(request_id):
+            await callback.answer("Пользователь исключен из команды и не может вступить повторно.", show_alert=True)
+            return
 
     team = get_team_by_id(team_id)
     user = get_user_by_id(user_id)
@@ -1509,8 +1579,9 @@ async def toggle_team_open(callback: CallbackQuery):
     await callback.answer(f"Приём заявок {'открыт' if new_status else 'закрыт'}.")
     user = get_user(callback.from_user.id)
     is_capt = user and is_captain(user['id'], team_id)
+    max_members = get_team_max_members(team_id)
     await callback.message.edit_reply_markup(reply_markup=team_management_extended_keyboard(
-        team_id, is_capt, new_status, settings['notify']))
+        team_id, is_capt, new_status, settings['notify'], max_members))
 
 
 @router.callback_query(F.data.startswith("toggle_notify_"))
@@ -1522,8 +1593,9 @@ async def toggle_team_notify(callback: CallbackQuery):
     await callback.answer(f"Уведомления {'включены' if new_status else 'выключены'}.")
     user = get_user(callback.from_user.id)
     is_capt = user and is_captain(user['id'], team_id)
+    max_members = get_team_max_members(team_id)
     await callback.message.edit_reply_markup(reply_markup=team_management_extended_keyboard(
-        team_id, is_capt, settings['is_open'], new_status))
+        team_id, is_capt, settings['is_open'], new_status, max_members))
 
 
 @router.callback_query(F.data.startswith("edit_max_members_"))

@@ -31,3 +31,11 @@ class TournamentRosterEdit(StatesGroup):
 class BracketTechnicalResultInput(StatesGroup):
     reason_input = State()
     confirm = State()
+
+
+class AdminRatingAdjustment(StatesGroup):
+    points = State()
+
+
+class AdminRatingChannelPublish(StatesGroup):
+    channel = State()

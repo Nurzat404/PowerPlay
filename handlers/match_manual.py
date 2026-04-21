@@ -24,7 +24,6 @@ from razryad_arena_utils import (
     get_tournament_team_members,
     get_tournament_by_id,
     resolve_bracket_match_format,
-    update_team_rating,
     upsert_football_player_stat,
     upsert_basketball_player_stat,
     upsert_volleyball_player_stat,
@@ -44,6 +43,9 @@ from utils.demo_import import (
     parse_demo_source_message,
 )
 from utils.notifications import notify_bracket_match_result
+from utils.rating_rules import SOURCE_BRACKET_MATCH
+from utils.rating_channel_posts import refresh_rating_channel_posts
+from utils.rating_service import replace_match_team_rating
 from utils.site_sync import request_site_sync
 from utils.veto_service import close_veto_for_technical_result, get_completed_series_maps_for_match, get_match_veto_details, refresh_veto_messages
 
@@ -1386,16 +1388,26 @@ async def confirm_technical_result(callback: CallbackQuery, state: FSMContext):
     winner_name = match["team2_name"] if loser_team_id == match["team1_id"] else match["team1_name"]
     loser_name = match["team1_name"] if loser_team_id == match["team1_id"] else match["team2_name"]
 
-    if tournament:
-        month = datetime.now(timezone.utc).strftime("%Y-%m")
-        points = 3 if round_number == 5 else 5
-        update_team_rating(winner_id, tournament["sport"], month, points)
+    if tournament and match:
+        replace_match_team_rating(
+            source_type=SOURCE_BRACKET_MATCH,
+            match_id=match_id,
+            sport_key=tournament["sport"],
+            tournament_id=tournament_id,
+            team1_id=match["team1_id"],
+            team2_id=match["team2_id"],
+            score1=result["score1"],
+            score2=result["score2"],
+            actor_user_id=actor["id"] if actor else None,
+        )
 
     temp_dir = os.path.abspath("temp/brackets")
     os.makedirs(temp_dir, exist_ok=True)
     png_path = os.path.join(temp_dir, f"bracket_{tournament_id}.png")
     png_result = generate_bracket_png(tournament_id, png_path)
     request_site_sync(f"match_technical_result_saved:{tournament_id}:{match_id}")
+    if tournament:
+        await refresh_rating_channel_posts(callback.bot, sport_key=tournament["sport"], entity_type="team")
 
     summary = (
         "🚫 Тех.поражение оформлено\n"
@@ -1940,18 +1952,26 @@ async def _finalize_non_cs2_match(callback: CallbackQuery, state: FSMContext):
     third_place_result = auto_create_third_place_if_ready(tournament_id)
 
     match = _fetch_bracket_match(match_id)
-    round_number = match["round_number"] if match else 0
     tournament = get_tournament_by_id(tournament_id)
-    if tournament:
-        month = datetime.now(timezone.utc).strftime("%Y-%m")
-        points = 3 if round_number == 5 else 5
-        update_team_rating(winner_id, tournament["sport"], month, points)
+    if tournament and match:
+        replace_match_team_rating(
+            source_type=SOURCE_BRACKET_MATCH,
+            match_id=match_id,
+            sport_key=tournament["sport"],
+            tournament_id=tournament_id,
+            team1_id=match["team1_id"],
+            team2_id=match["team2_id"],
+            score1=team1_score,
+            score2=team2_score,
+        )
 
     temp_dir = os.path.abspath("temp/brackets")
     os.makedirs(temp_dir, exist_ok=True)
     png_path = os.path.join(temp_dir, f"bracket_{tournament_id}.png")
     png_result = generate_bracket_png(tournament_id, png_path)
     request_site_sync(f"match_result_saved:{tournament_id}:{match_id}")
+    if tournament:
+        await refresh_rating_channel_posts(callback.bot, sport_key=tournament["sport"], entity_type="team")
 
     third_place_note = "\n🥉 Матч за 3-е место создан автоматически." if third_place_result.get("created") else ""
 
@@ -2015,18 +2035,26 @@ async def _finalize_series(callback: CallbackQuery, state: FSMContext):
     third_place_result = auto_create_third_place_if_ready(tournament_id)
 
     match = _fetch_bracket_match(match_id)
-    round_number = match["round_number"] if match else 0
     tournament = get_tournament_by_id(tournament_id)
-    if tournament:
-        month = datetime.now(timezone.utc).strftime("%Y-%m")
-        points = 3 if round_number == 5 else 5
-        update_team_rating(winner_id, tournament["sport"], month, points)
+    if tournament and match:
+        replace_match_team_rating(
+            source_type=SOURCE_BRACKET_MATCH,
+            match_id=match_id,
+            sport_key=tournament["sport"],
+            tournament_id=tournament_id,
+            team1_id=match["team1_id"],
+            team2_id=match["team2_id"],
+            score1=team1_wins,
+            score2=team2_wins,
+        )
 
     temp_dir = os.path.abspath("temp/brackets")
     os.makedirs(temp_dir, exist_ok=True)
     png_path = os.path.join(temp_dir, f"bracket_{tournament_id}.png")
     png_result = generate_bracket_png(tournament_id, png_path)
     request_site_sync(f"match_series_saved:{tournament_id}:{match_id}")
+    if tournament:
+        await refresh_rating_channel_posts(callback.bot, sport_key=tournament["sport"], entity_type="team")
 
     third_place_note = "\n🥉 Матч за 3-е место создан автоматически." if third_place_result.get("created") else ""
 

@@ -200,6 +200,11 @@ def _purge_removed_sport(cur: sqlite3.Cursor, sport_name: str):
         "DELETE FROM ratings WHERE sport=? OR team_id IN (SELECT id FROM teams WHERE sport=?)",
         (sport_name, sport_name),
     )
+    cur.execute("DELETE FROM rating_mvp_assignments WHERE sport_key=?", (sport_name,))
+    cur.execute("DELETE FROM entity_ratings WHERE sport_key=?", (sport_name,))
+    cur.execute("DELETE FROM rating_adjustments WHERE sport_key=?", (sport_name,))
+    cur.execute("DELETE FROM rating_channel_posts WHERE sport_key=?", (sport_name,))
+    cur.execute("DELETE FROM rating_seasons WHERE sport_key=?", (sport_name,))
 
     cur.execute("DELETE FROM tournaments WHERE sport=?", (sport_name,))
     cur.execute("DELETE FROM teams WHERE sport=?", (sport_name,))
@@ -297,6 +302,17 @@ def init_db():
                         type TEXT DEFAULT 'invite',     -- invite, request
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         UNIQUE(team_id, user_id)
+                    )
+                """)
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS team_member_blocks (
+                        team_id INTEGER NOT NULL REFERENCES teams(id),
+                        user_id INTEGER NOT NULL REFERENCES users(id),
+                        blocked_by INTEGER REFERENCES users(id),
+                        reason TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (team_id, user_id)
                     )
                 """)
 
@@ -443,6 +459,85 @@ def init_db():
                         points INTEGER DEFAULT 0,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         UNIQUE(team_id, sport, month)
+                    )
+                """)
+
+                # Legacy monthly team ratings remain in `ratings`.
+                # New canonical rating model: seasons + universal entity ratings + audit log.
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS rating_seasons (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        sport_key TEXT NOT NULL,
+                        name TEXT NOT NULL,
+                        sequence_no INTEGER NOT NULL,
+                        start_date TEXT,
+                        end_date TEXT,
+                        status TEXT NOT NULL DEFAULT 'active',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        completed_at TIMESTAMP
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS entity_ratings (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        entity_type TEXT NOT NULL,
+                        entity_id INTEGER NOT NULL,
+                        sport_key TEXT NOT NULL,
+                        format_key TEXT,
+                        rating_scope TEXT NOT NULL,
+                        season_id INTEGER REFERENCES rating_seasons(id),
+                        rating_value INTEGER DEFAULT 0,
+                        matches_played INTEGER DEFAULT 0,
+                        matches_won INTEGER DEFAULT 0,
+                        tournaments_played INTEGER DEFAULT 0,
+                        tournaments_won INTEGER DEFAULT 0,
+                        second_places INTEGER DEFAULT 0,
+                        third_places INTEGER DEFAULT 0,
+                        mvp_matches_count INTEGER DEFAULT 0,
+                        mvp_tournaments_count INTEGER DEFAULT 0,
+                        manual_adjustment_total INTEGER DEFAULT 0,
+                        last_manual_adjustment_at TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS rating_adjustments (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        entity_type TEXT NOT NULL,
+                        entity_id INTEGER NOT NULL,
+                        sport_key TEXT NOT NULL,
+                        format_key TEXT,
+                        rating_scope TEXT NOT NULL,
+                        season_id INTEGER REFERENCES rating_seasons(id),
+                        delta INTEGER NOT NULL DEFAULT 0,
+                        matches_played_delta INTEGER DEFAULT 0,
+                        matches_won_delta INTEGER DEFAULT 0,
+                        tournaments_played_delta INTEGER DEFAULT 0,
+                        tournaments_won_delta INTEGER DEFAULT 0,
+                        second_places_delta INTEGER DEFAULT 0,
+                        third_places_delta INTEGER DEFAULT 0,
+                        mvp_matches_count_delta INTEGER DEFAULT 0,
+                        mvp_tournaments_count_delta INTEGER DEFAULT 0,
+                        reason TEXT,
+                        source_type TEXT,
+                        source_id INTEGER,
+                        actor_user_id INTEGER REFERENCES users(id),
+                        event_key TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS rating_mvp_assignments (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        source_type TEXT NOT NULL,
+                        source_id INTEGER NOT NULL,
+                        user_id INTEGER NOT NULL REFERENCES users(id),
+                        sport_key TEXT NOT NULL,
+                        assigned_mode TEXT DEFAULT 'auto',
+                        assigned_by INTEGER REFERENCES users(id),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(source_type, source_id)
                     )
                 """)
 
@@ -599,6 +694,51 @@ def init_db():
                     ON tournament_match_format_rules(tournament_id, round_number)
                 """)
                 cur.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_rating_seasons_unique
+                    ON rating_seasons(sport_key, sequence_no)
+                """)
+                cur.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_rating_seasons_single_active
+                    ON rating_seasons(sport_key, status)
+                    WHERE status='active'
+                """)
+                cur.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_entity_ratings_unique
+                    ON entity_ratings(
+                        entity_type,
+                        entity_id,
+                        sport_key,
+                        COALESCE(format_key, ''),
+                        rating_scope,
+                        COALESCE(season_id, 0)
+                    )
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_entity_ratings_lookup
+                    ON entity_ratings(entity_type, sport_key, rating_scope, season_id, rating_value DESC)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_entity_ratings_entity
+                    ON entity_ratings(entity_type, entity_id, sport_key, rating_scope, season_id)
+                """)
+                cur.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_rating_adjustments_event_key
+                    ON rating_adjustments(event_key)
+                    WHERE event_key IS NOT NULL AND TRIM(event_key) <> ''
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_rating_adjustments_source
+                    ON rating_adjustments(source_type, source_id)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_rating_adjustments_entity
+                    ON rating_adjustments(entity_type, entity_id, sport_key, rating_scope, season_id)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_rating_mvp_assignments_lookup
+                    ON rating_mvp_assignments(source_type, source_id)
+                """)
+                cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_tournament_team_rosters_lookup
                     ON tournament_team_rosters(tournament_id, team_id, status, user_id)
                 """)
@@ -609,6 +749,14 @@ def init_db():
                 cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_tournament_team_captains_lookup
                     ON tournament_team_captains(tournament_id, team_id, user_id)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_team_member_blocks_team
+                    ON team_member_blocks(team_id, created_at)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_team_member_blocks_user
+                    ON team_member_blocks(user_id, created_at)
                 """)
                 cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_tournament_roster_requests_target
@@ -721,6 +869,24 @@ def init_db():
                     )
                 """)
                 logger.info("Таблица match_veto_message_targets проверена")
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS rating_channel_posts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        entity_type TEXT NOT NULL,
+                        sport_key TEXT NOT NULL,
+                        rating_scope TEXT NOT NULL,
+                        season_id INTEGER REFERENCES rating_seasons(id),
+                        format_key TEXT,
+                        chat_id INTEGER NOT NULL,
+                        message_id INTEGER NOT NULL,
+                        status TEXT DEFAULT 'active',
+                        created_by INTEGER REFERENCES users(id),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                logger.info("Таблица rating_channel_posts проверена")
 
                 cur.execute("PRAGMA table_info(match_veto_sessions)")
                 columns = [col[1] for col in cur.fetchall()]
@@ -932,6 +1098,20 @@ def init_db():
                     "CREATE INDEX IF NOT EXISTS idx_series_maps_session_order ON match_series_maps(session_id, map_order)")
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_veto_message_targets_session ON match_veto_message_targets(session_id)")
+                cur.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_rating_channel_posts_rating_key
+                    ON rating_channel_posts(
+                        entity_type,
+                        sport_key,
+                        rating_scope,
+                        COALESCE(season_id, 0),
+                        COALESCE(format_key, '')
+                    )
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_rating_channel_posts_status_lookup
+                    ON rating_channel_posts(status, sport_key, entity_type, rating_scope)
+                """)
 
                 # Миграции для player_match_stats
                 cur.execute("PRAGMA table_info(player_match_stats)")
@@ -1196,6 +1376,12 @@ def init_db():
                 _cleanup_user_favorite_sports(cur, {"Brawl Stars"})
 
             conn.close()
+            try:
+                from utils.rating_seasons import ensure_active_rating_seasons_for_all_sports
+
+                ensure_active_rating_seasons_for_all_sports()
+            except Exception:
+                logger.exception("Не удалось подготовить активные сезоны рейтинга")
             logger.info("База данных успешно инициализирована.")
             return
         except sqlite3.OperationalError as e:

@@ -7,6 +7,13 @@ import datetime
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 import logging
+from utils.rating_rules import ENTITY_TEAM, FORMAT_GENERAL, SCOPE_OVERALL
+from utils.rating_service import (
+    apply_manual_rating_adjustment,
+    get_rating_leaderboard,
+    replace_match_team_rating,
+    replace_tournament_rating_awards,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +67,18 @@ def update_user(telegram_id, **kwargs):
     conn.close()
 
 
+def update_user_by_id(user_id: int, **kwargs):
+    if not kwargs:
+        return
+    conn = get_connection()
+    cur = conn.cursor()
+    set_clause = ", ".join([f"{k}=?" for k in kwargs])
+    values = list(kwargs.values()) + [user_id]
+    cur.execute(f"UPDATE users SET {set_clause} WHERE id=?", values)
+    conn.commit()
+    conn.close()
+
+
 def get_user_teams(user_id):
     conn = get_connection()
     cur = conn.cursor()
@@ -102,6 +121,139 @@ def get_team_members(team_id):
     members = cur.fetchall()
     conn.close()
     return members
+
+
+def update_team_fields(team_id: int, **kwargs):
+    if not kwargs:
+        return
+    conn = get_connection()
+    cur = conn.cursor()
+    set_clause = ", ".join([f"{k}=?" for k in kwargs])
+    values = list(kwargs.values()) + [team_id]
+    cur.execute(f"UPDATE teams SET {set_clause} WHERE id=?", values)
+    conn.commit()
+    conn.close()
+
+
+def set_team_city(team_id: int, city: str | None):
+    normalized = (city or "").strip() or None
+    update_team_fields(team_id, city=normalized)
+
+
+def rename_team(team_id: int, new_name: str):
+    update_team_fields(team_id, name=(new_name or "").strip())
+
+
+def is_team_member_blocked(team_id: int, user_id: int) -> bool:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT 1 FROM team_member_blocks WHERE team_id=? AND user_id=? LIMIT 1",
+        (team_id, user_id),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return bool(row)
+
+
+def get_team_member_blocks(team_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT b.team_id, b.user_id, b.blocked_by, b.reason, b.created_at,
+               u.first_name, u.username
+        FROM team_member_blocks b
+        JOIN users u ON u.id = b.user_id
+        WHERE b.team_id=?
+        ORDER BY b.created_at DESC, b.user_id DESC
+        """,
+        (team_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def block_team_member(team_id: int, user_id: int, blocked_by: int | None = None, reason: str | None = None):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO team_member_blocks (team_id, user_id, blocked_by, reason, created_at)
+        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(team_id, user_id) DO UPDATE SET
+            blocked_by=excluded.blocked_by,
+            reason=excluded.reason,
+            created_at=CURRENT_TIMESTAMP
+        """,
+        (team_id, user_id, blocked_by, (reason or "").strip() or None),
+    )
+    conn.commit()
+    conn.close()
+
+
+def unblock_team_member(team_id: int, user_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM team_member_blocks WHERE team_id=? AND user_id=?", (team_id, user_id))
+    conn.commit()
+    conn.close()
+
+
+def remove_team_member_admin(team_id: int, user_id: int, replacement_captain_user_id: int | None = None):
+    team = get_team_by_id(team_id)
+    if not team:
+        return {"ok": False, "reason": "team_not_found"}
+    members = list(get_team_members(team_id))
+    member_ids = [int(member["id"]) for member in members]
+    if int(user_id) not in member_ids:
+        return {"ok": False, "reason": "not_member"}
+    if int(team["captain_id"] or 0) == int(user_id):
+        remaining_ids = [member_id for member_id in member_ids if member_id != int(user_id)]
+        if not remaining_ids:
+            return {"ok": False, "reason": "last_captain"}
+        if not replacement_captain_user_id or int(replacement_captain_user_id) not in remaining_ids:
+            return {"ok": False, "reason": "replacement_captain_required", "choices": remaining_ids}
+        update_team_fields(team_id, captain_id=int(replacement_captain_user_id))
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM team_members WHERE team_id=? AND user_id=?", (team_id, user_id))
+    cur.execute("DELETE FROM team_invites WHERE team_id=? AND user_id=?", (team_id, user_id))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
+def add_team_member_admin(team_id: int, user_id: int, *, bypass_block: bool = False):
+    team = get_team_by_id(team_id)
+    if not team:
+        return {"ok": False, "reason": "team_not_found"}
+    if is_team_member(user_id, team_id):
+        return {"ok": False, "reason": "already_member"}
+    if is_team_member_blocked(team_id, user_id) and not bypass_block:
+        return {"ok": False, "reason": "blocked"}
+    current_count = get_team_members_count(team_id)
+    max_members = get_team_max_members(team_id)
+    if current_count >= max_members:
+        return {"ok": False, "reason": "team_full"}
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT OR IGNORE INTO team_members (team_id, user_id) VALUES (?, ?)", (team_id, user_id))
+    cur.execute(
+        """
+        INSERT INTO team_invites (team_id, user_id, status, type)
+        VALUES (?, ?, 'accepted', 'request')
+        ON CONFLICT(team_id, user_id) DO UPDATE SET
+            status='accepted',
+            type='request'
+        """,
+        (team_id, user_id),
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True}
 
 
 def _tournament_team_roster_exists(tournament_id: int, team_id: int) -> bool:
@@ -1123,19 +1275,17 @@ def exclude_team_from_tournament(app_id):
 
 
 def update_team_rating(team_id, sport, month, points_change):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT points FROM ratings WHERE team_id=? AND sport=? AND month=?",
-                (team_id, sport, month))
-    existing = cur.fetchone()
-    if existing:
-        cur.execute("UPDATE ratings SET points = points + ? WHERE team_id=? AND sport=? AND month=?",
-                    (points_change, team_id, sport, month))
-    else:
-        cur.execute("INSERT INTO ratings (team_id, sport, month, points) VALUES (?, ?, ?, ?)",
-                    (team_id, sport, month, points_change))
-    conn.commit()
-    conn.close()
+    # Совместимая обёртка для старых вызовов: пишем в новую каноничную схему.
+    apply_manual_rating_adjustment(
+        entity_type=ENTITY_TEAM,
+        entity_id=team_id,
+        sport_key=sport,
+        rating_scope=SCOPE_OVERALL,
+        format_key=FORMAT_GENERAL,
+        delta=int(points_change),
+        actor_user_id=None,
+        reason="Legacy rating wrapper",
+    )
 
 # ---------- Функции для управления пользователями ----------
 
@@ -1204,16 +1354,16 @@ def toggle_user_ban(user_id):
 
 
 def update_team_rating_same_conn(conn, team_id, sport, month, points_change):
-    cur = conn.cursor()
-    cur.execute("SELECT points FROM ratings WHERE team_id=? AND sport=? AND month=?",
-                (team_id, sport, month))
-    existing = cur.fetchone()
-    if existing:
-        cur.execute("UPDATE ratings SET points = points + ? WHERE team_id=? AND sport=? AND month=?",
-                    (points_change, team_id, sport, month))
-    else:
-        cur.execute("INSERT INTO ratings (team_id, sport, month, points) VALUES (?, ?, ?, ?)",
-                    (team_id, sport, month, points_change))
+    apply_manual_rating_adjustment(
+        entity_type=ENTITY_TEAM,
+        entity_id=team_id,
+        sport_key=sport,
+        rating_scope=SCOPE_OVERALL,
+        format_key=FORMAT_GENERAL,
+        delta=int(points_change),
+        actor_user_id=None,
+        reason="Legacy rating wrapper",
+    )
 
 
 def get_user_by_username(username):
@@ -1250,16 +1400,21 @@ def has_pending_invite(user_id, team_id):
 
 def create_invite(team_id, user_id):
     """Создаёт новое приглашение"""
+    if is_team_member_blocked(team_id, user_id):
+        return False
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO team_invites (team_id, user_id) VALUES (?, ?)", (team_id, user_id))
     conn.commit()
     conn.close()
+    return True
 
 
 def accept_invite(team_id, user_id):
     """Принять приглашение: добавить в команду и обновить статус"""
+    if is_team_member_blocked(team_id, user_id):
+        return False
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -1268,6 +1423,7 @@ def accept_invite(team_id, user_id):
         "UPDATE team_invites SET status='accepted' WHERE team_id=? AND user_id=?", (team_id, user_id))
     conn.commit()
     conn.close()
+    return True
 
 
 def reject_invite(team_id, user_id):
@@ -1440,6 +1596,7 @@ def delete_team_admin(team_id):
     """Удалить команду (админ) со всеми связями"""
     conn = get_connection()
     cur = conn.cursor()
+    cur.execute("DELETE FROM team_member_blocks WHERE team_id=?", (team_id,))
     cur.execute("DELETE FROM team_members WHERE team_id=?", (team_id,))
     cur.execute("DELETE FROM team_invites WHERE team_id=?", (team_id,))
     cur.execute(
@@ -1447,6 +1604,8 @@ def delete_team_admin(team_id):
     cur.execute("DELETE FROM matches WHERE team1_id=? OR team2_id=?",
                 (team_id, team_id))
     cur.execute("DELETE FROM ratings WHERE team_id=?", (team_id,))
+    cur.execute("DELETE FROM entity_ratings WHERE entity_type='team' AND entity_id=?", (team_id,))
+    cur.execute("DELETE FROM rating_adjustments WHERE entity_type='team' AND entity_id=?", (team_id,))
     cur.execute("DELETE FROM teams WHERE id=?", (team_id,))
     conn.commit()
     conn.close()
@@ -1498,7 +1657,18 @@ def deduct_team_points(team_id, sport, points):
 
 
 def get_teams_with_rating(sport):
-    """Возвращает команды с их текущими очками для указанного спорта (за текущий месяц)"""
+    """Возвращает команды с их актуальными очками по новой рейтинговой модели."""
+    rows, _ = get_rating_leaderboard(
+        entity_type=ENTITY_TEAM,
+        sport_key=sport,
+        rating_scope=SCOPE_OVERALL,
+        format_key=None,
+        limit=500,
+        offset=0,
+    )
+    if rows:
+        return [{"id": row["entity_id"], "name": row["team_name"], "points": row["rating_value"]} for row in rows]
+
     month = datetime.now(timezone.utc).strftime("%Y-%m")
     conn = get_connection()
     cur = conn.cursor()
@@ -1550,6 +1720,8 @@ def set_team_notify_status(team_id, notify):
 
 def create_team_request(team_id, user_id):
     """Создаёт заявку на вступление (type='request')"""
+    if is_team_member_blocked(team_id, user_id):
+        return False
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -1558,6 +1730,7 @@ def create_team_request(team_id, user_id):
     """, (team_id, user_id))
     conn.commit()
     conn.close()
+    return True
 
 
 def get_team_requests(team_id, offset=0, limit=10):
@@ -1595,6 +1768,9 @@ def accept_request(request_id):
         "SELECT team_id, user_id FROM team_invites WHERE id=? AND type='request'", (request_id,))
     req = cur.fetchone()
     if not req:
+        conn.close()
+        return False
+    if is_team_member_blocked(int(req['team_id']), int(req['user_id'])):
         conn.close()
         return False
     cur.execute("INSERT OR IGNORE INTO team_members (team_id, user_id) VALUES (?, ?)",
@@ -3487,9 +3663,6 @@ def finish_tournament_with_awards(tournament_id: int) -> tuple:
             logger.info("Турнир уже завершён")
             return (None, None, None)
 
-        sport = tournament['sport']
-        month = datetime.now(timezone.utc).strftime("%Y-%m")
-
         # Получаем победителя (1 место)
         first_place_id = get_tournament_final_winner(tournament_id)
 
@@ -3499,27 +3672,11 @@ def finish_tournament_with_awards(tournament_id: int) -> tuple:
         # Получаем 3-е место (победитель матча за 3-е место)
         third_place_id = get_third_place_match_winner(tournament_id)
 
-        # Начисляем очки
-        if first_place_id:
-            update_team_rating_same_conn(
-                conn, first_place_id, sport, month, 20)
-            logger.info(f"✅ 1 место: команда {first_place_id} получает 20 очков")
-
-        if second_place_id:
-            update_team_rating_same_conn(
-                conn, second_place_id, sport, month, 15)
-            logger.info(f"✅ 2 место: команда {second_place_id} получает 15 очков")
-
-        if third_place_id:
-            update_team_rating_same_conn(
-                conn, third_place_id, sport, month, 10)
-            logger.info(f"✅ 3 место: команда {third_place_id} получает 10 очков")
-
         # Обновляем статус турнира
         cur.execute(
             "UPDATE tournaments SET status='finished' WHERE id=?", (tournament_id,))
-
         conn.commit()
+        replace_tournament_rating_awards(tournament_id)
 
         # Получаем названия команд для возврата
         cur.execute("SELECT name FROM teams WHERE id=?", (first_place_id,))

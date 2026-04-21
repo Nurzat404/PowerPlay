@@ -1,5 +1,6 @@
 from aiogram import Router, F
-from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton, MessageOriginChannel
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -9,10 +10,9 @@ import json
 from razryad_arena_utils import (
     is_admin, get_pending_applications, approve_application, reject_application, exclude_team_from_tournament,
     update_team_rating, get_all_users, search_users, get_user_by_id,
-    update_user_role, toggle_user_ban, update_team_rating_same_conn,
+    update_user_role, toggle_user_ban,
     get_team_members, get_tournament_by_id, get_team_by_id,
-    delete_tournament, get_all_sports, reset_sport_rating,
-    get_teams_with_rating, reset_team_rating, deduct_team_points,
+    delete_tournament, get_all_sports,
     delete_team_admin, parse_russian_date, parse_russian_datetime,
     get_user, get_user_teams, get_team_application, get_approved_teams_count, get_all_users_count, search_users_count,
     get_team_members_count, get_team_max_members, get_team_settings, is_captain,
@@ -31,12 +31,18 @@ from razryad_arena_utils import (
     create_tournament_roster_change_request, get_tournament_roster_change_request,
     accept_tournament_roster_change_request, decline_tournament_roster_change_request,
     update_tournament_roster_change_request_status,
+    update_user_by_id, is_email_unique, update_user_steam_id,
+    rename_team, set_team_city, update_team_fields,
+    add_team_member_admin, remove_team_member_admin, block_team_member, unblock_team_member,
+    get_team_member_blocks, is_team_member_blocked, update_team_max_members,
+    set_team_open_status, set_team_notify_status, set_team_invite_join_mode, set_team_invite_enabled,
 )
 from keyboards import (
     admin_menu_keyboard, back_to_main_keyboard,
-    admin_rating_menu_keyboard, admin_rating_sport_actions_keyboard,
-    admin_rating_teams_list_keyboard, admin_rating_team_actions_keyboard,
-    sports_choice_keyboard_single
+    admin_rating_action_keyboard, admin_rating_entity_keyboard,
+    admin_rating_entity_list_keyboard, admin_rating_format_picker_keyboard,
+    admin_rating_scope_keyboard, admin_rating_sport_picker_keyboard,
+    sports_choice_keyboard_single, sports_choice_keyboard
 )
 from datetime import datetime, timezone
 import logging
@@ -63,7 +69,33 @@ from utils.veto_service import (
     list_tournament_veto_sessions,
     validate_veto_pool,
 )
-from handlers.states import TargetedBroadcast, TournamentRosterEdit
+from handlers.states import AdminRatingAdjustment, AdminRatingChannelPublish, TargetedBroadcast, TournamentRosterEdit
+from utils.rating_rules import (
+    ENTITY_PLAYER,
+    ENTITY_TEAM,
+    FORMAT_GENERAL,
+    SCOPE_OVERALL,
+    SCOPE_SEASONAL,
+    SOURCE_LEGACY_MATCH,
+    get_format_options_for_sport,
+    sport_supports_formats,
+)
+from utils.rating_service import (
+    advance_to_next_rating_season,
+    apply_manual_rating_adjustment,
+    clear_rating_bucket,
+    get_active_rating_season,
+    get_match_mvp_candidates,
+    get_rating_leaderboard,
+    get_rating_row,
+    get_rating_season_by_id,
+    get_tournament_mvp_candidates,
+    replace_match_team_rating,
+    set_match_mvp_override,
+    set_tournament_mvp_override,
+)
+from utils.rating_channel_posts import parse_channel_target_text, publish_rating_channel_post, refresh_rating_channel_posts
+from utils.steam_utils import parse_steam_link
 
 logger = logging.getLogger(__name__)
 
@@ -537,6 +569,7 @@ def _build_admin_team_card_text(team_id: int, tournament: dict | None = None, ap
         "SELECT COUNT(*) FROM team_invites WHERE team_id=? AND type='request' AND status='pending'", (team_id,))
     join_requests_pending = cur.fetchone()[0]
     conn.close()
+    blocked_members = get_team_member_blocks(team_id)
 
     created_at = team['created_at'] if 'created_at' in team.keys(
     ) and team['created_at'] else "н/д"
@@ -545,13 +578,13 @@ def _build_admin_team_card_text(team_id: int, tournament: dict | None = None, ap
         "⚙️ Карточка команды (админ)\n\n"
         f"Название: {team['name']}\n"
         f"Вид спорта: {get_sport_display_name(team['sport'])}\n"
-        f"Город: {team['city']}\n"
+        f"Город: {_display_optional_text(team['city'])}\n"
         f"{'Турнирный капитан' if tournament else 'Капитан'}: {captain_name}\n"
         f"Участники: {members_count}/{max_members}\n"
         f"Набор в команду: {'🔓 открыт' if settings['is_open'] else '🔒 закрыт'}\n"
         f"Уведомления капитану: {'🔔 включены' if settings['notify'] else '🔕 выключены'}\n"
         f"Создана: {created_at}\n"
-        f"Активность: заявок в турниры={tournaments_total}, pending турниров={tournaments_pending}, pending вступлений={join_requests_pending}\n"
+        f"Активность: заявок в турниры={tournaments_total}, pending турниров={tournaments_pending}, pending вступлений={join_requests_pending}, блок-лист={len(blocked_members)}\n"
     )
 
     if app_status:
@@ -691,13 +724,64 @@ async def _show_tournament_roster_screen(message, tournament_id: int, team_id: i
         ),
     )
 
-def _admin_team_manage_card_keyboard(team_id: int) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🗑 Удалить",
-                   callback_data=f"admin_team_delete_confirm_{team_id}")
-    builder.button(text="🔙 К списку", callback_data="admin_teams")
-    builder.adjust(1)
-    return builder.as_markup()
+async def _render_admin_team_card_by_state(target, state: FSMContext):
+    data = await state.get_data()
+    team_id = data.get("admin_team_id")
+    if not team_id:
+        return
+    text = _build_admin_team_card_text(int(team_id))
+    if not text:
+        return
+    markup = _admin_team_manage_card_keyboard(int(team_id))
+    if isinstance(target, CallbackQuery):
+        await _safe_edit_admin_message(target, text, markup)
+    else:
+        await target.answer(text, reply_markup=markup)
+
+
+async def _show_admin_team_members_screen(target, team_id: int):
+    members = list(get_team_members(team_id))
+    text = "👥 Управление составом команды\n\nВыберите участника:" if members else "👥 В команде пока нет участников."
+    markup = _admin_team_members_keyboard(team_id, members)
+    if isinstance(target, CallbackQuery):
+        await _safe_edit_admin_message(target, text, markup)
+    else:
+        await target.answer(text, reply_markup=markup)
+
+
+async def _show_admin_team_blocks_screen(target, team_id: int):
+    blocks = list(get_team_member_blocks(team_id))
+    text = "🚫 Заблокированные участники" + ("" if blocks else "\n\nСписок пуст.")
+    markup = _admin_team_blocks_keyboard(team_id, blocks)
+    if isinstance(target, CallbackQuery):
+        await _safe_edit_admin_message(target, text, markup)
+    else:
+        await target.answer(text, reply_markup=markup)
+
+
+async def _show_admin_team_edit_menu(target, team_id: int):
+    team = get_team_by_id(team_id)
+    if not team:
+        return
+    settings = get_team_settings(team_id)
+    invite_mode = (team['invite_join_mode'] or 'request').strip().lower() if 'invite_join_mode' in team.keys() else 'request'
+    invite_enabled = int((team['invite_enabled'] if 'invite_enabled' in team.keys() else 1) or 0) == 1
+    text = (
+        "✏️ Редактирование команды\n\n"
+        f"Команда: {team['name']}\n"
+        f"Город: {_display_optional_text(team['city'])}\n"
+        f"Лимит: {get_team_max_members(team_id)}\n"
+        f"Набор: {'открыт' if settings['is_open'] else 'закрыт'}\n"
+        f"Уведомления: {'включены' if settings['notify'] else 'выключены'}\n"
+        f"Режим ссылки: {'сразу вступление' if invite_mode == 'direct' else 'по заявке'}\n"
+        f"Ссылка: {'включена' if invite_enabled else 'выключена'}\n\n"
+        "Выберите действие:"
+    )
+    markup = _admin_team_edit_menu_keyboard(team_id)
+    if isinstance(target, CallbackQuery):
+        await _safe_edit_admin_message(target, text, markup)
+    else:
+        await target.answer(text, reply_markup=markup)
 
 def _get_tournament_capacity_info(tournament_id: int) -> tuple[int, int | None]:
     conn = get_connection()
@@ -1252,6 +1336,16 @@ class EditTournament(StatesGroup):
 
 class AdminBroadcast(StatesGroup):
     text = State()
+
+
+class AdminUserEdit(StatesGroup):
+    value = State()
+    sports = State()
+
+
+class AdminTeamEdit(StatesGroup):
+    value = State()
+    member_username = State()
 
 
 async def _open_tournament_field_editor(
@@ -1992,6 +2086,7 @@ async def admin_tournament_manage(callback: CallbackQuery, tournament_id: int | 
                    callback_data=f"admin_tournament_broadcast_{tournament_id}")
     if _is_cs2_sport(tournament["sport"]):
         builder.button(text="🗺 Панель veto", callback_data=f"admin_tournament_veto_{tournament_id}")
+        builder.button(text="🏅 MVP", callback_data=f"admin_tournament_mvp_{tournament_id}")
 
     # Редактирование турнира
     builder.button(text="✏️ Редактировать турнир",
@@ -2040,6 +2135,154 @@ async def admin_tournament_replacements_toggle(callback: CallbackQuery):
     conn.close()
     request_site_sync(f"tournament_updated:{tournament_id}:replacements_enabled")
     await admin_tournament_manage(callback, tournament_id=tournament_id)
+
+
+async def _show_tournament_mvp_panel(message, tournament_id: int):
+    tournament = get_tournament_by_id(tournament_id)
+    if not tournament:
+        await message.edit_text("Турнир не найден.", reply_markup=back_to_main_keyboard())
+        return
+    builder = InlineKeyboardBuilder()
+    builder.button(text="⭐ MVP матчей", callback_data=f"admin_tournament_mvp_matches_{tournament_id}")
+    builder.button(text="🏆 MVP турнира", callback_data=f"admin_tournament_mvp_tournament_{tournament_id}")
+    builder.button(text="🔙 К турниру", callback_data=f"admin_tournament_manage_{tournament_id}")
+    builder.adjust(1)
+    await message.edit_text(
+        f"🏅 MVP-панель\n\nТурнир: {tournament['name']}\nСпорт: {get_sport_display_name(tournament['sport'])}\n\nЗдесь можно вручную переопределить MVP матча и MVP турнира.",
+        reply_markup=builder.as_markup(),
+    )
+
+
+@router.callback_query(F.data.regexp(r"^admin_tournament_mvp_\d+$"))
+async def admin_tournament_mvp_panel(callback: CallbackQuery):
+    tournament_id = int(callback.data.split("_")[3])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    tournament = get_tournament_by_id(tournament_id)
+    if not tournament or not _is_cs2_sport(tournament["sport"]):
+        await callback.answer("MVP доступен только для CS2-турниров.", show_alert=True)
+        return
+    await _show_tournament_mvp_panel(callback.message, tournament_id)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_tournament_mvp_matches_"))
+async def admin_tournament_mvp_matches(callback: CallbackQuery):
+    tournament_id = int(callback.data.split("_")[4])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT b.id, b.round_number, b.match_number, tm1.name AS team1_name, tm2.name AS team2_name
+        FROM tournament_brackets b
+        LEFT JOIN teams tm1 ON tm1.id = b.team1_id
+        LEFT JOIN teams tm2 ON tm2.id = b.team2_id
+        WHERE b.tournament_id=? AND b.status='completed'
+        ORDER BY b.round_number, b.match_number, b.id
+        """,
+        (tournament_id,),
+    )
+    matches = cur.fetchall()
+    conn.close()
+    builder = InlineKeyboardBuilder()
+    for match in matches:
+        label = f"Раунд {match['round_number']} / матч {match['match_number']}: {match['team1_name'] or 'TBD'} vs {match['team2_name'] or 'TBD'}"
+        builder.button(text=label[:64], callback_data=f"admin_tournament_mvp_match_{tournament_id}_{match['id']}")
+    builder.button(text="🔙 Назад", callback_data=f"admin_tournament_mvp_{tournament_id}")
+    builder.adjust(1)
+    await callback.message.edit_text("⭐ Выберите матч для ручного MVP:", reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^admin_tournament_mvp_match_\d+_\d+$"))
+async def admin_tournament_mvp_match(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    tournament_id = int(parts[4])
+    match_id = int(parts[5])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    candidates = get_match_mvp_candidates(match_id)
+    builder = InlineKeyboardBuilder()
+    for candidate in candidates:
+        username = candidate.get("username") or "без_username"
+        text = (
+            f"{candidate.get('first_name') or 'Игрок'} (@{username}) | "
+            f"K {candidate.get('kills', 0)} / D {candidate.get('deaths', 0)} / ADR {candidate.get('adr', 0)}"
+        )
+        builder.button(
+            text=text[:64],
+            callback_data=f"admin_tournament_mvp_match_pick_{match_id}_{candidate['user_id']}",
+        )
+    builder.button(text="🔙 Назад", callback_data=f"admin_tournament_mvp_matches_{tournament_id}")
+    builder.adjust(1)
+    await callback.message.edit_text("⭐ Выберите MVP матча:", reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^admin_tournament_mvp_match_pick_\d+_\d+$"))
+async def admin_tournament_mvp_match_pick(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    match_id = int(parts[5])
+    user_id = int(parts[6])
+    actor = get_user(callback.from_user.id)
+    result = set_match_mvp_override(match_id, user_id, "CS2", assigned_by=actor["id"] if actor else None)
+    if not result.get("ok"):
+        await callback.answer("Не удалось назначить MVP матча.", show_alert=True)
+        return
+    request_site_sync(f"match_mvp_override:{match_id}:{user_id}")
+    await refresh_rating_channel_posts(callback.bot, sport_key="CS2")
+    tournament_id = result.get("tournament_id")
+    if tournament_id:
+        await _show_tournament_mvp_panel(callback.message, int(tournament_id))
+    await callback.answer("MVP матча обновлён.", show_alert=True)
+
+
+@router.callback_query(F.data.regexp(r"^admin_tournament_mvp_tournament_\d+$"))
+async def admin_tournament_mvp_tournament(callback: CallbackQuery):
+    tournament_id = int(callback.data.split("_")[4])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    candidates = get_tournament_mvp_candidates(tournament_id)
+    builder = InlineKeyboardBuilder()
+    for candidate in candidates:
+        username = candidate.get("username") or "без_username"
+        text = (
+            f"{candidate.get('first_name') or 'Игрок'} (@{username}) | "
+            f"MVP матчей {candidate.get('match_mvp_count', 0)} | K {candidate.get('kills', 0)}"
+        )
+        builder.button(
+            text=text[:64],
+            callback_data=f"admin_tournament_mvp_tournament_pick_{tournament_id}_{candidate['user_id']}",
+        )
+    builder.button(text="🔙 Назад", callback_data=f"admin_tournament_mvp_{tournament_id}")
+    builder.adjust(1)
+    await callback.message.edit_text("🏆 Выберите MVP турнира:", reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.regexp(r"^admin_tournament_mvp_tournament_pick_\d+_\d+$"))
+async def admin_tournament_mvp_tournament_pick(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    tournament_id = int(parts[5])
+    user_id = int(parts[6])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    actor = get_user(callback.from_user.id)
+    result = set_tournament_mvp_override(tournament_id, user_id, "CS2", assigned_by=actor["id"] if actor else None)
+    if not result.get("ok"):
+        await callback.answer("Не удалось назначить MVP турнира.", show_alert=True)
+        return
+    request_site_sync(f"tournament_mvp_override:{tournament_id}:{user_id}")
+    await refresh_rating_channel_posts(callback.bot, sport_key="CS2")
+    await _show_tournament_mvp_panel(callback.message, tournament_id)
+    await callback.answer("MVP турнира обновлён.", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("admin_tournament_veto_"))
@@ -2391,6 +2634,10 @@ async def confirm_finish_tournament(callback: CallbackQuery):
     third_name = third_team['name'] if third_team else "???"
 
     await callback.answer(f"✅ Турнир завершён!", show_alert=True)
+
+    tournament = get_tournament_by_id(tournament_id)
+    if tournament:
+        await refresh_rating_channel_posts(callback.bot, sport_key=tournament["sport"])
 
     await callback.message.answer(
         f"🏆 Турнир завершён!\n\n"
@@ -3749,28 +3996,24 @@ async def result_enter_score2(message: Message, state: FSMContext):
             "SELECT team1_id, team2_id, tournament_id FROM matches WHERE id=?", (match_id,))
         match = cur.fetchone()
         if match:
-            month = datetime.now(timezone.utc).strftime("%Y-%m")
             cur.execute("SELECT sport FROM tournaments WHERE id=?",
                         (match['tournament_id'],))
             tour = cur.fetchone()
             sport = normalize_sport_name(tour['sport']) if tour else "CS2"
             match_meta = match
 
-            if score1 > score2:
-                update_team_rating_same_conn(
-                    conn, match['team1_id'], sport, month, 5)
-                update_team_rating_same_conn(
-                    conn, match['team2_id'], sport, month, 0)
-            elif score1 < score2:
-                update_team_rating_same_conn(
-                    conn, match['team1_id'], sport, month, 0)
-                update_team_rating_same_conn(
-                    conn, match['team2_id'], sport, month, 5)
-            else:
-                update_team_rating_same_conn(
-                    conn, match['team1_id'], sport, month, 1)
-                update_team_rating_same_conn(
-                    conn, match['team2_id'], sport, month, 1)
+            replace_match_team_rating(
+                source_type=SOURCE_LEGACY_MATCH,
+                match_id=match_id,
+                sport_key=sport,
+                tournament_id=match["tournament_id"],
+                team1_id=match["team1_id"],
+                team2_id=match["team2_id"],
+                score1=score1,
+                score2=score2,
+                actor_user_id=None,
+                conn=conn,
+            )
 
         conn.commit()
     except Exception as e:
@@ -3780,6 +4023,9 @@ async def result_enter_score2(message: Message, state: FSMContext):
         return
     finally:
         conn.close()
+
+    if match_meta:
+        await refresh_rating_channel_posts(message.bot, sport_key=sport, entity_type=ENTITY_TEAM)
 
     if match_meta and sport in ("Football", "Basketball", "Volleyball"):
         players = _fetch_players(match_meta["team1_id"], match_meta["team2_id"])
@@ -3904,6 +4150,144 @@ async def result_enter_player_stats(message: Message, state: FSMContext):
 
 # ---------- Управление пользователями ----------
 
+
+def _parse_favorite_sports_display(raw_value) -> str:
+    if not raw_value:
+        return "не указаны"
+    try:
+        raw_sports = json.loads(raw_value)
+        if isinstance(raw_sports, list):
+            return ", ".join(map_sports_to_display(raw_sports)) or "не указаны"
+    except Exception:
+        pass
+    return str(raw_value)
+
+
+def _build_admin_user_card_text(user: dict) -> str:
+    age_str = str(user['age']) if user['age'] is not None else "не указан"
+    email = _display_optional_text(user.get('email'))
+    city = _display_optional_text(user.get('city'))
+    username = f"@{user['username']}" if user.get('username') else "не указан"
+    return (
+        f"👤 Пользователь #{user['id']}\n"
+        f"Telegram ID: {user['telegram_id']}\n"
+        f"Имя: {_display_optional_text(user.get('first_name'), 'не указано')}\n"
+        f"Фамилия: {_display_optional_text(user.get('last_name'))}\n"
+        f"Username: {username}\n"
+        f"Email: {email}\n"
+        f"Город: {city}\n"
+        f"Возраст: {age_str}\n"
+        f"Steam: {_display_optional_text(user.get('steam_id'))}\n"
+        f"Любимые виды спорта: {_parse_favorite_sports_display(user.get('favorite_sports'))}\n"
+        f"Роль: {user['role']}\n"
+        f"Статус: {'🔴 Забанен' if user['is_banned'] else '🟢 Активен'}"
+    )
+
+
+def _admin_user_card_keyboard(user_id: int, source: str, offset: int = 0, query: str = "") -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✏️ Изменить данные", callback_data=f"admin_user_edit_menu_{user_id}")
+    builder.button(text="🏅 Изменить рейтинг", callback_data=f"admin_user_rating_change_{user_id}")
+    builder.button(text="🧹 Очистить рейтинг", callback_data=f"admin_user_rating_clear_{user_id}")
+    builder.button(text="🔄 Сменить роль", callback_data=f"admin_user_changerole_{user_id}")
+    builder.button(text="🔨 Бан/Разбан", callback_data=f"admin_user_toggleban_{user_id}")
+    if source == "list":
+        builder.button(text="🔙 Назад к списку", callback_data=f"admin_user_page_{offset}")
+    elif source == "search":
+        builder.button(text="🔙 К результатам поиска", callback_data=f"admin_search_page_{query}_{offset}")
+    else:
+        builder.button(text="🔙 Назад", callback_data="admin_users")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def _admin_user_edit_menu_keyboard(user_id: int, source: str = "direct", offset: int = 0, query: str = "") -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for callback, label in [
+        ("first_name", "Имя"),
+        ("last_name", "Фамилия"),
+        ("username", "Username"),
+        ("email", "Email"),
+        ("city", "Город"),
+        ("age", "Возраст"),
+        ("steam_id", "Steam"),
+        ("favorite_sports", "Любимые виды спорта"),
+    ]:
+        builder.button(text=f"✏️ {label}", callback_data=f"admin_user_edit_field_{callback}_{user_id}")
+    if source == "list":
+        back_callback = f"admin_user_view_{user_id}_list_{offset}"
+    elif source == "search":
+        back_callback = f"admin_user_view_{user_id}_search_{query}_{offset}"
+    else:
+        back_callback = f"admin_user_view_{user_id}_direct"
+    builder.button(text="🔙 Назад", callback_data=back_callback)
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def _admin_team_manage_card_keyboard(team_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✏️ Данные", callback_data=f"admin_team_edit_menu_{team_id}")
+    builder.button(text="👥 Состав", callback_data=f"admin_team_members_{team_id}")
+    builder.button(text="🏅 Изменить рейтинг", callback_data=f"admin_team_rating_change_{team_id}")
+    builder.button(text="🧹 Очистить рейтинг", callback_data=f"admin_team_rating_clear_{team_id}")
+    builder.button(text="🗑 Удалить", callback_data=f"admin_team_delete_confirm_{team_id}")
+    builder.button(text="🔙 К списку", callback_data="admin_teams")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def _admin_team_edit_menu_keyboard(team_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✏️ Название", callback_data=f"admin_team_edit_field_name_{team_id}")
+    builder.button(text="🏙 Город", callback_data=f"admin_team_edit_field_city_{team_id}")
+    builder.button(text="👤 Лимит участников", callback_data=f"admin_team_edit_field_max_members_{team_id}")
+    builder.button(text="👑 Капитан", callback_data=f"admin_team_change_captain_{team_id}")
+    builder.button(text="🔓/🔒 Набор", callback_data=f"admin_team_toggle_open_{team_id}")
+    builder.button(text="🔔 Уведомления", callback_data=f"admin_team_toggle_notify_{team_id}")
+    builder.button(text="🔗 Режим ссылки", callback_data=f"admin_team_toggle_invite_mode_{team_id}")
+    builder.button(text="📨 Ссылка включена/выкл", callback_data=f"admin_team_toggle_invite_enabled_{team_id}")
+    builder.button(text="🔙 Назад", callback_data=f"admin_team_manage_{team_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def _admin_team_members_keyboard(team_id: int, members: list[dict]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for member in members:
+        builder.button(
+            text=_format_user_label(member),
+            callback_data=f"admin_team_member_actions_{team_id}_{member['id']}"
+        )
+    builder.button(text="➕ Добавить участника", callback_data=f"admin_team_member_add_{team_id}")
+    builder.button(text="🚫 Заблокированные", callback_data=f"admin_team_blocks_{team_id}")
+    builder.button(text="🔙 Назад", callback_data=f"admin_team_manage_{team_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def _admin_team_member_actions_keyboard(team_id: int, user_id: int, is_captain_member: bool) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    if not is_captain_member:
+        builder.button(text="➖ Удалить из команды", callback_data=f"admin_team_member_remove_{team_id}_{user_id}")
+        builder.button(text="⛔ Исключить и заблокировать", callback_data=f"admin_team_member_exclude_{team_id}_{user_id}")
+        builder.button(text="👑 Сделать капитаном", callback_data=f"admin_team_make_captain_{team_id}_{user_id}")
+    builder.button(text="🔙 Назад", callback_data=f"admin_team_members_{team_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def _admin_team_blocks_keyboard(team_id: int, blocks: list[dict]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for row in blocks:
+        builder.button(
+            text=f"{_format_user_label(row)}",
+            callback_data=f"admin_team_unblock_{team_id}_{row['user_id']}"
+        )
+    builder.button(text="🔙 Назад", callback_data=f"admin_team_members_{team_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
 class UserManagement(StatesGroup):
     searching = State()
 
@@ -3981,69 +4365,34 @@ async def admin_user_page(callback: CallbackQuery):
     await callback.answer()
 
 @router.callback_query(F.data.startswith("admin_user_view_"))
-async def admin_user_view(callback: CallbackQuery):
+async def admin_user_view(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
 
     parts = callback.data.split("_")
     user_id = int(parts[3])
-    source = parts[4]  # "list" или "search"
-    offset = int(parts[5]) if source == "list" else 0
-    query = parts[5] if source == "search" else ""
+    source = parts[4] if len(parts) > 4 else "direct"
+    offset = int(parts[5]) if source == "list" and len(parts) > 5 else 0
+    query = parts[5] if source == "search" and len(parts) > 5 else ""
 
     user = get_user_by_id(user_id)
     if not user:
         await callback.answer("Пользователь не найден", show_alert=True)
         return
 
-    age_str = str(user['age']) if user['age'] is not None else "не указан"
-    favorite_sports_display = "не указаны"
-    if user['favorite_sports']:
-        try:
-            raw_sports = json.loads(user['favorite_sports'])
-            if isinstance(raw_sports, list):
-                favorite_sports_display = ", ".join(map_sports_to_display(raw_sports)) or "не указаны"
-            else:
-                favorite_sports_display = str(user['favorite_sports'])
-        except Exception:
-            favorite_sports_display = str(user['favorite_sports'])
-    text = f"""
-👤 Пользователь #{user['id']}
-Telegram ID: {user['telegram_id']}
-Имя: {user['first_name']} {user['last_name']}
-Username: @{user['username']}
-Email: {user['email']}
-Город: {user['city']}
-Возраст: {age_str}
-Steam: {user['steam_id'] if user['steam_id'] else "не указан"}
-Любимые виды спорта: {favorite_sports_display}
-Роль: {user['role']}
-Статус: {'🔴 Забанен' if user['is_banned'] else '🟢 Активен'}
-    """
-
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🔄 Сменить роль",
-                   callback_data=f"admin_user_changerole_{user_id}")
-    builder.button(text="🔨 Бан/Разбан",
-                   callback_data=f"admin_user_toggleban_{user_id}")
-
-    # Кнопка назад в зависимости от источника
-    if source == "list":
-        builder.button(text="🔙 Назад к списку",
-                       callback_data=f"admin_user_page_{offset}")
-    elif source == "search":
-        builder.button(text="🔙 К результатам поиска",
-                       callback_data=f"admin_search_page_{query}_{offset}")
-    else:
-        builder.button(text="🔙 Назад", callback_data="admin_users")
-
-    builder.adjust(1)
-    await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    await state.update_data(
+        admin_user_id=user_id,
+        admin_user_source=source,
+        admin_user_offset=offset,
+        admin_user_query=query,
+    )
+    text = _build_admin_user_card_text(user)
+    await callback.message.edit_text(text, reply_markup=_admin_user_card_keyboard(user_id, source, offset, query))
     await callback.answer()
 
 @router.callback_query(F.data.startswith("admin_user_changerole_"))
-async def admin_user_changerole(callback: CallbackQuery):
+async def admin_user_changerole(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
@@ -4057,13 +4406,20 @@ async def admin_user_changerole(callback: CallbackQuery):
         mark = "✅" if user['role'] == role else ""
         builder.button(
             text=f"{mark} {role}", callback_data=f"admin_user_setrole_{user_id}_{role}")
-    builder.button(text="🔙 Назад", callback_data=f"admin_user_view_{user_id}")
+    data = await state.get_data()
+    if data.get("admin_user_source") == "list":
+        back_callback = f"admin_user_view_{user_id}_list_{int(data.get('admin_user_offset', 0))}"
+    elif data.get("admin_user_source") == "search":
+        back_callback = f"admin_user_view_{user_id}_search_{data.get('admin_user_query', '')}_{int(data.get('admin_user_offset', 0))}"
+    else:
+        back_callback = f"admin_user_view_{user_id}_direct"
+    builder.button(text="🔙 Назад", callback_data=back_callback)
     builder.adjust(1)
     await callback.message.edit_text(f"Выберите новую роль для {user['first_name']}:", reply_markup=builder.as_markup())
     await callback.answer()
 
 @router.callback_query(F.data.startswith("admin_user_setrole_"))
-async def admin_user_setrole(callback: CallbackQuery):
+async def admin_user_setrole(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
@@ -4072,10 +4428,11 @@ async def admin_user_setrole(callback: CallbackQuery):
     new_role = parts[4]
     update_user_role(user_id, new_role)
     await callback.answer(f"Роль изменена на {new_role}")
-    await admin_user_view(callback)
+    await state.update_data(admin_user_id=user_id)
+    await _render_admin_user_card_by_state(callback, state)
 
 @router.callback_query(F.data.startswith("admin_user_toggleban_"))
-async def admin_user_toggleban(callback: CallbackQuery):
+async def admin_user_toggleban(callback: CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
@@ -4083,7 +4440,8 @@ async def admin_user_toggleban(callback: CallbackQuery):
     new_status = toggle_user_ban(user_id)
     status_text = "забанен" if new_status else "разбанен"
     await callback.answer(f"Пользователь {status_text}")
-    await admin_user_view(callback)
+    await state.update_data(admin_user_id=user_id)
+    await _render_admin_user_card_by_state(callback, state)
 
 @router.callback_query(F.data == "admin_user_search")
 async def admin_user_search_start(callback: CallbackQuery, state: FSMContext):
@@ -4146,6 +4504,248 @@ async def admin_search_page(callback: CallbackQuery):
     total = search_users_count(query)
     await show_search_results(callback.message, query, users, offset, total)
 
+
+async def _render_admin_user_card_by_state(target, state: FSMContext, *, bot: Bot | None = None):
+    data = await state.get_data()
+    user_id = data.get("admin_user_id")
+    if not user_id:
+        return
+    user = get_user_by_id(int(user_id))
+    if not user:
+        return
+    text = _build_admin_user_card_text(user)
+    markup = _admin_user_card_keyboard(
+        int(user_id),
+        data.get("admin_user_source", "direct"),
+        int(data.get("admin_user_offset", 0)),
+        data.get("admin_user_query", ""),
+    )
+    if isinstance(target, CallbackQuery):
+        await _safe_edit_admin_message(target, text, markup)
+    else:
+        await target.answer(text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("admin_user_edit_menu_"))
+async def admin_user_edit_menu(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    user_id = int(callback.data.split("_")[4])
+    user = get_user_by_id(user_id)
+    if not user:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+    data = await state.get_data()
+    source = data.get("admin_user_source", "direct")
+    offset = int(data.get("admin_user_offset", 0))
+    query = data.get("admin_user_query", "")
+    await callback.message.edit_text(
+        f"✏️ Редактирование пользователя\n\n{_format_user_label(user)}\n\nВыберите поле:",
+        reply_markup=_admin_user_edit_menu_keyboard(user_id, source, offset, query),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_user_edit_field_"))
+async def admin_user_edit_field(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    tail = callback.data.replace("admin_user_edit_field_", "")
+    field_name, user_id_token = tail.rsplit("_", 1)
+    user_id = int(user_id_token)
+    user = get_user_by_id(user_id)
+    if not user:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+    await state.update_data(admin_edit_user_id=user_id, admin_edit_user_field=field_name)
+    if field_name == "favorite_sports":
+        sports = get_all_sports()
+        current_sports = json.loads(user['favorite_sports']) if user.get('favorite_sports') else []
+        await state.set_state(AdminUserEdit.sports)
+        await state.update_data(admin_edit_user_sports=current_sports)
+        await callback.message.edit_text(
+            "Выберите любимые виды спорта пользователя:",
+            reply_markup=sports_choice_keyboard(sports, current_sports),
+        )
+        await callback.answer()
+        return
+
+    prompts = {
+        "first_name": "Введите новое имя:",
+        "last_name": "Введите новую фамилию или '-' для очистки:",
+        "username": "Введите новый username без @ или '-' для очистки:",
+        "email": "Введите новый email:",
+        "city": "Введите новый город или '-' для очистки:",
+        "age": "Введите возраст от 0 до 100 или '-' для очистки:",
+        "steam_id": "Введите SteamID/ссылку или '-' для очистки:",
+    }
+    await state.set_state(AdminUserEdit.value)
+    await callback.message.edit_text(prompts.get(field_name, "Введите новое значение:"))
+    await callback.answer()
+
+
+@router.callback_query(AdminUserEdit.sports, F.data.startswith("sport_"), F.data != "sport_done")
+async def admin_user_edit_sports_toggle(callback: CallbackQuery, state: FSMContext):
+    sport = callback.data.replace("sport_", "")
+    data = await state.get_data()
+    selected = list(data.get("admin_edit_user_sports", []))
+    if sport in selected:
+        selected.remove(sport)
+    else:
+        selected.append(sport)
+    await state.update_data(admin_edit_user_sports=selected)
+    await callback.message.edit_reply_markup(reply_markup=sports_choice_keyboard(get_all_sports(), selected))
+    await callback.answer()
+
+
+@router.callback_query(AdminUserEdit.sports, F.data == "sport_done")
+async def admin_user_edit_sports_done(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    user_id = data.get("admin_edit_user_id")
+    selected = data.get("admin_edit_user_sports", [])
+    if not selected:
+        await callback.answer("Выберите хотя бы один вид спорта.", show_alert=True)
+        return
+    update_user_by_id(int(user_id), favorite_sports=json.dumps(selected, ensure_ascii=False))
+    await state.set_state(None)
+    await _render_admin_user_card_by_state(callback, state)
+    await callback.answer("Данные обновлены")
+
+
+@router.message(AdminUserEdit.value)
+async def admin_user_edit_value(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет прав")
+        return
+    data = await state.get_data()
+    user_id = data.get("admin_edit_user_id")
+    field_name = data.get("admin_edit_user_field")
+    if not user_id or not field_name:
+        await state.clear()
+        await message.answer("Сессия редактирования устарела.")
+        return
+
+    raw_value = (message.text or "").strip()
+    clear_requested = raw_value == "-"
+    if field_name == "email":
+        if "@" not in raw_value or "." not in raw_value:
+            await message.answer("Введите корректный email.")
+            return
+        user = get_user_by_id(int(user_id))
+        if not is_email_unique(raw_value, exclude_telegram_id=user["telegram_id"]):
+            await message.answer("Этот email уже используется.")
+            return
+        update_user_by_id(int(user_id), email=raw_value)
+    elif field_name == "age":
+        if clear_requested:
+            update_user_by_id(int(user_id), age=None)
+        else:
+            try:
+                age = int(raw_value)
+            except ValueError:
+                await message.answer("Введите число от 0 до 100.")
+                return
+            if age < 0 or age > 100:
+                await message.answer("Введите число от 0 до 100.")
+                return
+            update_user_by_id(int(user_id), age=age)
+    elif field_name == "steam_id":
+        if clear_requested:
+            update_user_by_id(int(user_id), steam_id=None)
+        else:
+            parsed = parse_steam_link(raw_value)
+            if not parsed:
+                await message.answer("Не удалось распознать SteamID или ссылку.")
+                return
+            update_user_steam_id(int(user_id), parsed)
+    elif field_name in {"last_name", "username", "city"}:
+        if field_name == "username" and not clear_requested:
+            raw_value = raw_value.lstrip("@")
+        update_user_by_id(int(user_id), **{field_name: None if clear_requested else raw_value})
+    else:
+        if not raw_value:
+            await message.answer("Значение не может быть пустым.")
+            return
+        update_user_by_id(int(user_id), **{field_name: raw_value})
+
+    await state.set_state(None)
+    await _render_admin_user_card_by_state(message, state)
+
+
+async def _start_rating_shortcut(
+    callback: CallbackQuery,
+    state: FSMContext,
+    *,
+    entity_type: str,
+    entity_id: int,
+    entity_name: str,
+    mode: str,
+    origin: str,
+):
+    await state.update_data(
+        rating_shortcut_origin=origin,
+        rating_shortcut_mode=mode,
+        rating_entity_type=entity_type,
+        rating_entity_id=entity_id,
+        rating_entity_name=entity_name,
+        rating_sport_key=None,
+        rating_format_key=None,
+        rating_season_id=None,
+    )
+    await callback.message.edit_text(
+        f"📊 Управление рейтингом\n\nВыбрано: {entity_name}\nРежим: {'Изменить рейтинг' if mode == 'change' else 'Очистить рейтинг'}\n\nВыберите тип рейтинга:",
+        reply_markup=admin_rating_scope_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("admin_user_rating_change_"))
+async def admin_user_rating_change(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    user_id = int(callback.data.split("_")[4])
+    user = get_user_by_id(user_id)
+    if not user:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+    await state.update_data(admin_user_id=user_id)
+    await _start_rating_shortcut(
+        callback,
+        state,
+        entity_type=ENTITY_PLAYER,
+        entity_id=user_id,
+        entity_name=_format_user_label(user),
+        mode="change",
+        origin="user_card",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_user_rating_clear_"))
+async def admin_user_rating_clear(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    user_id = int(callback.data.split("_")[4])
+    user = get_user_by_id(user_id)
+    if not user:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+    await state.update_data(admin_user_id=user_id)
+    await _start_rating_shortcut(
+        callback,
+        state,
+        entity_type=ENTITY_PLAYER,
+        entity_id=user_id,
+        entity_name=_format_user_label(user),
+        mode="clear",
+        origin="user_card",
+    )
+    await callback.answer()
+
+
 # ---------- Удаление турнира (кнопка в карточке турнира) ----------
 
 @router.callback_query(F.data.startswith("admin_delete_tournament_"))
@@ -4197,124 +4797,621 @@ async def admin_delete_tournament_execute(callback: CallbackQuery, state: FSMCon
 
 # ---------- Управление рейтингом ----------
 
-@router.callback_query(F.data == "admin_rating")
-async def admin_rating_menu(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-    sports = get_all_sports()
-    await callback.message.edit_text("Выберите вид спорта:", reply_markup=admin_rating_menu_keyboard(sports))
-    await callback.answer()
+def _admin_rating_scope_display(scope: str) -> str:
+    return "Общий" if scope == SCOPE_OVERALL else "Сезонный"
 
-@router.callback_query(F.data.startswith("admin_rating_sport_"))
-async def admin_rating_sport_actions(callback: CallbackQuery):
-    await callback.answer()
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-    sport = callback.data.replace("admin_rating_sport_", "")
-    await callback.message.edit_text(
-        f"Действия для спорта {get_sport_display_name(sport)}:",
-        reply_markup=admin_rating_sport_actions_keyboard(sport),
-    )
 
-@router.callback_query(F.data.startswith("admin_rating_reset_all_"))
-async def admin_rating_reset_all(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-    sport = callback.data.replace("admin_rating_reset_all_", "")
-    reset_sport_rating(sport)
-    request_site_sync(f"rating_reset_all:{sport}")
-    await callback.answer(f"Рейтинг по {get_sport_display_name(sport)} обнулён!", show_alert=True)
-    await admin_rating_menu(callback)
+def _admin_rating_entity_display(entity_type: str) -> str:
+    return "Игроки" if entity_type == ENTITY_PLAYER else "Команды"
 
-@router.callback_query(F.data.startswith("admin_rating_list_teams_"))
-async def admin_rating_list_teams(callback: CallbackQuery):
-    await callback.answer()
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-    sport = callback.data.replace("admin_rating_list_teams_", "")
-    teams = get_teams_with_rating(sport)
-    if not teams:
-        await callback.message.edit_text(
-            f"Нет команд по спорту {get_sport_display_name(sport)}.",
-            reply_markup=back_to_main_keyboard(),
-        )
-        await callback.answer()
-        return
-    await callback.message.edit_text(
-        f"Команды по {get_sport_display_name(sport)}:",
-        reply_markup=admin_rating_teams_list_keyboard(teams, sport),
-    )
 
-@router.callback_query(F.data.startswith("admin_rating_team_"))
-async def admin_rating_team_actions(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-    parts = callback.data.split("_")
-    team_id = int(parts[3])
-    sport = parts[4]
-    await state.update_data(team_id=team_id, sport=sport)
-    await callback.message.edit_text(f"Действия для команды:", reply_markup=admin_rating_team_actions_keyboard(team_id, sport))
+def _admin_rating_format_display(format_key: str | None) -> str:
+    return "Общий" if not format_key else format_key
 
-@router.callback_query(F.data.startswith("admin_rating_reset_team_"))
-async def admin_rating_reset_team(callback: CallbackQuery):
-    await callback.answer()
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-    parts = callback.data.split("_")
-    team_id = int(parts[4])
-    sport = parts[5]
-    reset_team_rating(team_id, sport)
-    request_site_sync(f"rating_reset_team:{sport}:{team_id}")
-    await callback.answer("Рейтинг команды обнулён!", show_alert=True)
-    # Вернуться к списку команд этого спорта
-    teams = get_teams_with_rating(sport)
-    await callback.message.edit_text(
-        f"Команды по {get_sport_display_name(sport)}:",
-        reply_markup=admin_rating_teams_list_keyboard(teams, sport),
-    )
 
-class DeductPoints(StatesGroup):
-    points = State()
+def _display_optional_text(value: str | None, fallback: str = "не указан") -> str:
+    return (value or "").strip() or fallback
 
-@router.callback_query(F.data.startswith("admin_rating_deduct_"))
-async def admin_rating_deduct_start(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Нет прав", show_alert=True)
-        return
-    parts = callback.data.split("_")
-    team_id = int(parts[3])
-    sport = parts[4]
-    await state.update_data(team_id=team_id, sport=sport)
-    await state.set_state(DeductPoints.points)
-    await callback.message.edit_text("Введите количество очков для снятия:")
 
-@router.message(DeductPoints.points)
-async def admin_rating_deduct_execute(message: Message, state: FSMContext):
+def _format_user_label(user: dict) -> str:
+    username = (user.get("username") or "").strip()
+    name = (user.get("first_name") or "Игрок").strip()
+    return f"{name} (@{username})" if username else name
+
+
+async def _safe_edit_admin_message(callback: CallbackQuery, text: str, reply_markup: InlineKeyboardMarkup):
     try:
-        points = int(message.text)
-        if points <= 0:
-            await message.answer("Введите положительное число.")
+        await callback.message.edit_text(text, reply_markup=reply_markup)
+    except TelegramBadRequest as exc:
+        if "message is not modified" in str(exc).lower():
             return
-    except ValueError:
-        await message.answer("Введите число!")
+        raise
+
+
+def _extract_forwarded_channel(message: Message) -> tuple[int, str | None] | None:
+    origin = getattr(message, "forward_origin", None)
+    if isinstance(origin, MessageOriginChannel):
+        return int(origin.chat.id), origin.chat.title or origin.chat.username
+    forwarded_chat = getattr(message, "forward_from_chat", None)
+    if forwarded_chat and getattr(forwarded_chat, "type", None) == "channel":
+        return int(forwarded_chat.id), forwarded_chat.title or forwarded_chat.username
+    return None
+
+
+async def _render_admin_rating_sports(callback: CallbackQuery, state: FSMContext):
+    sports = get_all_sports()
+    data = await state.get_data()
+    scope = data.get("rating_scope", SCOPE_OVERALL)
+    entity_type = data.get("rating_entity_type")
+    entity_label = _admin_rating_entity_display(entity_type) if entity_type else "не выбрано"
+    await callback.message.edit_text(
+        f"📊 Управление рейтингом\n\nТип: {_admin_rating_scope_display(scope)}\nКто в рейтинге: {entity_label}\n\nВыберите вид спорта:",
+        reply_markup=admin_rating_sport_picker_keyboard(sports),
+    )
+
+
+async def _render_admin_rating_format(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    sport_key = data["rating_sport_key"]
+    scope = data["rating_scope"]
+    season = get_active_rating_season(sport_key) if scope == SCOPE_SEASONAL else None
+    season_text = f"\nСезон: {season['name']}" if season else ""
+    await state.update_data(rating_season_id=int(season["id"]) if season else None)
+    await callback.message.edit_text(
+        f"📊 Управление рейтингом\n\nТип: {_admin_rating_scope_display(scope)}\nКто в рейтинге: {_admin_rating_entity_display(data['rating_entity_type'])}\nСпорт: {get_sport_display_name(sport_key)}{season_text}\n\nВыберите формат:",
+        reply_markup=admin_rating_format_picker_keyboard(
+            get_format_options_for_sport(sport_key) if sport_supports_formats(sport_key) else [],
+            allow_next_season=scope == SCOPE_SEASONAL,
+        ),
+    )
+
+
+def _load_admin_rating_entities(
+    entity_type: str,
+    sport_key: str,
+    rating_scope: str,
+    format_key: str | None,
+    season_id: int | None,
+    offset: int,
+) -> tuple[list[dict], bool, bool]:
+    limit = 10
+    rows, has_next = get_rating_leaderboard(
+        entity_type=entity_type,
+        sport_key=sport_key,
+        rating_scope=rating_scope,
+        format_key=format_key,
+        season_id=season_id,
+        limit=limit,
+        offset=offset,
+    )
+    items: list[dict] = []
+    for row in rows:
+        item = {
+            "id": int(row["entity_id"]),
+            "rating_value": int(row.get("rating_value") or 0),
+        }
+        if entity_type == ENTITY_TEAM:
+            item["name"] = row.get("team_name") or f"Команда #{row['entity_id']}"
+        else:
+            item["first_name"] = row.get("first_name") or "Игрок"
+            item["username"] = row.get("username") or ""
+        items.append(item)
+    return items, offset > 0, has_next
+
+
+async def _render_admin_rating_entities(callback: CallbackQuery, state: FSMContext, offset: int = 0):
+    data = await state.get_data()
+    items, has_prev, has_next = _load_admin_rating_entities(
+        data["rating_entity_type"],
+        data["rating_sport_key"],
+        data["rating_scope"],
+        data.get("rating_format_key"),
+        data.get("rating_season_id"),
+        offset,
+    )
+    season = None
+    if data["rating_scope"] == SCOPE_SEASONAL and data.get("rating_season_id"):
+        season = get_rating_season_by_id(int(data["rating_season_id"]))
+    season_text = f"\nСезон: {season['name']}" if season else ""
+    format_label = _admin_rating_format_display(data.get("rating_format_key"))
+    show_format_button = bool(sport_supports_formats(data["rating_sport_key"]))
+    show_next_season_button = data["rating_scope"] == SCOPE_SEASONAL
+    await state.update_data(rating_entity_offset=offset)
+    await _safe_edit_admin_message(
+        callback,
+        f"📊 Управление рейтингом\n\nТип: {_admin_rating_scope_display(data['rating_scope'])}\nКто в рейтинге: {_admin_rating_entity_display(data['rating_entity_type'])}\nСпорт: {get_sport_display_name(data['rating_sport_key'])}\nФормат: {format_label}{season_text}\n\nВыберите {'игрока' if data['rating_entity_type'] == ENTITY_PLAYER else 'команду'} для изменения очков:",
+        reply_markup=admin_rating_entity_list_keyboard(
+            items,
+            entity_type=data["rating_entity_type"],
+            offset=offset,
+            has_prev=has_prev,
+            has_next=has_next,
+            show_format_button=show_format_button,
+            show_next_season_button=show_next_season_button,
+            show_publish_button=True,
+        ),
+    )
+
+
+async def _render_admin_rating_actions(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    row = get_rating_row(
+        entity_type=data["rating_entity_type"],
+        entity_id=int(data["rating_entity_id"]),
+        sport_key=data["rating_sport_key"],
+        rating_scope=data["rating_scope"],
+        format_key=data.get("rating_format_key"),
+        season_id=data.get("rating_season_id"),
+    )
+    current_value = int(row["rating_value"]) if row else 0
+    season = None
+    if data["rating_scope"] == SCOPE_SEASONAL and data.get("rating_season_id"):
+        season = get_rating_season_by_id(int(data["rating_season_id"]))
+    season_text = f"\nСезон: {season['name']}" if season else ""
+    await callback.message.edit_text(
+        f"📊 Управление рейтингом\n\nТип: {_admin_rating_scope_display(data['rating_scope'])}\nВыбрано: {data['rating_entity_name']}\nСпорт: {get_sport_display_name(data['rating_sport_key'])}\nФормат: {_admin_rating_format_display(data.get('rating_format_key'))}{season_text}\nТекущий рейтинг: {current_value}\n\nВыберите действие:",
+        reply_markup=admin_rating_action_keyboard(),
+    )
+
+
+def _is_rating_shortcut(data: dict) -> bool:
+    return bool(data.get("rating_shortcut_origin"))
+
+
+async def _return_from_rating_shortcut(target, state: FSMContext):
+    data = await state.get_data()
+    origin = data.get("rating_shortcut_origin")
+    if origin == "user_card":
+        await _render_admin_user_card_by_state(target, state)
+        return
+    if origin == "team_card":
+        team_id = int(data.get("admin_team_id") or data.get("rating_return_team_id") or 0)
+        team_text = _build_admin_team_card_text(team_id) if team_id else None
+        if team_text:
+            markup = _admin_team_manage_card_keyboard(team_id)
+            if isinstance(target, CallbackQuery):
+                await _safe_edit_admin_message(target, team_text, markup)
+            else:
+                await target.answer(team_text, reply_markup=markup)
+
+
+async def _handle_rating_target_shortcut(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not _is_rating_shortcut(data):
+        return False
+    if data.get("rating_shortcut_mode") == "clear":
+        actor = get_user(callback.from_user.id)
+        result = clear_rating_bucket(
+            entity_type=data["rating_entity_type"],
+            entity_id=int(data["rating_entity_id"]),
+            sport_key=data["rating_sport_key"],
+            rating_scope=data["rating_scope"],
+            format_key=data.get("rating_format_key"),
+            season_id=data.get("rating_season_id"),
+            actor_user_id=actor["id"] if actor else None,
+            reason="Точечная очистка рейтинга через админ-карточку",
+        )
+        if result.get("ok"):
+            request_site_sync(
+                f"rating_clear:{data['rating_scope']}:{data['rating_entity_type']}:{data['rating_sport_key']}:{data['rating_entity_id']}"
+            )
+            await refresh_rating_channel_posts(
+                callback.bot,
+                sport_key=data["rating_sport_key"],
+                entity_type=data["rating_entity_type"],
+            )
+            await callback.answer("Рейтинг очищен.", show_alert=True)
+        else:
+            await callback.answer("Этот рейтинг уже равен нулю.", show_alert=True)
+        await _return_from_rating_shortcut(callback, state)
+        return True
+
+    await _render_admin_rating_actions(callback, state)
+    return True
+
+
+@router.callback_query(F.data == "admin_rating")
+async def admin_rating_menu(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text(
+        "📊 Управление рейтингом\n\nВыберите режим работы:",
+        reply_markup=admin_rating_scope_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.in_(["admin_rating_scope_overall", "admin_rating_scope_seasonal"]))
+async def admin_rating_scope_pick(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    scope = SCOPE_OVERALL if callback.data.endswith("overall") else SCOPE_SEASONAL
+    await state.update_data(rating_scope=scope)
+    data = await state.get_data()
+    if _is_rating_shortcut(data):
+        await _render_admin_rating_sports(callback, state)
+    else:
+        await callback.message.edit_text(
+            f"📊 Управление рейтингом\n\nТип: {_admin_rating_scope_display(scope)}\n\nВыберите, чей рейтинг хотите изменить:",
+            reply_markup=admin_rating_entity_keyboard(scope),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.in_(["admin_rating_entity_player", "admin_rating_entity_team"]))
+async def admin_rating_entity_pick(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    entity_type = ENTITY_PLAYER if callback.data.endswith("player") else ENTITY_TEAM
+    await state.update_data(rating_entity_type=entity_type)
+    await _render_admin_rating_sports(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_rating_back_entity")
+async def admin_rating_back_entity(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
         return
     data = await state.get_data()
-    team_id = data['team_id']
-    sport = data['sport']
-    deduct_team_points(team_id, sport, points)
-    request_site_sync(f"rating_deduct:{sport}:{team_id}")
-    await state.clear()
-    await message.answer(f"С команды снято {points} очков.")
-    # Вернуться в меню рейтинга
-    await message.answer("Панель администратора:", reply_markup=admin_menu_keyboard())
+    if _is_rating_shortcut(data):
+        await _return_from_rating_shortcut(callback, state)
+    else:
+        await callback.message.edit_text(
+            f"📊 Управление рейтингом\n\nТип: {_admin_rating_scope_display(data.get('rating_scope', SCOPE_OVERALL))}\n\nВыберите, чей рейтинг хотите изменить:",
+            reply_markup=admin_rating_entity_keyboard(data.get("rating_scope", SCOPE_OVERALL)),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_rating_pick_sport_"))
+async def admin_rating_pick_sport(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    sport_key = callback.data.replace("admin_rating_pick_sport_", "")
+    scope = (await state.get_data()).get("rating_scope")
+    season = get_active_rating_season(sport_key) if scope == SCOPE_SEASONAL else None
+    await state.update_data(
+        rating_sport_key=sport_key,
+        rating_format_key=None,
+        rating_season_id=int(season["id"]) if season else None,
+    )
+    data = await state.get_data()
+    if _is_rating_shortcut(data):
+        if sport_supports_formats(sport_key):
+            await _render_admin_rating_format(callback, state)
+        else:
+            await _handle_rating_target_shortcut(callback, state)
+    else:
+        await state.update_data(rating_entity_id=None)
+        await _render_admin_rating_entities(callback, state, 0)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_rating_back_sport")
+async def admin_rating_back_sport(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    await _render_admin_rating_sports(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_rating_open_formats")
+async def admin_rating_open_formats(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    data = await state.get_data()
+    if not sport_supports_formats(data.get("rating_sport_key")):
+        await callback.answer("Для этого спорта нет форматного рейтинга.", show_alert=True)
+        return
+    await _render_admin_rating_format(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_rating_pick_format_"))
+async def admin_rating_pick_format(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    token = callback.data.replace("admin_rating_pick_format_", "")
+    format_key = None if token == "general" else token
+    await state.update_data(rating_format_key=format_key)
+    data = await state.get_data()
+    if _is_rating_shortcut(data):
+        await _handle_rating_target_shortcut(callback, state)
+    else:
+        await _render_admin_rating_entities(callback, state, 0)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_rating_pick_format_general")
+async def admin_rating_pick_format_general_legacy(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    await state.update_data(rating_format_key=None)
+    data = await state.get_data()
+    if _is_rating_shortcut(data):
+        await _handle_rating_target_shortcut(callback, state)
+    else:
+        await _render_admin_rating_entities(callback, state, 0)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_rating_next_season")
+async def admin_rating_next_season_handler(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    data = await state.get_data()
+    sport_key = data.get("rating_sport_key")
+    if not sport_key:
+        await callback.answer("Сначала выберите спорт.", show_alert=True)
+        return
+    season = get_active_rating_season(sport_key)
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Подтвердить", callback_data="admin_rating_next_season_confirm")
+    builder.button(text="❌ Отмена", callback_data="admin_rating_next_season_cancel")
+    builder.adjust(1)
+    await callback.message.edit_text(
+        f"⚠️ Подтверждение перехода сезона\n\n"
+        f"Спорт: {get_sport_display_name(sport_key)}\n"
+        f"Текущий активный сезон: {season['name']}\n\n"
+        "После подтверждения текущий сезон будет завершен, создастся новый пустой сезон, а общий рейтинг останется без изменений.",
+        reply_markup=builder.as_markup(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_rating_next_season_cancel")
+async def admin_rating_next_season_cancel(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    await _render_admin_rating_entities(callback, state, int((await state.get_data()).get("rating_entity_offset", 0)))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_rating_next_season_confirm")
+async def admin_rating_next_season_confirm(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    data = await state.get_data()
+    sport_key = data.get("rating_sport_key")
+    if not sport_key:
+        await callback.answer("Сначала выберите спорт.", show_alert=True)
+        return
+    result = advance_to_next_rating_season(sport_key)
+    await state.update_data(rating_season_id=int(result["current"]["id"]))
+    request_site_sync(f"rating_next_season:{sport_key}:{result['current']['id']}")
+    await refresh_rating_channel_posts(callback.bot, sport_key=sport_key)
+    await _render_admin_rating_entities(callback, state, 0)
+    await callback.answer("Создан новый активный сезон.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("admin_rating_page_"))
+async def admin_rating_page(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    offset = int(callback.data.replace("admin_rating_page_", ""))
+    await _render_admin_rating_entities(callback, state, max(0, offset))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_rating_back_format")
+async def admin_rating_back_format(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    await _render_admin_rating_sports(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_rating_back_entities_general")
+async def admin_rating_back_entities_general(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    await state.update_data(rating_format_key=None)
+    data = await state.get_data()
+    if _is_rating_shortcut(data):
+        await _handle_rating_target_shortcut(callback, state)
+    else:
+        await _render_admin_rating_entities(callback, state, 0)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_rating_back_entities")
+async def admin_rating_back_entities(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    data = await state.get_data()
+    if _is_rating_shortcut(data):
+        await _return_from_rating_shortcut(callback, state)
+    else:
+        await _render_admin_rating_entities(callback, state, int(data.get("rating_entity_offset", 0)))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_rating_publish_channel")
+async def admin_rating_publish_channel(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    data = await state.get_data()
+    if not data.get("rating_sport_key") or not data.get("rating_entity_type") or not data.get("rating_scope"):
+        await callback.answer("Сначала выберите рейтинг.", show_alert=True)
+        return
+    await state.set_state(AdminRatingChannelPublish.channel)
+    await callback.message.answer(
+        "Перешлите любое сообщение из канала или пришлите @channel_username.\n\n"
+        "Чтобы отменить, отправьте: отмена"
+    )
+    await callback.answer()
+
+
+@router.message(AdminRatingChannelPublish.channel)
+async def admin_rating_publish_channel_input(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет прав.")
+        return
+    text = (message.text or "").strip()
+    if text.lower() in {"отмена", "cancel", "/cancel"}:
+        await state.set_state(None)
+        await message.answer("Публикация в канал отменена.")
+        return
+
+    forwarded_channel = _extract_forwarded_channel(message)
+    channel_ref: int | str | None = None
+    channel_label: str | None = None
+    if forwarded_channel:
+        channel_ref, channel_label = forwarded_channel
+    else:
+        parsed_target = parse_channel_target_text(text)
+        if not parsed_target:
+            await message.answer("Пришлите пересланное сообщение из канала или @channel_username.")
+            return
+        channel_ref = parsed_target
+
+    try:
+        chat = await message.bot.get_chat(channel_ref)
+    except Exception:
+        await message.answer("Не удалось открыть канал. Проверьте, что бот добавлен в канал и username указан верно.")
+        return
+
+    if getattr(chat, "type", None) != "channel":
+        await message.answer("Нужен именно канал Telegram, а не личный чат или группа.")
+        return
+
+    data = await state.get_data()
+    actor = get_user(message.from_user.id)
+    try:
+        result = await publish_rating_channel_post(
+            message.bot,
+            chat_id=int(chat.id),
+            entity_type=data["rating_entity_type"],
+            sport_key=data["rating_sport_key"],
+            rating_scope=data["rating_scope"],
+            season_id=data.get("rating_season_id"),
+            format_key=data.get("rating_format_key"),
+            created_by=actor["id"] if actor else None,
+        )
+    except Exception as exc:
+        logger.warning("Не удалось опубликовать рейтинг в канал chat_id=%s: %s", getattr(chat, "id", None), exc)
+        await message.answer(
+            "Не удалось опубликовать рейтинг в канал. Убедитесь, что бот есть в канале и имеет право отправлять сообщения."
+        )
+        return
+
+    await state.set_state(None)
+    target_name = channel_label or getattr(chat, "title", None) or getattr(chat, "username", None) or str(chat.id)
+    action_text = "Сообщение обновлено" if result.get("reused_existing") else "Live-пост опубликован"
+    await message.answer(f"✅ {action_text} в канале: {target_name}")
+
+
+@router.callback_query(F.data.startswith("admin_rating_pick_entity_"))
+async def admin_rating_pick_entity(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    entity_id = int(callback.data.replace("admin_rating_pick_entity_", ""))
+    data = await state.get_data()
+    conn = get_connection()
+    cur = conn.cursor()
+    if data["rating_entity_type"] == ENTITY_TEAM:
+        cur.execute("SELECT name FROM teams WHERE id=?", (entity_id,))
+        row = cur.fetchone()
+        entity_name = row["name"] if row else f"Команда #{entity_id}"
+    else:
+        cur.execute("SELECT first_name, username FROM users WHERE id=?", (entity_id,))
+        row = cur.fetchone()
+        if row:
+            username = row["username"] or "без_username"
+            entity_name = f"{row['first_name'] or 'Игрок'} (@{username})"
+        else:
+            entity_name = f"Игрок #{entity_id}"
+    conn.close()
+    await state.update_data(rating_entity_id=entity_id, rating_entity_name=entity_name)
+    await _render_admin_rating_actions(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(F.data.in_(["admin_rating_action_add", "admin_rating_action_sub"]))
+async def admin_rating_action_pick(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    operation = "add" if callback.data.endswith("add") else "sub"
+    await state.update_data(rating_operation=operation)
+    label = "добавления" if operation == "add" else "снятия"
+    await state.set_state(AdminRatingAdjustment.points)
+    await callback.message.edit_text(f"Введите количество очков для {label}:")
+    await callback.answer()
+
+
+@router.message(AdminRatingAdjustment.points)
+async def admin_rating_apply_points(message: Message, state: FSMContext):
+    try:
+        points = int((message.text or "").strip())
+    except ValueError:
+        await message.answer("Введите число.")
+        return
+
+    if points <= 0:
+        await message.answer("Введите положительное число.")
+        return
+
+    data = await state.get_data()
+    delta = points if data.get("rating_operation") == "add" else -points
+    actor = get_user(message.from_user.id)
+    result = apply_manual_rating_adjustment(
+        entity_type=data["rating_entity_type"],
+        entity_id=int(data["rating_entity_id"]),
+        sport_key=data["rating_sport_key"],
+        rating_scope=data["rating_scope"],
+        format_key=data.get("rating_format_key"),
+        season_id=data.get("rating_season_id"),
+        delta=delta,
+        actor_user_id=actor["id"] if actor else None,
+        reason="Ручная корректировка через админ-панель",
+    )
+    if not result.get("ok"):
+        await message.answer("Изменение не применилось: рейтинг уже равен нулю.")
+        await state.clear()
+        await message.answer("Панель администратора:", reply_markup=admin_menu_keyboard())
+        return
+
+    request_site_sync(
+        f"rating_manual:{data['rating_scope']}:{data['rating_entity_type']}:{data['rating_sport_key']}:{data['rating_entity_id']}"
+    )
+    await refresh_rating_channel_posts(
+        message.bot,
+        sport_key=data["rating_sport_key"],
+        entity_type=data["rating_entity_type"],
+    )
+    sign = "+" if result["applied_delta"] > 0 else ""
+    if _is_rating_shortcut(data):
+        await state.set_state(None)
+        await message.answer(
+            f"✅ Изменение применено.\n{data['rating_entity_name']}: {sign}{result['applied_delta']} очков\nНовый рейтинг: {result['new_value']}"
+        )
+        await _return_from_rating_shortcut(message, state)
+    else:
+        await state.clear()
+        await message.answer(
+            f"✅ Изменение применено.\n{data['rating_entity_name']}: {sign}{result['applied_delta']} очков\nНовый рейтинг: {result['new_value']}"
+        )
+        await message.answer("Панель администратора:", reply_markup=admin_menu_keyboard())
 
 # ---------- Управление командами ----------
 
@@ -4385,7 +5482,7 @@ async def admin_teams_page(callback: CallbackQuery):
     await show_admin_teams_page(callback.message, offset)
 
 @router.callback_query(F.data.startswith("admin_team_manage_"))
-async def admin_team_manage_card(callback: CallbackQuery):
+async def admin_team_manage_card(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
@@ -4396,7 +5493,7 @@ async def admin_team_manage_card(callback: CallbackQuery):
     if not text:
         await callback.answer("Команда не найдена", show_alert=True)
         return
-
+    await state.update_data(admin_team_id=team_id)
     await callback.message.edit_text(text, reply_markup=_admin_team_manage_card_keyboard(team_id))
 
 @router.callback_query(F.data.startswith("admin_team_delete_confirm_"))
@@ -4438,7 +5535,7 @@ async def admin_team_delete_execute(callback: CallbackQuery):
     await callback.message.edit_text("✅ Команда удалена.", reply_markup=kb)
 
 @router.callback_query(F.data.startswith("admin_delete_team_"))
-async def admin_delete_team_legacy_redirect(callback: CallbackQuery):
+async def admin_delete_team_legacy_redirect(callback: CallbackQuery, state: FSMContext):
     """Legacy callback: перенаправляем старые кнопки в новый поток карточки команды."""
     await callback.answer()
     if not is_admin(callback.from_user.id):
@@ -4450,8 +5547,331 @@ async def admin_delete_team_legacy_redirect(callback: CallbackQuery):
     if not text:
         await callback.answer("Команда не найдена", show_alert=True)
         return
-
+    await state.update_data(admin_team_id=team_id)
     await callback.message.edit_text(text, reply_markup=_admin_team_manage_card_keyboard(team_id))
+
+
+@router.callback_query(F.data.startswith("admin_team_rating_change_"))
+async def admin_team_rating_change(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    team_id = int(callback.data.split("_")[4])
+    team = get_team_by_id(team_id)
+    if not team:
+        await callback.answer("Команда не найдена", show_alert=True)
+        return
+    await state.update_data(admin_team_id=team_id, rating_return_team_id=team_id)
+    await _start_rating_shortcut(
+        callback,
+        state,
+        entity_type=ENTITY_TEAM,
+        entity_id=team_id,
+        entity_name=team["name"],
+        mode="change",
+        origin="team_card",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_team_rating_clear_"))
+async def admin_team_rating_clear(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    team_id = int(callback.data.split("_")[4])
+    team = get_team_by_id(team_id)
+    if not team:
+        await callback.answer("Команда не найдена", show_alert=True)
+        return
+    await state.update_data(admin_team_id=team_id, rating_return_team_id=team_id)
+    await _start_rating_shortcut(
+        callback,
+        state,
+        entity_type=ENTITY_TEAM,
+        entity_id=team_id,
+        entity_name=team["name"],
+        mode="clear",
+        origin="team_card",
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_team_edit_menu_"))
+async def admin_team_edit_menu(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    team_id = int(callback.data.split("_")[4])
+    team = get_team_by_id(team_id)
+    if not team:
+        await callback.answer("Команда не найдена", show_alert=True)
+        return
+    await state.update_data(admin_team_id=team_id)
+    await _show_admin_team_edit_menu(callback, team_id)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_team_edit_field_"))
+async def admin_team_edit_field(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    tail = callback.data.replace("admin_team_edit_field_", "")
+    field_name, team_id_token = tail.rsplit("_", 1)
+    team_id = int(team_id_token)
+    await state.update_data(admin_team_id=team_id, admin_team_edit_field=field_name)
+    prompts = {
+        "name": "Введите новое название команды:",
+        "city": "Введите новый город или '-' чтобы очистить:",
+        "max_members": "Введите новый лимит участников от 1 до 10:",
+    }
+    await state.set_state(AdminTeamEdit.value)
+    await callback.message.edit_text(prompts.get(field_name, "Введите новое значение:"))
+    await callback.answer()
+
+
+@router.message(AdminTeamEdit.value)
+async def admin_team_edit_value(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет прав")
+        return
+    data = await state.get_data()
+    team_id = data.get("admin_team_id")
+    field_name = data.get("admin_team_edit_field")
+    if not team_id or not field_name:
+        await state.clear()
+        await message.answer("Сессия редактирования устарела.")
+        return
+    raw_value = (message.text or "").strip()
+    if field_name == "name":
+        if len(raw_value) < 3 or len(raw_value) > 20:
+            await message.answer("Название должно быть от 3 до 20 символов.")
+            return
+        rename_team(int(team_id), raw_value)
+    elif field_name == "city":
+        set_team_city(int(team_id), None if raw_value in {"", "-"} else raw_value)
+    elif field_name == "max_members":
+        try:
+            value = int(raw_value)
+        except ValueError:
+            await message.answer("Введите число от 1 до 10.")
+            return
+        if value < 1 or value > 10:
+            await message.answer("Введите число от 1 до 10.")
+            return
+        members_count = get_team_members_count(int(team_id))
+        if value < members_count:
+            await message.answer(f"Нельзя поставить лимит меньше текущего состава ({members_count}).")
+            return
+        update_team_max_members(int(team_id), value)
+    await state.set_state(None)
+    await _render_admin_team_card_by_state(message, state)
+
+
+@router.callback_query(F.data.startswith("admin_team_toggle_open_"))
+async def admin_team_toggle_open(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    team_id = int(callback.data.split("_")[4])
+    settings = get_team_settings(team_id)
+    set_team_open_status(team_id, not settings["is_open"])
+    await _show_admin_team_edit_menu(callback, team_id)
+    await callback.answer("Статус набора обновлен")
+
+
+@router.callback_query(F.data.startswith("admin_team_toggle_notify_"))
+async def admin_team_toggle_notify(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    team_id = int(callback.data.split("_")[4])
+    settings = get_team_settings(team_id)
+    set_team_notify_status(team_id, not settings["notify"])
+    await _show_admin_team_edit_menu(callback, team_id)
+    await callback.answer("Настройка уведомлений обновлена")
+
+
+@router.callback_query(F.data.startswith("admin_team_toggle_invite_mode_"))
+async def admin_team_toggle_invite_mode(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    team_id = int(callback.data.split("_")[5])
+    team = get_team_by_id(team_id)
+    if not team:
+        await callback.answer("Команда не найдена", show_alert=True)
+        return
+    current_mode = (team['invite_join_mode'] or 'request').strip().lower() if 'invite_join_mode' in team.keys() else 'request'
+    set_team_invite_join_mode(team_id, 'request' if current_mode == 'direct' else 'direct')
+    await _show_admin_team_edit_menu(callback, team_id)
+    await callback.answer("Режим ссылки обновлен")
+
+
+@router.callback_query(F.data.startswith("admin_team_toggle_invite_enabled_"))
+async def admin_team_toggle_invite_enabled(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    team_id = int(callback.data.split("_")[5])
+    team = get_team_by_id(team_id)
+    if not team:
+        await callback.answer("Команда не найдена", show_alert=True)
+        return
+    enabled = int((team['invite_enabled'] if 'invite_enabled' in team.keys() else 1) or 0) == 1
+    set_team_invite_enabled(team_id, not enabled)
+    await _show_admin_team_edit_menu(callback, team_id)
+    await callback.answer("Статус ссылки обновлен")
+
+
+@router.callback_query(F.data.startswith("admin_team_change_captain_"))
+async def admin_team_change_captain(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    team_id = int(callback.data.split("_")[4])
+    members = get_team_members(team_id)
+    builder = InlineKeyboardBuilder()
+    for member in members:
+        builder.button(text=_format_user_label(member), callback_data=f"admin_team_make_captain_{team_id}_{member['id']}")
+    builder.button(text="🔙 Назад", callback_data=f"admin_team_edit_menu_{team_id}")
+    builder.adjust(1)
+    await callback.message.edit_text("Выберите нового капитана:", reply_markup=builder.as_markup())
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_team_make_captain_"))
+async def admin_team_make_captain(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    _, _, _, _, team_id_token, user_id_token = callback.data.split("_")
+    team_id = int(team_id_token)
+    user_id = int(user_id_token)
+    update_team_fields(team_id, captain_id=user_id)
+    await state.update_data(admin_team_id=team_id)
+    await _render_admin_team_card_by_state(callback, state)
+    await callback.answer("Капитан обновлен")
+
+
+@router.callback_query(F.data.startswith("admin_team_members_"))
+async def admin_team_members_menu(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    team_id = int(callback.data.split("_")[3])
+    await state.update_data(admin_team_id=team_id)
+    await _show_admin_team_members_screen(callback, team_id)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_team_member_actions_"))
+async def admin_team_member_actions(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    _, _, _, _, team_id_token, user_id_token = callback.data.split("_")
+    team_id = int(team_id_token)
+    user_id = int(user_id_token)
+    team = get_team_by_id(team_id)
+    is_captain_member = bool(team and int(team["captain_id"]) == user_id)
+    user = get_user_by_id(user_id)
+    await callback.message.edit_text(
+        f"Участник: {_format_user_label(user or {'first_name': 'Игрок', 'username': ''})}",
+        reply_markup=_admin_team_member_actions_keyboard(team_id, user_id, is_captain_member),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_team_member_remove_"))
+async def admin_team_member_remove(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    _, _, _, _, team_id_token, user_id_token = callback.data.split("_")
+    result = remove_team_member_admin(int(team_id_token), int(user_id_token))
+    if not result.get("ok"):
+        await callback.answer("Не удалось удалить участника.", show_alert=True)
+        return
+    await _show_admin_team_members_screen(callback, int(team_id_token))
+    await callback.answer("Участник удален")
+
+
+@router.callback_query(F.data.startswith("admin_team_member_exclude_"))
+async def admin_team_member_exclude(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    _, _, _, _, team_id_token, user_id_token = callback.data.split("_")
+    team_id = int(team_id_token)
+    user_id = int(user_id_token)
+    result = remove_team_member_admin(team_id, user_id)
+    if not result.get("ok"):
+        await callback.answer("Не удалось исключить участника.", show_alert=True)
+        return
+    actor = get_user(callback.from_user.id)
+    block_team_member(team_id, user_id, blocked_by=actor["id"] if actor else None, reason="Исключен админом")
+    await _show_admin_team_members_screen(callback, int(team_id_token))
+    await callback.answer("Участник исключен и заблокирован")
+
+
+@router.callback_query(F.data.startswith("admin_team_member_add_"))
+async def admin_team_member_add(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    team_id = int(callback.data.split("_")[4])
+    await state.update_data(admin_team_id=team_id)
+    await state.set_state(AdminTeamEdit.member_username)
+    await callback.message.edit_text("Введите username пользователя для добавления в команду:")
+    await callback.answer()
+
+
+@router.message(AdminTeamEdit.member_username)
+async def admin_team_member_add_finish(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("Нет прав")
+        return
+    data = await state.get_data()
+    team_id = int(data.get("admin_team_id") or 0)
+    username = (message.text or "").strip().lstrip("@")
+    user = get_user_by_username(username)
+    if not user:
+        await message.answer("Пользователь не найден.")
+        return
+    result = add_team_member_admin(team_id, int(user["id"]))
+    if not result.get("ok"):
+        reasons = {
+            "already_member": "Пользователь уже в команде.",
+            "blocked": "Пользователь исключен из команды и сейчас заблокирован.",
+            "team_full": "В команде уже достигнут лимит участников.",
+        }
+        await message.answer(reasons.get(result.get("reason"), "Не удалось добавить участника."))
+        return
+    await state.set_state(None)
+    await _render_admin_team_card_by_state(message, state)
+
+
+@router.callback_query(F.data.startswith("admin_team_blocks_"))
+async def admin_team_blocks(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    team_id = int(callback.data.split("_")[3])
+    await _show_admin_team_blocks_screen(callback, team_id)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_team_unblock_"))
+async def admin_team_unblock(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    _, _, _, team_id_token, user_id_token = callback.data.split("_")
+    unblock_team_member(int(team_id_token), int(user_id_token))
+    await _show_admin_team_blocks_screen(callback, int(team_id_token))
+    await callback.answer("Блок снят")
 
 @router.callback_query(F.data == "admin_confirm_delete_team")
 async def admin_delete_team_execute_legacy(callback: CallbackQuery, state: FSMContext):

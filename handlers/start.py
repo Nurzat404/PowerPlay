@@ -18,6 +18,10 @@ router = Router()
 REQUIRED_CHANNEL_USERNAME = os.getenv("REQUIRED_CHANNEL_USERNAME", "razryadarena").strip().lstrip("@")
 
 
+def _display_optional_text(value: str | None, fallback: str = "не указан") -> str:
+    return (value or "").strip() or fallback
+
+
 class Registration(StatesGroup):
     name = State()
     email = State()
@@ -48,7 +52,7 @@ async def _handle_team_invite(message: Message, token: str) -> bool:
         f"Приглашение в команду\n\n"
         f"Команда: {team['name']}\n"
         f"Вид спорта: {get_sport_display_name(team['sport'])}\n"
-        f"Город: {team['city']}\n"
+        f"Город: {_display_optional_text(team['city'])}\n"
         f"Капитан: {captain_name}\n"
         f"Участников: {members_count}/{max_members}\n"
         f"Набор: {'Открыт' if settings and settings['is_open'] else 'Закрыт'}\n"
@@ -251,4 +255,3 @@ async def reg_sports_done(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Регистрация завершена! Добро пожаловать в Разряд-Арена.")
     await callback.message.answer("Главное меню:", reply_markup=main_menu_keyboard())
     await callback.answer()
-
