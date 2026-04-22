@@ -482,9 +482,11 @@ def _build_team_members_block(members):
 
 
 def _build_roster_member_label(member: dict, *, is_captain_member: bool = False) -> str:
-    username = f"@{member['username']}" if member.get("username") else "без username"
+    username_value = _row_value(member, "username")
+    username = f"@{username_value}" if username_value else "без username"
     prefix = "👑 " if is_captain_member else ""
-    return f"{prefix}{member.get('first_name') or 'Участник'} ({username})"
+    first_name = _row_value(member, "first_name", "Участник")
+    return f"{prefix}{first_name or 'Участник'} ({username})"
 
 def _build_tournament_compliance_block(tournament: dict, members: list[dict]) -> tuple[str, bool]:
     """Возвращает текст проверки и флаг полного соответствия."""
@@ -4164,21 +4166,23 @@ def _parse_favorite_sports_display(raw_value) -> str:
 
 
 def _build_admin_user_card_text(user: dict) -> str:
-    age_str = str(user['age']) if user['age'] is not None else "не указан"
-    email = _display_optional_text(user.get('email'))
-    city = _display_optional_text(user.get('city'))
-    username = f"@{user['username']}" if user.get('username') else "не указан"
+    age = _row_value(user, "age")
+    age_str = str(age) if age is not None else "не указан"
+    email = _display_optional_text(_row_value(user, 'email'))
+    city = _display_optional_text(_row_value(user, 'city'))
+    username_raw = _row_value(user, 'username')
+    username = f"@{username_raw}" if username_raw else "не указан"
     return (
         f"👤 Пользователь #{user['id']}\n"
         f"Telegram ID: {user['telegram_id']}\n"
-        f"Имя: {_display_optional_text(user.get('first_name'), 'не указано')}\n"
-        f"Фамилия: {_display_optional_text(user.get('last_name'))}\n"
+        f"Имя: {_display_optional_text(_row_value(user, 'first_name'), 'не указано')}\n"
+        f"Фамилия: {_display_optional_text(_row_value(user, 'last_name'))}\n"
         f"Username: {username}\n"
         f"Email: {email}\n"
         f"Город: {city}\n"
         f"Возраст: {age_str}\n"
-        f"Steam: {_display_optional_text(user.get('steam_id'))}\n"
-        f"Любимые виды спорта: {_parse_favorite_sports_display(user.get('favorite_sports'))}\n"
+        f"Steam: {_display_optional_text(_row_value(user, 'steam_id'))}\n"
+        f"Любимые виды спорта: {_parse_favorite_sports_display(_row_value(user, 'favorite_sports'))}\n"
         f"Роль: {user['role']}\n"
         f"Статус: {'🔴 Забанен' if user['is_banned'] else '🟢 Активен'}"
     )
@@ -4562,7 +4566,7 @@ async def admin_user_edit_field(callback: CallbackQuery, state: FSMContext):
     await state.update_data(admin_edit_user_id=user_id, admin_edit_user_field=field_name)
     if field_name == "favorite_sports":
         sports = get_all_sports()
-        current_sports = json.loads(user['favorite_sports']) if user.get('favorite_sports') else []
+        current_sports = json.loads(user['favorite_sports']) if _row_value(user, 'favorite_sports') else []
         await state.set_state(AdminUserEdit.sports)
         await state.update_data(admin_edit_user_sports=current_sports)
         await callback.message.edit_text(
@@ -4813,9 +4817,26 @@ def _display_optional_text(value: str | None, fallback: str = "не указан
     return (value or "").strip() or fallback
 
 
+def _row_value(row, key: str, default=None):
+    if row is None:
+        return default
+    try:
+        if hasattr(row, "keys"):
+            keys = row.keys()
+            if key in keys:
+                value = row[key]
+                return default if value is None else value
+    except Exception:
+        pass
+    if isinstance(row, dict):
+        value = row.get(key, default)
+        return default if value is None else value
+    return default
+
+
 def _format_user_label(user: dict) -> str:
-    username = (user.get("username") or "").strip()
-    name = (user.get("first_name") or "Игрок").strip()
+    username = str(_row_value(user, "username", "") or "").strip()
+    name = str(_row_value(user, "first_name", "Игрок") or "Игрок").strip()
     return f"{name} (@{username})" if username else name
 
 

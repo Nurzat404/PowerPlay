@@ -331,22 +331,33 @@ def apply_manual_rating_adjustment(
     normalized_format = normalize_format_key(format_key, normalized_sport)
     if rating_scope == SCOPE_SEASONAL and season_id is None:
         season_id = int(get_active_rating_season(normalized_sport)["id"])
-    current_value = get_rating_value(
-        entity_type,
-        entity_id,
-        normalized_sport,
-        rating_scope,
-        normalized_format,
-        season_id,
+    targets = _build_manual_rollup_targets(
+        sport_key=normalized_sport,
+        rating_scope=rating_scope,
+        format_key=normalized_format,
+        season_id=season_id,
     )
+    current_values = [
+        get_rating_value(
+            entity_type,
+            entity_id,
+            normalized_sport,
+            target["rating_scope"],
+            target.get("format_key"),
+            target.get("season_id"),
+        )
+        for target in targets
+    ]
+    current_value = current_values[0] if current_values else 0
     applied_delta = int(delta)
-    if current_value + applied_delta < 0:
-        applied_delta = -current_value
+    if applied_delta < 0:
+        max_subtract = min(current_values) if current_values else 0
+        if current_value + applied_delta < 0 or abs(applied_delta) > max_subtract:
+            applied_delta = -max_subtract
     if applied_delta == 0:
         return {"ok": False, "applied_delta": 0, "current_value": current_value}
 
     conn = get_connection()
-    cur = conn.cursor()
     _insert_adjustment_rows(
         conn,
         [
@@ -354,13 +365,14 @@ def apply_manual_rating_adjustment(
                 entity_type=entity_type,
                 entity_id=entity_id,
                 sport_key=normalized_sport,
-                format_key=normalized_format,
-                rating_scope=rating_scope,
-                season_id=season_id,
+                format_key=target.get("format_key"),
+                rating_scope=target["rating_scope"],
+                season_id=target.get("season_id"),
                 delta=applied_delta,
                 reason=(reason or "Ручная корректировка рейтинга").strip(),
                 actor_user_id=actor_user_id,
             )
+            for target in targets
         ],
     )
     rebuild_entity_ratings(conn)
@@ -372,6 +384,44 @@ def apply_manual_rating_adjustment(
         "new_value": current_value + applied_delta,
         "season_id": season_id,
     }
+
+
+def _build_manual_rollup_targets(
+    *,
+    sport_key: str,
+    rating_scope: str,
+    format_key: str | None,
+    season_id: int | None,
+) -> list[dict[str, Any]]:
+    normalized_sport = normalize_sport_key(sport_key)
+    normalized_format = normalize_format_key(format_key, normalized_sport)
+    targets: list[dict[str, Any]] = []
+    seen: set[tuple[str, int | None, str | None]] = set()
+
+    def add_target(scope_value: str, season_value: int | None, format_value: str | None) -> None:
+        key = (scope_value, season_value, format_value)
+        if key in seen:
+            return
+        seen.add(key)
+        targets.append(
+            {
+                "rating_scope": scope_value,
+                "season_id": season_value,
+                "format_key": format_value,
+            }
+        )
+
+    base_season_id = season_id if rating_scope == SCOPE_SEASONAL else None
+    add_target(rating_scope, base_season_id, normalized_format)
+
+    if normalized_format:
+        add_target(rating_scope, base_season_id, None)
+        add_target(SCOPE_OVERALL, None, normalized_format)
+        add_target(SCOPE_OVERALL, None, None)
+    elif rating_scope == SCOPE_SEASONAL:
+        add_target(SCOPE_OVERALL, None, None)
+
+    return targets
 
 
 def clear_rating_bucket(
