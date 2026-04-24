@@ -5,8 +5,10 @@ import logging
 from typing import Any
 
 from aiogram import Bot
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from razryad_arena_utils import (
+    build_tournament_date_lines,
     format_utc_to_msk,
     get_bracket_match_by_id,
     get_bracket_matches_due_for_reminder,
@@ -17,15 +19,26 @@ from razryad_arena_utils import (
     get_team_by_id,
     get_team_members,
     get_tournament_team_members,
+    get_tournament_admin_notification_chat_ids,
     get_tournament_by_id,
     get_tournament_manager_chat_ids,
     get_tournament_teams,
     get_user_by_id,
+    list_tournaments_due_for_registration_deadline_notice,
+    mark_tournament_registration_deadline_notified,
     mark_bracket_reminder_sent,
     normalize_sport_name,
 )
+from utils.veto_service import (
+    ADMIN_ACTION_SCOPE_REGISTRATION_ENDED,
+    send_tracked_admin_action_messages,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def get_registration_ended_action_key(tournament_id: int) -> str:
+    return f"tournament:{int(tournament_id)}:registration-ended"
 
 
 def _safe_team_name(value: str | None, fallback: str) -> str:
@@ -172,12 +185,8 @@ def prepare_tournament_broadcast_payload(tournament_id: int, body_text: str = ""
         f"🏆 Турнир: {(tournament_dict.get('name') or 'Турнир').strip()}",
         f"🎮 Вид спорта: {get_sport_display_name(tournament_dict.get('sport'))}",
     ]
-    start_date = (tournament_dict.get("start_date") or "").strip()
-    end_date = (tournament_dict.get("end_date") or "").strip()
-    if start_date and end_date:
-        lines.append(f"📅 Даты: {start_date} - {end_date}")
-    elif start_date:
-        lines.append(f"📅 Дата: {start_date}")
+    for line in build_tournament_date_lines(tournament_dict):
+        lines.append(f"📅 {line}")
     if body_text:
         lines.extend(["", body_text.strip()])
 
@@ -424,6 +433,45 @@ async def dispatch_due_match_reminders(bot: Bot) -> int:
             sent += 1
         except Exception as exc:
             logger.exception("Ошибка отправки напоминания по матчу %s: %s", match["id"], exc)
+    return sent
+
+
+async def dispatch_due_tournament_registration_deadlines(bot: Bot) -> int:
+    sent = 0
+    for tournament in list_tournaments_due_for_registration_deadline_notice():
+        tournament_id = int(tournament["id"])
+        chat_ids = get_tournament_admin_notification_chat_ids(tournament_id)
+        mark_tournament_registration_deadline_notified(tournament_id)
+        if not chat_ids:
+            continue
+
+        tournament_name = (tournament["name"] or "Турнир").strip()
+        lines = [
+            "⏳ Регистрация завершилась",
+            "",
+            f"🏆 Турнир: {tournament_name}",
+            f"🎮 Вид спорта: {get_sport_display_name(tournament['sport'])}",
+            f"📅 Регистрация: {(tournament['registration_start_date'] or '').strip() or 'не указана'} - {(tournament['registration_end_date'] or '').strip() or 'не указана'}",
+            "",
+            "Пора начать турнир и перейти в управление.",
+        ]
+        markup = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="Открыть турнир",
+                callback_data=f"admin_tournament_notice_open_{tournament_id}",
+            )
+        ]])
+        await send_tracked_admin_action_messages(
+            bot,
+            chat_ids=chat_ids,
+            text="\n".join(lines),
+            reply_markup=markup,
+            action_scope=ADMIN_ACTION_SCOPE_REGISTRATION_ENDED,
+            action_key=get_registration_ended_action_key(tournament_id),
+            tournament_id=tournament_id,
+            bracket_match_id=None,
+        )
+        sent += 1
     return sent
 
 

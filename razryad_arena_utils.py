@@ -821,6 +821,93 @@ def get_tournament_by_id(tournament_id):
     return tournament
 
 
+def format_tournament_date_range(
+    start_date: str | None,
+    end_date: str | None,
+    *,
+    empty_fallback: str,
+) -> str:
+    start_value = (start_date or "").strip()
+    end_value = (end_date or "").strip()
+    if start_value and end_value:
+        return f"{start_value} - {end_value}"
+    if start_value:
+        return f"с {start_value}"
+    if end_value:
+        return f"до {end_value}"
+    return empty_fallback
+
+
+def format_tournament_registration_period(tournament) -> str:
+    registration_start = tournament["registration_start_date"] if tournament and "registration_start_date" in tournament.keys() else None
+    registration_end = tournament["registration_end_date"] if tournament and "registration_end_date" in tournament.keys() else None
+    return format_tournament_date_range(
+        registration_start,
+        registration_end,
+        empty_fallback="не указаны",
+    )
+
+
+def format_tournament_event_period(tournament) -> str:
+    start_date = tournament["start_date"] if tournament and "start_date" in tournament.keys() else None
+    end_date = tournament["end_date"] if tournament and "end_date" in tournament.keys() else None
+    return format_tournament_date_range(
+        start_date,
+        end_date,
+        empty_fallback="будут объявлены позже",
+    )
+
+
+def build_tournament_date_lines(tournament) -> list[str]:
+    if not tournament:
+        return []
+    status = (tournament["status"] or "").strip().lower() if "status" in tournament.keys() else ""
+    lines: list[str] = []
+    if status == "registration":
+        lines.append(f"Регистрация: {format_tournament_registration_period(tournament)}")
+    lines.append(f"Проведение: {format_tournament_event_period(tournament)}")
+    return lines
+
+
+def list_tournaments_due_for_registration_deadline_notice():
+    today = datetime.now(MSK_TZ).date()
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT *
+        FROM tournaments
+        WHERE status='registration'
+          AND registration_end_date IS NOT NULL
+          AND TRIM(registration_end_date) <> ''
+          AND registration_deadline_notified_at IS NULL
+        ORDER BY id
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    due_rows = []
+    for row in rows:
+        parsed = parse_russian_date(row["registration_end_date"])
+        if not parsed:
+            continue
+        day, month = parsed
+        if (month, day) <= (today.month, today.day):
+            due_rows.append(row)
+    return due_rows
+
+
+def mark_tournament_registration_deadline_notified(tournament_id: int) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE tournaments
+        SET registration_deadline_notified_at=CURRENT_TIMESTAMP
+        WHERE id=?
+    """, (int(tournament_id),))
+    conn.commit()
+    conn.close()
+
+
 def _resolve_internal_user_id(candidate_id):
     if candidate_id is None:
         return None

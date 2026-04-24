@@ -38,6 +38,7 @@ from razryad_arena_utils import (
     set_team_open_status, set_team_notify_status, set_team_invite_join_mode, set_team_invite_enabled,
     get_admin_tournament_notifications_enabled, get_tournament_notification_override,
     set_admin_tournament_notifications_enabled, set_tournament_notification_override,
+    build_tournament_date_lines,
 )
 from keyboards import (
     admin_menu_keyboard, back_to_main_keyboard,
@@ -56,11 +57,13 @@ from utils.cs2_maps import (
 )
 from utils.site_sync import request_site_sync
 from utils.notifications import (
+    get_registration_ended_action_key,
     prepare_match_broadcast_payload,
     prepare_tournament_broadcast_payload,
     send_custom_broadcast,
 )
 from utils.veto_service import (
+    ADMIN_ACTION_SCOPE_REGISTRATION_ENDED,
     LAUNCH_ADMIN,
     LAUNCH_AUTO,
     STATUS_CANCELLED,
@@ -69,6 +72,7 @@ from utils.veto_service import (
     STATUS_READY,
     get_veto_status_label,
     list_tournament_veto_sessions,
+    resolve_admin_action_messages,
     validate_veto_pool,
 )
 from handlers.states import AdminRatingAdjustment, AdminRatingChannelPublish, TargetedBroadcast, TournamentRosterEdit
@@ -111,6 +115,41 @@ VETO_LAUNCH_OPTIONS = [
 
 def _is_cs2_sport(sport_name: str | None) -> bool:
     return normalize_sport_name(sport_name) == "CS2"
+
+
+DATE_INPUT_HINT = (
+    "в формате: день и сокращённое название месяца с точкой, например: 1 янв."
+)
+DATE_INPUT_MONTHS_HINT = (
+    "Подсказка по месяцам:\n"
+    "'янв.', 'февр.', 'марта', 'апр.', 'мая', 'июня', 'июля', 'авг.', 'сент.', 'окт.', 'нояб.', 'дек.'"
+)
+
+
+def _format_tournament_dates_for_text(tournament) -> str:
+    return "\n".join(build_tournament_date_lines(tournament))
+
+
+def _russian_date_order_key(value: str | None) -> tuple[int, int] | None:
+    parsed = parse_russian_date((value or "").strip())
+    if not parsed:
+        return None
+    day, month = parsed
+    return month, day
+
+
+def _is_optional_date_reset_text(value: str | None) -> bool:
+    normalized = (value or "").strip().lower()
+    return normalized in {"-", "нет"}
+
+
+def _normalize_optional_date_input(value: str | None) -> str | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    if _is_optional_date_reset_text(raw):
+        return None
+    return raw
 
 
 def _normalize_map_pool_entries(raw_entries) -> list[dict[str, str]]:
@@ -444,7 +483,7 @@ async def send_tournament_info(bot: Bot, chat_id: int, tournament_id: int, user_
 Требуемый размер команды: {tournament['required_team_size']} чел.
 Город: {tournament['city']}
 Возраст: {age_text}
-Даты: {tournament['start_date']} - {tournament['end_date']}
+{_format_tournament_dates_for_text(tournament)}
 Макс. команд: {tournament['max_teams']}
 Статус: {status_display}
 Инвайт-ссылка: {invite_url}
@@ -1032,8 +1071,10 @@ class CreateTournament(StatesGroup):
     name = State()
     sport = State()
     city = State()
-    start_date = State()
-    end_date = State()
+    registration_start_date = State()
+    registration_end_date = State()
+    event_start_date = State()
+    event_end_date = State()
     max_teams = State()
     required_team_size = State()
     min_age = State()        # новое
@@ -1073,30 +1114,80 @@ async def create_tournament_sport_chosen(callback: CallbackQuery, state: FSMCont
 @router.message(CreateTournament.city)
 async def create_tournament_city(message: Message, state: FSMContext):
     await state.update_data(city=message.text)
-    await state.set_state(CreateTournament.start_date)
-    await message.answer("Введите дату начала турнира (в формате: день и сокращённое название месяца с точкой, например : 1 янв.):")
+    await state.set_state(CreateTournament.registration_start_date)
+    await message.answer(f"Введите дату начала регистрации ({DATE_INPUT_HINT}):")
 
-@router.message(CreateTournament.start_date)
-async def create_tournament_start(message: Message, state: FSMContext):
+
+@router.message(CreateTournament.registration_start_date)
+async def create_tournament_registration_start(message: Message, state: FSMContext):
     date_str = message.text.strip()
     if parse_russian_date(date_str) is None:
-        await message.answer("❌ Неверный формат. Введите дату в формате: день месяц (например: 1 янв.)\n"
-                             "Подсказка по месяцам:\n"
-                             "'янв.', 'февр.', 'марта', 'апр.', 'мая', 'июня', 'июля', 'авг.', 'сент.', 'окт.', 'нояб.', 'дек.'"
-                             )
+        await message.answer(
+            "❌ Неверный формат. Введите дату регистрации "
+            f"({DATE_INPUT_HINT}).\n{DATE_INPUT_MONTHS_HINT}"
+        )
+        return
+    await state.update_data(registration_start_date=date_str)
+    await state.set_state(CreateTournament.registration_end_date)
+    await message.answer(f"Введите дату конца регистрации ({DATE_INPUT_HINT}):")
+
+
+@router.message(CreateTournament.registration_end_date)
+async def create_tournament_registration_end(message: Message, state: FSMContext):
+    date_str = message.text.strip()
+    if parse_russian_date(date_str) is None:
+        await message.answer(
+            "❌ Неверный формат. Введите дату конца регистрации "
+            f"({DATE_INPUT_HINT}).\n{DATE_INPUT_MONTHS_HINT}"
+        )
+        return
+    data = await state.get_data()
+    start_key = _russian_date_order_key(data.get("registration_start_date"))
+    end_key = _russian_date_order_key(date_str)
+    if start_key and end_key and end_key < start_key:
+        await message.answer("❌ Конец регистрации не может быть раньше начала регистрации.")
+        return
+    await state.update_data(registration_end_date=date_str)
+    await state.set_state(CreateTournament.event_start_date)
+    await message.answer(
+        f"Введите дату начала проведения турнира ({DATE_INPUT_HINT})\n"
+        "Если дата пока неизвестна, отправьте `-` или `нет`."
+    )
+
+
+@router.message(CreateTournament.event_start_date)
+async def create_tournament_event_start(message: Message, state: FSMContext):
+    raw_value = message.text.strip()
+    date_str = _normalize_optional_date_input(raw_value)
+    if date_str and parse_russian_date(date_str) is None:
+        await message.answer(
+            "❌ Неверный формат. Введите дату проведения "
+            f"({DATE_INPUT_HINT}) или отправьте `-` / `нет`.\n{DATE_INPUT_MONTHS_HINT}"
+        )
         return
     await state.update_data(start_date=date_str)
-    await state.set_state(CreateTournament.end_date)
-    await message.answer("Введите дату окончания турнира (в формате: день и сокращённое название месяца с точкой, например: 2 февр.):")
+    await state.set_state(CreateTournament.event_end_date)
+    await message.answer(
+        f"Введите дату конца проведения турнира ({DATE_INPUT_HINT})\n"
+        "Если дата пока неизвестна, отправьте `-` или `нет`."
+    )
 
-@router.message(CreateTournament.end_date)
-async def create_tournament_end(message: Message, state: FSMContext):
-    date_str = message.text.strip()
-    if parse_russian_date(date_str) is None:
-        await message.answer("❌ Неверный формат. Введите дату в формате: день месяц (например: 2 февр.)\n"
-                             "Подсказка по месяцам:\n"
-                             "'янв.', 'февр.', 'марта', 'апр.', 'мая', 'июня', 'июля', 'авг.', 'сент.', 'окт.', 'нояб.', 'дек.'"
-                             )
+
+@router.message(CreateTournament.event_end_date)
+async def create_tournament_event_end(message: Message, state: FSMContext):
+    raw_value = message.text.strip()
+    date_str = _normalize_optional_date_input(raw_value)
+    if date_str and parse_russian_date(date_str) is None:
+        await message.answer(
+            "❌ Неверный формат. Введите дату конца проведения "
+            f"({DATE_INPUT_HINT}) или отправьте `-` / `нет`.\n{DATE_INPUT_MONTHS_HINT}"
+        )
+        return
+    data = await state.get_data()
+    start_key = _russian_date_order_key(data.get("start_date"))
+    end_key = _russian_date_order_key(date_str)
+    if start_key and end_key and end_key < start_key:
+        await message.answer("❌ Конец проведения не может быть раньше начала проведения.")
         return
     await state.update_data(end_date=date_str)
     await state.set_state(CreateTournament.max_teams)
@@ -1342,13 +1433,15 @@ async def create_tournament_description(message: Message, state: FSMContext):
     cur = conn.cursor()
     cur.execute("""
     INSERT INTO tournaments (
-        name, sport, city, start_date, end_date, max_teams, required_team_size,
+        name, sport, city, registration_start_date, registration_end_date, start_date, end_date, max_teams, required_team_size,
         min_age, max_age, description, created_by, status, match_format,
         map_veto_enabled, veto_launch_mode
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'registration', ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'registration', ?, ?, ?)
     """, (
-        data['name'], data['sport'], data['city'], data['start_date'], data['end_date'],
+        data['name'], data['sport'], data['city'],
+        data['registration_start_date'], data['registration_end_date'],
+        data.get('start_date'), data.get('end_date'),
         data['max_teams'], data['required_team_size'], data['min_age'], data['max_age'],
         description, message.from_user.id, data.get('match_format', 'bo3'),
         int(data.get('map_veto_enabled') or 0), data.get('veto_launch_mode', LAUNCH_ADMIN)
@@ -1490,16 +1583,30 @@ async def _open_tournament_field_editor(
         field_titles = {
             "name": "Название",
             "city": "Город",
-            "start_date": "Дата начала",
-            "end_date": "Дата конца",
+            "registration_start_date": "Дата начала регистрации",
+            "registration_end_date": "Дата конца регистрации",
+            "start_date": "Дата начала проведения",
+            "end_date": "Дата конца проведения",
             "max_teams": "Макс. команд",
             "required_team_size": "Размер команды",
             "min_age": "Мин. возраст",
             "max_age": "Макс. возраст",
             "description": "Описание",
         }
+        if field in {"start_date", "end_date"}:
+            prompt = (
+                f"Введите новое значение для поля «{field_titles.get(field, field)}» "
+                f"({DATE_INPUT_HINT}) или отправьте `-` / `нет`, чтобы очистить:"
+            )
+        elif field in {"registration_start_date", "registration_end_date"}:
+            prompt = (
+                f"Введите новое значение для поля «{field_titles.get(field, field)}» "
+                f"({DATE_INPUT_HINT}):"
+            )
+        else:
+            prompt = f"Введите новое значение для поля «{field_titles.get(field, field)}»:"
         await callback.message.edit_text(
-            f"Введите новое значение для поля «{field_titles.get(field, field)}»:"
+            prompt
         )
 
 @router.callback_query(F.data.startswith("admin_edit_tournament_"))
@@ -1515,8 +1622,10 @@ async def edit_tournament_start(callback: CallbackQuery, state: FSMContext):
         ("name", "Название"),
         ("sport", "Вид спорта"),
         ("city", "Город"),
-        ("start_date", "Дата начала"),
-        ("end_date", "Дата конца"),
+        ("registration_start_date", "Дата начала регистрации"),
+        ("registration_end_date", "Дата конца регистрации"),
+        ("start_date", "Дата начала проведения"),
+        ("end_date", "Дата конца проведения"),
         ("max_teams", "Макс. команд"),
         ("required_team_size", "Размер команды"),
         ("min_age", "Мин. возраст"),
@@ -1554,7 +1663,8 @@ async def edit_tournament_value(message: Message, state: FSMContext):
         await state.clear()
         return
     field = data['field']
-    new_value = message.text
+    raw_value = message.text.strip()
+    new_value = raw_value
     if field == "max_teams" or field == "required_team_size" or field == "min_age" or field == "max_age":
         try:
             new_value = int(new_value)
@@ -1590,6 +1700,59 @@ async def edit_tournament_value(message: Message, state: FSMContext):
             conn.close()
             if current_min_age is not None and current_min_age > new_value:
                 await message.answer("❌ Минимальный возраст не может быть больше максимального.")
+                return
+    elif field in {"registration_start_date", "registration_end_date", "start_date", "end_date"}:
+        tournament = get_tournament_by_id(tournament_id)
+        if not tournament:
+            await message.answer("Турнир не найден.")
+            await state.clear()
+            return
+
+        if field in {"registration_start_date", "registration_end_date"}:
+            if parse_russian_date(raw_value) is None:
+                await message.answer(
+                    "❌ Неверный формат даты.\n"
+                    f"Введите дату {DATE_INPUT_HINT}.\n{DATE_INPUT_MONTHS_HINT}"
+                )
+                return
+            new_value = raw_value
+        else:
+            normalized_optional = _normalize_optional_date_input(raw_value)
+            if normalized_optional and parse_russian_date(normalized_optional) is None:
+                await message.answer(
+                    "❌ Неверный формат даты.\n"
+                    f"Введите дату {DATE_INPUT_HINT} или отправьте `-` / `нет`.\n{DATE_INPUT_MONTHS_HINT}"
+                )
+                return
+            new_value = normalized_optional
+
+        if field == "registration_start_date":
+            current_end = tournament["registration_end_date"]
+            start_key = _russian_date_order_key(new_value)
+            end_key = _russian_date_order_key(current_end)
+            if start_key and end_key and start_key > end_key:
+                await message.answer("❌ Начало регистрации не может быть позже конца регистрации.")
+                return
+        elif field == "registration_end_date":
+            current_start = tournament["registration_start_date"]
+            start_key = _russian_date_order_key(current_start)
+            end_key = _russian_date_order_key(new_value)
+            if start_key and end_key and end_key < start_key:
+                await message.answer("❌ Конец регистрации не может быть раньше начала регистрации.")
+                return
+        elif field == "start_date":
+            current_end = tournament["end_date"]
+            start_key = _russian_date_order_key(new_value)
+            end_key = _russian_date_order_key(current_end)
+            if start_key and end_key and start_key > end_key:
+                await message.answer("❌ Начало проведения не может быть позже конца проведения.")
+                return
+        elif field == "end_date":
+            current_start = tournament["start_date"]
+            start_key = _russian_date_order_key(current_start)
+            end_key = _russian_date_order_key(new_value)
+            if start_key and end_key and end_key < start_key:
+                await message.answer("❌ Конец проведения не может быть раньше начала проведения.")
                 return
 
     conn = get_connection()
@@ -2013,6 +2176,23 @@ async def admin_tournaments_page_callback(callback: CallbackQuery):
 
 # ---------- Управление конкретным турниром ----------
 
+
+@router.callback_query(F.data.regexp(r"^admin_tournament_notice_open_\d+$"))
+async def admin_tournament_notice_open(callback: CallbackQuery):
+    tournament_id = int(callback.data.split("_")[4])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    await resolve_admin_action_messages(
+        callback.bot,
+        text="✅ Турнир уже открыт другим администратором.",
+        action_scope=ADMIN_ACTION_SCOPE_REGISTRATION_ENDED,
+        action_key=get_registration_ended_action_key(tournament_id),
+        exclude_target=(callback.message.chat.id, callback.message.message_id) if callback.message.chat and callback.message.message_id else None,
+    )
+    await admin_tournament_manage(callback, tournament_id=tournament_id)
+    await callback.answer()
+
 @router.callback_query(F.data.startswith("admin_tournament_manage_"))
 async def admin_tournament_manage(callback: CallbackQuery, tournament_id: int | None = None):
     """Меню управления конкретным турниром для админа."""
@@ -2093,7 +2273,7 @@ async def admin_tournament_manage(callback: CallbackQuery, tournament_id: int | 
         f"Требуемый размер команды: {tournament['required_team_size']} чел.",
         f"Город: {tournament['city']}",
         f"Возраст: {age_text}",
-        f"Даты: {tournament['start_date']} - {tournament['end_date']}",
+        *_format_tournament_dates_for_text(tournament).splitlines(),
         teams_text,
         f"Новые заявки: {pending_count}",
         f"Исключенные: {excluded_count}",

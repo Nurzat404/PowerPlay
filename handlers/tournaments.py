@@ -6,7 +6,7 @@ from razryad_arena_utils import (
     get_user, get_user_teams, get_tournaments_by_sport, get_tournament_by_id,
     add_tournament_application, get_all_sports, get_team_application,
     get_approved_teams_count, get_tournament_teams, can_manage_tournament, is_admin, get_team_members_count, can_retry_tournament_application, get_team_by_id, get_team_members, is_captain,
-    get_sport_display_name, normalize_sport_name, ensure_tournament_invite_token,
+    get_sport_display_name, normalize_sport_name, ensure_tournament_invite_token, build_tournament_date_lines,
     get_tournament_member_application_conflicts, get_user_tournament_captain_teams,
 )
 from keyboards import (
@@ -130,7 +130,7 @@ async def view_tournament(callback: CallbackQuery):
 Вид спорта: {get_sport_display_name(tournament['sport'])}
 Требуемый размер команды: {tournament['required_team_size']} чел.
 Город: {tournament['city']}
-Даты: {tournament['start_date']} - {tournament['end_date']}
+{chr(10).join(build_tournament_date_lines(tournament))}
 Макс. команд: {tournament['max_teams']}
 {age_restriction}
 Статус: {status_display}

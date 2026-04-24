@@ -62,6 +62,7 @@ ACTION_PICK = "pick"
 
 ADMIN_ACTION_SCOPE_VETO_READY = "veto_ready"
 ADMIN_ACTION_SCOPE_VETO_TIMEOUT_TECH = "veto_timeout_technical"
+ADMIN_ACTION_SCOPE_REGISTRATION_ENDED = "registration_ended"
 ADMIN_ACTION_STATUS_ACTIVE = "active"
 ADMIN_ACTION_STATUS_RESOLVED = "resolved"
 ADMIN_ACTION_STATUS_INVALIDATED = "invalidated"
@@ -415,6 +416,29 @@ async def _send_tracked_admin_action_messages(
                 chat_id,
                 exc,
             )
+
+
+async def send_tracked_admin_action_messages(
+    bot: Bot,
+    *,
+    chat_ids: list[int],
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None,
+    action_scope: str,
+    action_key: str,
+    tournament_id: int | None,
+    bracket_match_id: int | None = None,
+) -> None:
+    await _send_tracked_admin_action_messages(
+        bot,
+        chat_ids=chat_ids,
+        text=text,
+        reply_markup=reply_markup,
+        action_scope=action_scope,
+        action_key=action_key,
+        tournament_id=tournament_id,
+        bracket_match_id=bracket_match_id,
+    )
 
 
 async def resolve_admin_action_messages(

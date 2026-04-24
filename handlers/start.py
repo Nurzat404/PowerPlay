@@ -9,7 +9,7 @@ from razryad_arena_utils import (
     get_all_sports, get_user, get_or_create_user, update_user,
     get_team_by_invite_token, get_tournament_by_invite_token,
     get_team_members_count, get_team_max_members, get_team_settings,
-    get_user_by_id, get_sport_display_name
+    get_user_by_id, get_sport_display_name, build_tournament_date_lines
 )
 from keyboards import main_menu_keyboard, sports_choice_keyboard, subscription_required_keyboard
 
@@ -87,7 +87,7 @@ async def _handle_tournament_invite(message: Message, token: str) -> bool:
         f"Турнир: {tournament['name']}\n"
         f"Вид спорта: {get_sport_display_name(tournament['sport'])}\n"
         f"Город: {tournament['city']}\n"
-        f"Даты: {tournament['start_date']} - {tournament['end_date']}\n"
+        f"{chr(10).join(build_tournament_date_lines(tournament))}\n"
         f"Статус: {status_display}"
     )
 

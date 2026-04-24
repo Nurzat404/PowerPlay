@@ -25,7 +25,14 @@ from handlers.states import ManualMatchInput, BracketScheduleInput, TargetedBroa
 from handlers.match_manual import start_manual_input_by_match
 from utils.notifications import notify_bracket_match_scheduled, notify_bracket_match_reminder, prepare_match_broadcast_payload
 from utils.site_sync import request_site_sync
-from utils.veto_service import STATUS_COMPLETED, STATUS_IN_PROGRESS, get_match_veto_details
+from utils.notifications import get_registration_ended_action_key
+from utils.veto_service import (
+    ADMIN_ACTION_SCOPE_REGISTRATION_ENDED,
+    STATUS_COMPLETED,
+    STATUS_IN_PROGRESS,
+    get_match_veto_details,
+    resolve_admin_action_messages,
+)
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -329,6 +336,12 @@ async def confirm_generate_bracket(callback: CallbackQuery, state: FSMContext):
         conn.commit()
         conn.close()
         request_site_sync(f"bracket_generated:{tournament_id}")
+        await resolve_admin_action_messages(
+            callback.bot,
+            text="✅ Турнир уже переведен в активную стадию. Это уведомление больше неактуально.",
+            action_scope=ADMIN_ACTION_SCOPE_REGISTRATION_ENDED,
+            action_key=get_registration_ended_action_key(tournament_id),
+        )
 
         await state.clear()
         await callback.answer("✅ Сетка сгенерирована! Статус турнира изменён на 'Идёт'.", show_alert=True)

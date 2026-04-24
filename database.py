@@ -323,8 +323,11 @@ def init_db():
                         name TEXT NOT NULL,
                         sport TEXT NOT NULL,
                         city TEXT,
+                        registration_start_date TEXT,
+                        registration_end_date TEXT,
                         start_date TEXT,
                         end_date TEXT,
+                        registration_deadline_notified_at TIMESTAMP,
                         max_teams INTEGER,
                         description TEXT,
                         status TEXT DEFAULT 'registration',
@@ -605,6 +608,18 @@ def init_db():
                 # Добавляем поле required_team_size в tournaments
                 cur.execute("PRAGMA table_info(tournaments)")
                 columns = [col[1] for col in cur.fetchall()]
+                if 'registration_start_date' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournaments ADD COLUMN registration_start_date TEXT")
+                    logger.info("Поле registration_start_date добавлено в таблицу tournaments")
+                if 'registration_end_date' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournaments ADD COLUMN registration_end_date TEXT")
+                    logger.info("Поле registration_end_date добавлено в таблицу tournaments")
+                if 'registration_deadline_notified_at' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournaments ADD COLUMN registration_deadline_notified_at TIMESTAMP")
+                    logger.info("Поле registration_deadline_notified_at добавлено в таблицу tournaments")
                 if 'required_team_size' not in columns:
                     cur.execute(
                         "ALTER TABLE tournaments ADD COLUMN required_team_size INTEGER DEFAULT 2")
@@ -1167,6 +1182,10 @@ def init_db():
                 cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_rating_channel_posts_status_lookup
                     ON rating_channel_posts(status, sport_key, entity_type, rating_scope)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_tournaments_registration_deadline_lookup
+                    ON tournaments(status, registration_end_date, registration_deadline_notified_at)
                 """)
                 cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_admin_notification_preferences_enabled
