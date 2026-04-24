@@ -816,6 +816,9 @@ def init_db():
                         current_step_index INTEGER DEFAULT 0,
                         current_team_id INTEGER REFERENCES teams(id),
                         current_action_type TEXT,
+                        current_turn_started_at TIMESTAMP,
+                        timeout_notified_step_index INTEGER,
+                        timeout_notified_at TIMESTAMP,
                         auto_start_consumed INTEGER DEFAULT 0,
                         admin_notified_at TIMESTAMP,
                         captains_notified_at TIMESTAMP,
@@ -888,12 +891,63 @@ def init_db():
                 """)
                 logger.info("Таблица rating_channel_posts проверена")
 
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS admin_notification_preferences (
+                        user_id INTEGER PRIMARY KEY REFERENCES users(id),
+                        tournament_notifications_enabled INTEGER DEFAULT 1,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                logger.info("Таблица admin_notification_preferences проверена")
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS tournament_notification_overrides (
+                        tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
+                        user_id INTEGER NOT NULL REFERENCES users(id),
+                        notifications_mode TEXT NOT NULL DEFAULT 'inherit',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (tournament_id, user_id)
+                    )
+                """)
+                logger.info("Таблица tournament_notification_overrides проверена")
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS admin_action_message_targets (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        action_scope TEXT NOT NULL,
+                        action_key TEXT NOT NULL,
+                        tournament_id INTEGER REFERENCES tournaments(id),
+                        bracket_match_id INTEGER REFERENCES tournament_brackets(id),
+                        chat_id INTEGER NOT NULL,
+                        message_id INTEGER NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'active',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(action_scope, action_key, chat_id)
+                    )
+                """)
+                logger.info("Таблица admin_action_message_targets проверена")
+
                 cur.execute("PRAGMA table_info(match_veto_sessions)")
                 columns = [col[1] for col in cur.fetchall()]
                 if 'auto_start_consumed' not in columns:
                     cur.execute(
                         "ALTER TABLE match_veto_sessions ADD COLUMN auto_start_consumed INTEGER DEFAULT 0")
                     logger.info("Поле auto_start_consumed добавлено в таблицу match_veto_sessions")
+                if 'current_turn_started_at' not in columns:
+                    cur.execute(
+                        "ALTER TABLE match_veto_sessions ADD COLUMN current_turn_started_at TIMESTAMP")
+                    logger.info("Поле current_turn_started_at добавлено в таблицу match_veto_sessions")
+                if 'timeout_notified_step_index' not in columns:
+                    cur.execute(
+                        "ALTER TABLE match_veto_sessions ADD COLUMN timeout_notified_step_index INTEGER")
+                    logger.info("Поле timeout_notified_step_index добавлено в таблицу match_veto_sessions")
+                if 'timeout_notified_at' not in columns:
+                    cur.execute(
+                        "ALTER TABLE match_veto_sessions ADD COLUMN timeout_notified_at TIMESTAMP")
+                    logger.info("Поле timeout_notified_at добавлено в таблицу match_veto_sessions")
 
                 # Создаём таблицу player_match_stats с правильными полями для CS2
                 # ИСПРАВЛЕНО: убрали DROP TABLE - теперь таблица не пересоздаётся каждый раз
@@ -1091,6 +1145,8 @@ def init_db():
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_veto_sessions_status_ready ON match_veto_sessions(status, ready_at)")
                 cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_veto_sessions_status_turn_started ON match_veto_sessions(status, current_turn_started_at)")
+                cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_veto_sessions_bracket_match ON match_veto_sessions(bracket_match_id)")
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_veto_actions_session_step ON match_veto_actions(session_id, step_index)")
@@ -1111,6 +1167,22 @@ def init_db():
                 cur.execute("""
                     CREATE INDEX IF NOT EXISTS idx_rating_channel_posts_status_lookup
                     ON rating_channel_posts(status, sport_key, entity_type, rating_scope)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_admin_notification_preferences_enabled
+                    ON admin_notification_preferences(tournament_notifications_enabled)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_tournament_notification_overrides_user
+                    ON tournament_notification_overrides(user_id, notifications_mode)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_admin_action_targets_lookup
+                    ON admin_action_message_targets(action_scope, action_key, status)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_admin_action_targets_match
+                    ON admin_action_message_targets(bracket_match_id, status)
                 """)
 
                 # Миграции для player_match_stats

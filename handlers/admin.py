@@ -36,12 +36,14 @@ from razryad_arena_utils import (
     add_team_member_admin, remove_team_member_admin, block_team_member, unblock_team_member,
     get_team_member_blocks, is_team_member_blocked, update_team_max_members,
     set_team_open_status, set_team_notify_status, set_team_invite_join_mode, set_team_invite_enabled,
+    get_admin_tournament_notifications_enabled, get_tournament_notification_override,
+    set_admin_tournament_notifications_enabled, set_tournament_notification_override,
 )
 from keyboards import (
     admin_menu_keyboard, back_to_main_keyboard,
     admin_rating_action_keyboard, admin_rating_entity_keyboard,
     admin_rating_entity_list_keyboard, admin_rating_format_picker_keyboard,
-    admin_rating_scope_keyboard, admin_rating_sport_picker_keyboard,
+    admin_rating_scope_keyboard, admin_rating_sport_picker_keyboard, admin_rating_season_picker_keyboard,
     sports_choice_keyboard_single, sports_choice_keyboard
 )
 from datetime import datetime, timezone
@@ -85,6 +87,7 @@ from utils.rating_service import (
     apply_manual_rating_adjustment,
     clear_rating_bucket,
     get_active_rating_season,
+    list_rating_seasons,
     get_match_mvp_candidates,
     get_rating_leaderboard,
     get_rating_row,
@@ -275,6 +278,66 @@ def _build_manager_label(user) -> str:
     first_name = user["first_name"] if "first_name" in user.keys() and user["first_name"] else "Пользователь"
     handle = f"@{username}" if username else f"id={telegram_id}"
     return f"{first_name} ({handle})"
+
+
+def _notification_mode_label(mode: str) -> str:
+    return {
+        "inherit": "наследовать",
+        "on": "включить",
+        "off": "выключить",
+    }.get((mode or "inherit").strip().lower(), "наследовать")
+
+
+def _admin_notifications_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text=f"{'✅' if enabled else '⬜'} Включены",
+        callback_data="admin_notifications_global_on",
+    )
+    builder.button(
+        text=f"{'⬜' if enabled else '✅'} Выключены",
+        callback_data="admin_notifications_global_off",
+    )
+    builder.button(text="🔙 Назад", callback_data="admin_menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def _tournament_notifications_keyboard(tournament_id: int, current_mode: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    modes = [
+        ("inherit", "Наследовать"),
+        ("on", "Включить"),
+        ("off", "Выключить"),
+    ]
+    for mode_key, label in modes:
+        marker = "✅" if current_mode == mode_key else "⬜"
+        builder.button(
+            text=f"{marker} {label}",
+            callback_data=f"admin_tournament_notifications_set_{tournament_id}_{mode_key}",
+        )
+    builder.button(text="🔙 К турниру", callback_data=f"admin_tournament_manage_{tournament_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+async def _render_tournament_notifications(callback: CallbackQuery, tournament_id: int) -> None:
+    tournament = get_tournament_by_id(tournament_id)
+    user = get_user(callback.from_user.id)
+    if not tournament or not user:
+        await callback.answer("Данные не найдены", show_alert=True)
+        return
+    current_mode = get_tournament_notification_override(tournament_id, int(user["id"]))
+    global_enabled = get_admin_tournament_notifications_enabled(int(user["id"]))
+    effective_text = "включены" if (current_mode == "on" or (current_mode == "inherit" and global_enabled)) else "выключены"
+    await callback.message.edit_text(
+        "🔔 Мои уведомления по турниру\n\n"
+        f"Турнир: {tournament['name']}\n"
+        f"Глобальная настройка: {'включены' if global_enabled else 'выключены'}\n"
+        f"Режим для этого турнира: {_notification_mode_label(current_mode)}\n"
+        f"Итог: {effective_text}",
+        reply_markup=_tournament_notifications_keyboard(tournament_id, current_mode),
+    )
 
 
 def _has_in_progress_veto_sessions(tournament_id: int) -> bool:
@@ -2089,6 +2152,7 @@ async def admin_tournament_manage(callback: CallbackQuery, tournament_id: int | 
     if _is_cs2_sport(tournament["sport"]):
         builder.button(text="🗺 Панель veto", callback_data=f"admin_tournament_veto_{tournament_id}")
         builder.button(text="🏅 MVP", callback_data=f"admin_tournament_mvp_{tournament_id}")
+    builder.button(text="🔔 Мои уведомления", callback_data=f"admin_tournament_notifications_{tournament_id}")
 
     # Редактирование турнира
     builder.button(text="✏️ Редактировать турнир",
@@ -2137,6 +2201,74 @@ async def admin_tournament_replacements_toggle(callback: CallbackQuery):
     conn.close()
     request_site_sync(f"tournament_updated:{tournament_id}:replacements_enabled")
     await admin_tournament_manage(callback, tournament_id=tournament_id)
+
+
+@router.callback_query(F.data == "admin_notifications")
+async def admin_notifications(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    user = get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+    enabled = get_admin_tournament_notifications_enabled(int(user["id"]))
+    await callback.message.edit_text(
+        "🔔 Мои турнирные уведомления\n\n"
+        f"Сейчас: {'включены' if enabled else 'выключены'}\n\n"
+        "Эта настройка влияет на уведомления для админов и ответственных по турнирам.\n"
+        "Отдельно в карточке турнира можно задать override для конкретного турнира.",
+        reply_markup=_admin_notifications_keyboard(enabled),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.in_(["admin_notifications_global_on", "admin_notifications_global_off"]))
+async def admin_notifications_global_toggle(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    user = get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+    enabled = callback.data.endswith("_on")
+    set_admin_tournament_notifications_enabled(int(user["id"]), enabled)
+    await callback.message.edit_text(
+        "🔔 Мои турнирные уведомления\n\n"
+        f"Сейчас: {'включены' if enabled else 'выключены'}\n\n"
+        "Эта настройка влияет на уведомления для админов и ответственных по турнирам.\n"
+        "Отдельно в карточке турнира можно задать override для конкретного турнира.",
+        reply_markup=_admin_notifications_keyboard(enabled),
+    )
+    await callback.answer("Настройка обновлена")
+
+
+@router.callback_query(F.data.regexp(r"^admin_tournament_notifications_\d+$"))
+async def admin_tournament_notifications(callback: CallbackQuery):
+    tournament_id = int(callback.data.split("_")[3])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    await _render_tournament_notifications(callback, tournament_id)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_tournament_notifications_set_"))
+async def admin_tournament_notifications_set(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    tournament_id = int(parts[4])
+    mode = parts[5]
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    user = get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("Пользователь не найден", show_alert=True)
+        return
+    set_tournament_notification_override(tournament_id, int(user["id"]), mode)
+    await _render_tournament_notifications(callback, tournament_id)
+    await callback.answer("Настройка уведомлений обновлена")
 
 
 async def _show_tournament_mvp_panel(message, tournament_id: int):
@@ -4871,18 +5003,40 @@ async def _render_admin_rating_sports(callback: CallbackQuery, state: FSMContext
     )
 
 
+async def _render_admin_rating_seasons(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    sport_key = data["rating_sport_key"]
+    seasons = list_rating_seasons(sport_key)
+    active_season = get_active_rating_season(sport_key)
+    selected_season_id = int(data.get("rating_season_id") or active_season["id"])
+    await state.update_data(rating_season_id=selected_season_id)
+    await callback.message.edit_text(
+        f"📊 Управление рейтингом\n\nТип: {_admin_rating_scope_display(data['rating_scope'])}\n"
+        f"Кто в рейтинге: {_admin_rating_entity_display(data['rating_entity_type'])}\n"
+        f"Спорт: {get_sport_display_name(sport_key)}\n\n"
+        "Выберите сезон:",
+        reply_markup=admin_rating_season_picker_keyboard(
+            seasons,
+            active_season_id=int(active_season["id"]) if active_season else None,
+            allow_next_season=True,
+        ),
+    )
+
+
 async def _render_admin_rating_format(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     sport_key = data["rating_sport_key"]
     scope = data["rating_scope"]
-    season = get_active_rating_season(sport_key) if scope == SCOPE_SEASONAL else None
+    season = get_rating_season_by_id(int(data["rating_season_id"])) if scope == SCOPE_SEASONAL and data.get("rating_season_id") else None
+    if scope == SCOPE_SEASONAL and not season:
+        season = get_active_rating_season(sport_key)
+        await state.update_data(rating_season_id=int(season["id"]) if season else None)
     season_text = f"\nСезон: {season['name']}" if season else ""
-    await state.update_data(rating_season_id=int(season["id"]) if season else None)
     await callback.message.edit_text(
         f"📊 Управление рейтингом\n\nТип: {_admin_rating_scope_display(scope)}\nКто в рейтинге: {_admin_rating_entity_display(data['rating_entity_type'])}\nСпорт: {get_sport_display_name(sport_key)}{season_text}\n\nВыберите формат:",
         reply_markup=admin_rating_format_picker_keyboard(
             get_format_options_for_sport(sport_key) if sport_supports_formats(sport_key) else [],
-            allow_next_season=scope == SCOPE_SEASONAL,
+            allow_next_season=scope == SCOPE_SEASONAL and season and int(season["id"]) == int(get_active_rating_season(sport_key)["id"]),
         ),
     )
 
@@ -4931,12 +5085,19 @@ async def _render_admin_rating_entities(callback: CallbackQuery, state: FSMConte
         offset,
     )
     season = None
+    active_season = None
     if data["rating_scope"] == SCOPE_SEASONAL and data.get("rating_season_id"):
         season = get_rating_season_by_id(int(data["rating_season_id"]))
+        active_season = get_active_rating_season(data["rating_sport_key"])
     season_text = f"\nСезон: {season['name']}" if season else ""
     format_label = _admin_rating_format_display(data.get("rating_format_key"))
     show_format_button = bool(sport_supports_formats(data["rating_sport_key"]))
-    show_next_season_button = data["rating_scope"] == SCOPE_SEASONAL
+    show_next_season_button = bool(
+        data["rating_scope"] == SCOPE_SEASONAL
+        and season
+        and active_season
+        and int(season["id"]) == int(active_season["id"])
+    )
     await state.update_data(rating_entity_offset=offset)
     await _safe_edit_admin_message(
         callback,
@@ -4950,6 +5111,7 @@ async def _render_admin_rating_entities(callback: CallbackQuery, state: FSMConte
             show_format_button=show_format_button,
             show_next_season_button=show_next_season_button,
             show_publish_button=True,
+            show_season_button=data["rating_scope"] == SCOPE_SEASONAL,
         ),
     )
 
@@ -5102,15 +5264,18 @@ async def admin_rating_pick_sport(callback: CallbackQuery, state: FSMContext):
         rating_format_key=None,
         rating_season_id=int(season["id"]) if season else None,
     )
-    data = await state.get_data()
-    if _is_rating_shortcut(data):
-        if sport_supports_formats(sport_key):
-            await _render_admin_rating_format(callback, state)
-        else:
-            await _handle_rating_target_shortcut(callback, state)
+    if scope == SCOPE_SEASONAL:
+        await _render_admin_rating_seasons(callback, state)
     else:
-        await state.update_data(rating_entity_id=None)
-        await _render_admin_rating_entities(callback, state, 0)
+        data = await state.get_data()
+        if _is_rating_shortcut(data):
+            if sport_supports_formats(sport_key):
+                await _render_admin_rating_format(callback, state)
+            else:
+                await _handle_rating_target_shortcut(callback, state)
+        else:
+            await state.update_data(rating_entity_id=None)
+            await _render_admin_rating_entities(callback, state, 0)
     await callback.answer()
 
 
@@ -5133,6 +5298,42 @@ async def admin_rating_open_formats(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Для этого спорта нет форматного рейтинга.", show_alert=True)
         return
     await _render_admin_rating_format(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_rating_choose_season")
+async def admin_rating_choose_season(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    data = await state.get_data()
+    if data.get("rating_scope") != SCOPE_SEASONAL or not data.get("rating_sport_key"):
+        await callback.answer("Сначала выберите сезонный рейтинг.", show_alert=True)
+        return
+    await _render_admin_rating_seasons(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_rating_pick_season_"))
+async def admin_rating_pick_season(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    season_id = int(callback.data.replace("admin_rating_pick_season_", ""))
+    season = get_rating_season_by_id(season_id)
+    data = await state.get_data()
+    if not season or (data.get("rating_sport_key") and season["sport_key"] != data["rating_sport_key"]):
+        await callback.answer("Сезон не найден.", show_alert=True)
+        return
+    await state.update_data(rating_season_id=season_id, rating_format_key=None)
+    data = await state.get_data()
+    if _is_rating_shortcut(data):
+        if sport_supports_formats(data["rating_sport_key"]):
+            await _render_admin_rating_format(callback, state)
+        else:
+            await _handle_rating_target_shortcut(callback, state)
+    else:
+        await _render_admin_rating_entities(callback, state, 0)
     await callback.answer()
 
 
@@ -5177,6 +5378,8 @@ async def admin_rating_next_season_handler(callback: CallbackQuery, state: FSMCo
         await callback.answer("Сначала выберите спорт.", show_alert=True)
         return
     season = get_active_rating_season(sport_key)
+    return_target = "season_picker" if "Выберите сезон" in ((callback.message.text or "") if callback.message else "") else "entities"
+    await state.update_data(rating_next_season_return=return_target)
     builder = InlineKeyboardBuilder()
     builder.button(text="✅ Подтвердить", callback_data="admin_rating_next_season_confirm")
     builder.button(text="❌ Отмена", callback_data="admin_rating_next_season_cancel")
@@ -5196,7 +5399,11 @@ async def admin_rating_next_season_cancel(callback: CallbackQuery, state: FSMCon
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет прав", show_alert=True)
         return
-    await _render_admin_rating_entities(callback, state, int((await state.get_data()).get("rating_entity_offset", 0)))
+    data = await state.get_data()
+    if data.get("rating_next_season_return") == "season_picker":
+        await _render_admin_rating_seasons(callback, state)
+    else:
+        await _render_admin_rating_entities(callback, state, int(data.get("rating_entity_offset", 0)))
     await callback.answer()
 
 

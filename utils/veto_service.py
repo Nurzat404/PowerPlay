@@ -19,6 +19,7 @@ from database import get_connection
 from razryad_arena_utils import (
     can_manage_tournament,
     format_utc_to_msk,
+    get_tournament_admin_notification_chat_ids,
     get_bracket_match_by_id,
     get_effective_tournament_captain_id,
     get_team_members,
@@ -38,6 +39,8 @@ from utils.cs2_maps import DEFAULT_CS2_MAP_POOL, get_cs2_map_name
 
 logger = logging.getLogger(__name__)
 
+VETO_TURN_TIMEOUT_SECONDS = 5 * 60
+
 STATUS_NOT_READY = "not_ready"
 STATUS_READY = "ready_to_start"
 STATUS_IN_PROGRESS = "in_progress"
@@ -56,6 +59,12 @@ START_SOURCE_PANEL = "panel"
 
 ACTION_BAN = "ban"
 ACTION_PICK = "pick"
+
+ADMIN_ACTION_SCOPE_VETO_READY = "veto_ready"
+ADMIN_ACTION_SCOPE_VETO_TIMEOUT_TECH = "veto_timeout_technical"
+ADMIN_ACTION_STATUS_ACTIVE = "active"
+ADMIN_ACTION_STATUS_RESOLVED = "resolved"
+ADMIN_ACTION_STATUS_INVALIDATED = "invalidated"
 
 FIXED_STEPS = {
     "bo3": [
@@ -262,6 +271,245 @@ def _delete_veto_message_target(session_id: int, chat_id: int):
     conn.close()
 
 
+def _ready_action_key(bracket_match_id: int) -> str:
+    return f"match:{int(bracket_match_id)}:ready"
+
+
+def _timeout_action_key(bracket_match_id: int, step_index: int) -> str:
+    return f"match:{int(bracket_match_id)}:step:{int(step_index)}:timeout"
+
+
+def _store_admin_action_message_target(
+    *,
+    action_scope: str,
+    action_key: str,
+    tournament_id: int | None,
+    bracket_match_id: int | None,
+    chat_id: int,
+    message_id: int,
+    status: str = ADMIN_ACTION_STATUS_ACTIVE,
+) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO admin_action_message_targets (
+            action_scope, action_key, tournament_id, bracket_match_id,
+            chat_id, message_id, status, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(action_scope, action_key, chat_id) DO UPDATE SET
+            tournament_id=excluded.tournament_id,
+            bracket_match_id=excluded.bracket_match_id,
+            message_id=excluded.message_id,
+            status=excluded.status,
+            updated_at=CURRENT_TIMESTAMP
+    """, (
+        action_scope,
+        action_key,
+        tournament_id,
+        bracket_match_id,
+        int(chat_id),
+        int(message_id),
+        status,
+    ))
+    conn.commit()
+    conn.close()
+
+
+def _fetch_admin_action_message_targets(
+    *,
+    action_scope: str | None = None,
+    action_key: str | None = None,
+    bracket_match_id: int | None = None,
+    statuses: tuple[str, ...] | None = (ADMIN_ACTION_STATUS_ACTIVE,),
+) -> list[dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    sql = """
+        SELECT *
+        FROM admin_action_message_targets
+        WHERE 1=1
+    """
+    params: list[Any] = []
+    if action_scope:
+        sql += " AND action_scope=?"
+        params.append(action_scope)
+    if action_key:
+        sql += " AND action_key=?"
+        params.append(action_key)
+    if bracket_match_id is not None:
+        sql += " AND bracket_match_id=?"
+        params.append(int(bracket_match_id))
+    if statuses:
+        placeholders = ",".join("?" for _ in statuses)
+        sql += f" AND status IN ({placeholders})"
+        params.extend(statuses)
+    sql += " ORDER BY id"
+    cur.execute(sql, params)
+    rows = [dict(row) for row in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def _mark_admin_action_targets(
+    *,
+    action_scope: str | None = None,
+    action_key: str | None = None,
+    bracket_match_id: int | None = None,
+    from_statuses: tuple[str, ...] | None = None,
+    status: str,
+) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    sql = """
+        UPDATE admin_action_message_targets
+        SET status=?, updated_at=CURRENT_TIMESTAMP
+        WHERE 1=1
+    """
+    params: list[Any] = [status]
+    if action_scope:
+        sql += " AND action_scope=?"
+        params.append(action_scope)
+    if action_key:
+        sql += " AND action_key=?"
+        params.append(action_key)
+    if bracket_match_id is not None:
+        sql += " AND bracket_match_id=?"
+        params.append(int(bracket_match_id))
+    if from_statuses:
+        placeholders = ",".join("?" for _ in from_statuses)
+        sql += f" AND status IN ({placeholders})"
+        params.extend(from_statuses)
+    cur.execute(sql, params)
+    conn.commit()
+    conn.close()
+
+
+async def _send_tracked_admin_action_messages(
+    bot: Bot,
+    *,
+    chat_ids: list[int],
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None,
+    action_scope: str,
+    action_key: str,
+    tournament_id: int | None,
+    bracket_match_id: int | None,
+) -> None:
+    for chat_id in chat_ids:
+        try:
+            sent = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+            _store_admin_action_message_target(
+                action_scope=action_scope,
+                action_key=action_key,
+                tournament_id=tournament_id,
+                bracket_match_id=bracket_match_id,
+                chat_id=int(chat_id),
+                message_id=int(sent.message_id),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Не удалось отправить tracked admin action message scope=%s key=%s chat_id=%s: %s",
+                action_scope,
+                action_key,
+                chat_id,
+                exc,
+            )
+
+
+async def resolve_admin_action_messages(
+    bot: Bot,
+    *,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    action_scope: str | None = None,
+    action_key: str | None = None,
+    bracket_match_id: int | None = None,
+    exclude_target: tuple[int, int] | None = None,
+    final_status: str = ADMIN_ACTION_STATUS_RESOLVED,
+) -> None:
+    targets = _fetch_admin_action_message_targets(
+        action_scope=action_scope,
+        action_key=action_key,
+        bracket_match_id=bracket_match_id,
+        statuses=(ADMIN_ACTION_STATUS_ACTIVE,),
+    )
+    excluded_chat_id = int(exclude_target[0]) if exclude_target else None
+    excluded_message_id = int(exclude_target[1]) if exclude_target else None
+    for row in targets:
+        if excluded_chat_id is not None and excluded_message_id is not None:
+            if int(row["chat_id"]) == excluded_chat_id and int(row["message_id"]) == excluded_message_id:
+                continue
+        try:
+            await bot.edit_message_text(
+                chat_id=int(row["chat_id"]),
+                message_id=int(row["message_id"]),
+                text=text,
+                reply_markup=reply_markup,
+            )
+        except TelegramBadRequest as exc:
+            lowered = str(exc).lower()
+            if "message is not modified" in lowered:
+                continue
+            if "message to edit not found" in lowered or "message can't be edited" in lowered:
+                logger.info(
+                    "Не удалось обновить admin action message scope=%s key=%s chat_id=%s: %s",
+                    row["action_scope"],
+                    row["action_key"],
+                    row["chat_id"],
+                    exc,
+                )
+                continue
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Не удалось обновить admin action message scope=%s key=%s chat_id=%s: %s",
+                row["action_scope"],
+                row["action_key"],
+                row["chat_id"],
+                exc,
+            )
+    _mark_admin_action_targets(
+        action_scope=action_scope,
+        action_key=action_key,
+        bracket_match_id=bracket_match_id,
+        from_statuses=(ADMIN_ACTION_STATUS_ACTIVE,),
+        status=final_status,
+    )
+
+
+def get_veto_ready_action_key(bracket_match_id: int) -> str:
+    return _ready_action_key(bracket_match_id)
+
+
+def get_veto_timeout_action_key(bracket_match_id: int, step_index: int) -> str:
+    return _timeout_action_key(bracket_match_id, step_index)
+
+
+def _timeout_turn_started_at(session: dict[str, Any]) -> datetime | None:
+    started_at_raw = session.get("current_turn_started_at")
+    return parse_utc_storage_datetime(started_at_raw)
+
+
+def is_veto_timeout_pending(session: dict[str, Any], *, expected_step_index: int | None = None) -> bool:
+    if not session or session.get("status") != STATUS_IN_PROGRESS:
+        return False
+    current_step_index = int(session.get("current_step_index") or 0)
+    if current_step_index <= 0:
+        return False
+    if expected_step_index is not None and current_step_index != int(expected_step_index):
+        return False
+    if not session.get("current_team_id"):
+        return False
+    if session.get("timeout_notified_step_index") is not None and int(session["timeout_notified_step_index"]) == current_step_index:
+        pass
+    turn_started_at = _timeout_turn_started_at(session)
+    if not turn_started_at:
+        return False
+    elapsed_seconds = (datetime.now(timezone.utc) - turn_started_at).total_seconds()
+    return elapsed_seconds >= VETO_TURN_TIMEOUT_SECONDS
+
+
 def get_completed_series_maps_for_match(bracket_match_id: int) -> list[dict[str, Any]]:
     session = _fetch_session(bracket_match_id)
     if not session or session["status"] != STATUS_COMPLETED:
@@ -327,6 +575,9 @@ def _write_session_state(conn: sqlite3.Connection, session_id: int, resolution: 
             current_step_index=?,
             current_team_id=?,
             current_action_type=?,
+            current_turn_started_at=CASE WHEN ? = ? THEN CURRENT_TIMESTAMP ELSE NULL END,
+            timeout_notified_step_index=NULL,
+            timeout_notified_at=NULL,
             updated_at=CURRENT_TIMESTAMP
         WHERE id=?
     """, (
@@ -334,6 +585,8 @@ def _write_session_state(conn: sqlite3.Connection, session_id: int, resolution: 
         resolution.current_step_index,
         resolution.current_team_id,
         resolution.current_action_type,
+        resolution.status,
+        STATUS_IN_PROGRESS,
         session_id,
     ))
 
@@ -548,6 +801,9 @@ def start_veto_session(
             current_step_index=?,
             current_team_id=?,
             current_action_type=?,
+            current_turn_started_at=CURRENT_TIMESTAMP,
+            timeout_notified_step_index=NULL,
+            timeout_notified_at=NULL,
             auto_start_consumed=1,
             updated_at=CURRENT_TIMESTAMP
         WHERE bracket_match_id=?
@@ -728,6 +984,9 @@ def cancel_veto_session(bracket_match_id: int, actor_telegram_id: int | None = N
             current_step_index=NULL,
             current_team_id=NULL,
             current_action_type=NULL,
+            current_turn_started_at=NULL,
+            timeout_notified_step_index=NULL,
+            timeout_notified_at=NULL,
             cancelled_at=CURRENT_TIMESTAMP,
             auto_start_consumed=1,
             updated_at=CURRENT_TIMESTAMP
@@ -774,6 +1033,9 @@ def reset_veto_session(bracket_match_id: int, actor_telegram_id: int | None = No
             current_step_index=NULL,
             current_team_id=NULL,
             current_action_type=NULL,
+            current_turn_started_at=NULL,
+            timeout_notified_step_index=NULL,
+            timeout_notified_at=NULL,
             admin_notified_at=NULL,
             captains_notified_at=NULL,
             updated_at=CURRENT_TIMESTAMP
@@ -806,6 +1068,9 @@ def close_veto_for_technical_result(bracket_match_id: int, actor_telegram_id: in
             current_step_index=NULL,
             current_team_id=NULL,
             current_action_type=NULL,
+            current_turn_started_at=NULL,
+            timeout_notified_step_index=NULL,
+            timeout_notified_at=NULL,
             cancelled_at=CASE WHEN status = ? THEN cancelled_at ELSE CURRENT_TIMESTAMP END,
             auto_start_consumed=1,
             updated_at=CURRENT_TIMESTAMP
@@ -846,28 +1111,16 @@ def list_due_sessions_for_dispatch() -> list[dict[str, Any]]:
         JOIN tournaments t ON t.id = s.tournament_id
         LEFT JOIN teams t1 ON t1.id = s.team1_id
         LEFT JOIN teams t2 ON t2.id = s.team2_id
-        WHERE s.status IN (?, ?)
+        WHERE s.status IN (?, ?, ?)
         ORDER BY b.scheduled_at_utc, s.id
-    """, (STATUS_NOT_READY, STATUS_READY))
+    """, (STATUS_NOT_READY, STATUS_READY, STATUS_IN_PROGRESS))
     rows = [dict(row) for row in cur.fetchall()]
     conn.close()
     return rows
 
 
 def _manager_chat_ids_for_tournament(tournament_id: int) -> list[int]:
-    tournament = get_tournament_by_id(tournament_id)
-    chat_ids = set(get_tournament_manager_chat_ids(tournament_id))
-    created_by = tournament["created_by"] if tournament else None
-    creator = get_user(created_by) if created_by else None
-    if creator and creator["telegram_id"]:
-        chat_ids.add(int(creator["telegram_id"]))
-    elif created_by:
-        maybe_user = get_user_by_id(created_by)
-        if maybe_user and maybe_user["telegram_id"]:
-            chat_ids.add(int(maybe_user["telegram_id"]))
-        elif isinstance(created_by, int):
-            chat_ids.add(int(created_by))
-    return list(chat_ids)
+    return list(get_tournament_admin_notification_chat_ids(tournament_id))
 
 
 def _captain_chat_ids(tournament_id: int | None, team1_id: int | None, team2_id: int | None) -> list[int]:
@@ -1020,6 +1273,19 @@ def build_manager_ready_keyboard(bracket_match_id: int) -> InlineKeyboardMarkup:
     ])
 
 
+def build_veto_timeout_keyboard(bracket_match_id: int, step_index: int, *, confirm: bool = False) -> InlineKeyboardMarkup:
+    if confirm:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Подтвердить тех.поражение", callback_data=f"veto_timeout_tech_confirm_{bracket_match_id}_{step_index}")],
+            [InlineKeyboardButton(text="↩️ Назад", callback_data=f"veto_timeout_tech_{bracket_match_id}_{step_index}")],
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚫 Тех.поражение", callback_data=f"veto_timeout_tech_{bracket_match_id}_{step_index}")],
+        [InlineKeyboardButton(text="✅ Не присуждать", callback_data=f"veto_timeout_dismiss_{bracket_match_id}_{step_index}")],
+        [InlineKeyboardButton(text="Открыть управление", callback_data=f"veto_admin_open_{bracket_match_id}")],
+    ])
+
+
 def build_captain_open_keyboard(bracket_match_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Открыть пик карт", callback_data=f"veto_open_{bracket_match_id}")],
@@ -1155,7 +1421,16 @@ async def _notify_managers_ready(bot: Bot, session: dict[str, Any]):
         f"Время: {format_utc_to_msk(session.get('scheduled_at_utc'))} (МСК)\n"
         "Режим запуска: admin_start"
     )
-    await _safe_send(bot, chat_ids, text, build_manager_ready_keyboard(session["bracket_match_id"]))
+    await _send_tracked_admin_action_messages(
+        bot,
+        chat_ids=chat_ids,
+        text=text,
+        reply_markup=build_manager_ready_keyboard(session["bracket_match_id"]),
+        action_scope=ADMIN_ACTION_SCOPE_VETO_READY,
+        action_key=_ready_action_key(session["bracket_match_id"]),
+        tournament_id=session["tournament_id"],
+        bracket_match_id=session["bracket_match_id"],
+    )
 
     conn = get_connection()
     cur = conn.cursor()
@@ -1165,6 +1440,56 @@ async def _notify_managers_ready(bot: Bot, session: dict[str, Any]):
             updated_at=CURRENT_TIMESTAMP
         WHERE id=?
     """, (session["id"],))
+    conn.commit()
+    conn.close()
+
+
+def format_veto_timeout_message(session: dict[str, Any], *, confirm: bool = False, resolved: bool = False) -> str:
+    team_name = session.get("team1_name") if session.get("current_team_id") == session.get("team1_id") else session.get("team2_name")
+    header = "⚠️ Истекло время на пик/бан карт"
+    if confirm:
+        header = "⚠️ Подтверждение тех.поражения"
+    if resolved:
+        header = "✅ Ситуация уже обработана"
+    return (
+        f"{header}\n\n"
+        f"Турнир: {session.get('tournament_name') or 'Турнир'}\n"
+        f"Раунд: {session.get('round_name') or session.get('round_number') or '-'}\n"
+        f"Матч: {session.get('team1_name') or 'Команда 1'} vs {session.get('team2_name') or 'Команда 2'}\n"
+        f"Не сделала ход: {team_name or 'Команда'}\n"
+        "Дедлайн на текущее действие по veto: 5 минут.\n"
+        + (
+            "\nПодтвердите тех.поражение для этой стороны."
+            if confirm
+            else "\nМожно открыть матч или присудить тех.поражение за бездействие."
+        )
+    )
+
+
+async def _notify_veto_timeout(bot: Bot, session: dict[str, Any]) -> None:
+    chat_ids = _manager_chat_ids_for_tournament(session["tournament_id"])
+    step_index = int(session.get("current_step_index") or 0)
+    if not chat_ids or step_index <= 0:
+        return
+    await _send_tracked_admin_action_messages(
+        bot,
+        chat_ids=chat_ids,
+        text=format_veto_timeout_message(session),
+        reply_markup=build_veto_timeout_keyboard(session["bracket_match_id"], step_index),
+        action_scope=ADMIN_ACTION_SCOPE_VETO_TIMEOUT_TECH,
+        action_key=_timeout_action_key(session["bracket_match_id"], step_index),
+        tournament_id=session["tournament_id"],
+        bracket_match_id=session["bracket_match_id"],
+    )
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE match_veto_sessions
+        SET timeout_notified_step_index=?,
+            timeout_notified_at=CURRENT_TIMESTAMP,
+            updated_at=CURRENT_TIMESTAMP
+        WHERE id=?
+    """, (step_index, session["id"]))
     conn.commit()
     conn.close()
 
@@ -1195,7 +1520,7 @@ async def notify_captains_veto_started(bot: Bot, bracket_match_id: int):
 async def dispatch_due_veto_sessions(bot: Bot) -> int:
     dispatched = 0
     for session in list_due_sessions_for_dispatch():
-        if not _match_due(session):
+        if session["status"] in {STATUS_NOT_READY, STATUS_READY} and not _match_due(session):
             continue
 
         if session["status"] == STATUS_NOT_READY:
@@ -1232,6 +1557,25 @@ async def dispatch_due_veto_sessions(bot: Bot) -> int:
             merged = dict(session)
             merged.update(latest)
             await _notify_managers_ready(bot, merged)
+            dispatched += 1
+
+        latest = _fetch_session(session["bracket_match_id"])
+        if not latest or latest.get("status") != STATUS_IN_PROGRESS:
+            continue
+        merged = dict(session)
+        merged.update(latest)
+        current_step_index = int(merged.get("current_step_index") or 0)
+        timeout_notified_step_index = (
+            int(merged["timeout_notified_step_index"])
+            if merged.get("timeout_notified_step_index") is not None
+            else None
+        )
+        if (
+            current_step_index > 0
+            and timeout_notified_step_index != current_step_index
+            and is_veto_timeout_pending(merged)
+        ):
+            await _notify_veto_timeout(bot, merged)
             dispatched += 1
     return dispatched
 

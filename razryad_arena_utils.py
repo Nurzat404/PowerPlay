@@ -40,6 +40,127 @@ def is_admin(telegram_id):
     return user and user['role'] == 'admin'
 
 
+def get_all_admin_users():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT *
+        FROM users
+        WHERE role='admin' AND COALESCE(is_banned, 0)=0
+        ORDER BY first_name, username, id
+    """)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def get_all_admin_chat_ids() -> list[int]:
+    chat_ids: list[int] = []
+    for user in get_all_admin_users():
+        telegram_id = user["telegram_id"] if "telegram_id" in user.keys() else None
+        if telegram_id:
+            chat_ids.append(int(telegram_id))
+    return chat_ids
+
+
+def get_admin_tournament_notifications_enabled(user_id: int) -> bool:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT tournament_notifications_enabled
+        FROM admin_notification_preferences
+        WHERE user_id=?
+    """, (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return True
+    return int(row["tournament_notifications_enabled"] or 0) == 1
+
+
+def set_admin_tournament_notifications_enabled(user_id: int, enabled: bool) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO admin_notification_preferences (
+            user_id, tournament_notifications_enabled, created_at, updated_at
+        )
+        VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(user_id) DO UPDATE SET
+            tournament_notifications_enabled=excluded.tournament_notifications_enabled,
+            updated_at=CURRENT_TIMESTAMP
+    """, (int(user_id), 1 if enabled else 0))
+    conn.commit()
+    conn.close()
+
+
+def get_tournament_notification_override(tournament_id: int, user_id: int) -> str:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT notifications_mode
+        FROM tournament_notification_overrides
+        WHERE tournament_id=? AND user_id=?
+    """, (int(tournament_id), int(user_id)))
+    row = cur.fetchone()
+    conn.close()
+    return (row["notifications_mode"] if row else "inherit") or "inherit"
+
+
+def set_tournament_notification_override(tournament_id: int, user_id: int, mode: str) -> None:
+    normalized_mode = (mode or "inherit").strip().lower()
+    if normalized_mode not in {"inherit", "on", "off"}:
+        normalized_mode = "inherit"
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO tournament_notification_overrides (
+            tournament_id, user_id, notifications_mode, created_at, updated_at
+        )
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(tournament_id, user_id) DO UPDATE SET
+            notifications_mode=excluded.notifications_mode,
+            updated_at=CURRENT_TIMESTAMP
+    """, (int(tournament_id), int(user_id), normalized_mode))
+    conn.commit()
+    conn.close()
+
+
+def is_tournament_notification_enabled_for_user(user_id: int, tournament_id: int) -> bool:
+    override = get_tournament_notification_override(tournament_id, user_id)
+    if override == "on":
+        return True
+    if override == "off":
+        return False
+    return get_admin_tournament_notifications_enabled(user_id)
+
+
+def get_tournament_admin_notification_chat_ids(tournament_id: int) -> list[int]:
+    chat_ids: set[int] = set()
+    users_by_id: dict[int, sqlite3.Row] = {}
+
+    for user in get_all_admin_users():
+        users_by_id[int(user["id"])] = user
+
+    tournament = get_tournament_by_id(tournament_id)
+    created_by = int(tournament["created_by"]) if tournament and tournament["created_by"] else None
+    if created_by:
+        creator = get_user_by_id(created_by)
+        if creator:
+            users_by_id[int(creator["id"])] = creator
+
+    for user in get_tournament_manager_users(tournament_id):
+        users_by_id[int(user["id"])] = user
+
+    for user_id, user in users_by_id.items():
+        telegram_id = user["telegram_id"] if "telegram_id" in user.keys() else None
+        if not telegram_id:
+            continue
+        if is_tournament_notification_enabled_for_user(user_id, tournament_id):
+            chat_ids.add(int(telegram_id))
+    return list(chat_ids)
+
+
 def get_or_create_user(telegram_id, first_name, last_name, username):
     conn = get_connection()
     cur = conn.cursor()

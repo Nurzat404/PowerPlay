@@ -211,6 +211,8 @@ def admin_menu_keyboard():
             text="👥 Управление пользователями", callback_data="admin_users")],
         [InlineKeyboardButton(text="📊 Управление рейтингом",
                               callback_data="admin_rating")],
+        [InlineKeyboardButton(text="🔔 Мои турнирные уведомления",
+                              callback_data="admin_notifications")],
         [InlineKeyboardButton(text="📢 Рассылка",
                               callback_data="admin_broadcast_start")],
         [InlineKeyboardButton(text="⚙️ Управление командами",
@@ -411,7 +413,22 @@ def admin_rating_format_picker_keyboard(options, *, allow_next_season: bool = Fa
     builder.adjust(1)
     return builder.as_markup()
 
-def admin_rating_entity_list_keyboard(items, *, entity_type: str, offset: int, has_prev: bool, has_next: bool, show_format_button: bool = False, show_next_season_button: bool = False, show_publish_button: bool = False):
+def admin_rating_season_picker_keyboard(seasons, *, active_season_id: int | None = None, allow_next_season: bool = True):
+    builder = InlineKeyboardBuilder()
+    for season in seasons:
+        season_id = int(season["id"])
+        label = str(season["name"])
+        if active_season_id and season_id == int(active_season_id):
+            label = f"✅ {label}"
+        builder.button(text=label[:60], callback_data=f"admin_rating_pick_season_{season_id}")
+    if allow_next_season:
+        builder.button(text="➡️ Следующий сезон", callback_data="admin_rating_next_season")
+    builder.button(text="🔙 Назад", callback_data="admin_rating_back_sport")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def admin_rating_entity_list_keyboard(items, *, entity_type: str, offset: int, has_prev: bool, has_next: bool, show_format_button: bool = False, show_next_season_button: bool = False, show_publish_button: bool = False, show_season_button: bool = False):
     builder = InlineKeyboardBuilder()
     for item in items:
         rating_value = int(item.get("rating_value") or 0)
@@ -433,6 +450,8 @@ def admin_rating_entity_list_keyboard(items, *, entity_type: str, offset: int, h
 
     if show_format_button:
         builder.button(text="🗂 Формат", callback_data="admin_rating_open_formats")
+    if show_season_button:
+        builder.button(text="🗓 Сезон", callback_data="admin_rating_choose_season")
     if show_publish_button:
         builder.button(text="📢 Опубликовать в канал", callback_data="admin_rating_publish_channel")
     if show_next_season_button:

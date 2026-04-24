@@ -7,6 +7,7 @@ from aiogram.filters import Command
 from razryad_arena_utils import get_user, is_admin, get_all_sports, update_user, is_email_unique, update_user_age, update_user_steam_id, get_user_by_steam_id, get_steam_profile_name, map_sports_to_display
 from keyboards import main_menu_keyboard, back_to_main_keyboard, admin_menu_keyboard, edit_profile_menu_keyboard, cancel_keyboard, sports_choice_keyboard
 from utils.steam_utils import parse_steam_link, validate_steam_id64, get_steam_id_instructions
+from utils.project_rules import get_project_rules_text
 import json
 import logging
 import sqlite3
@@ -14,6 +15,26 @@ import sqlite3
 logger = logging.getLogger(__name__)
 
 router = Router()
+
+
+def _chunk_telegram_text(text: str, limit: int = 3900) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for line in text.splitlines():
+        line_len = len(line) + 1
+        if current and current_len + line_len > limit:
+            chunks.append("\n".join(current).strip())
+            current = [line]
+            current_len = line_len
+        else:
+            current.append(line)
+            current_len += line_len
+    if current:
+        chunks.append("\n".join(current).strip())
+    return chunks
 
 
 def format_profile_text(user: dict) -> str:
@@ -422,51 +443,14 @@ async def edit_steam_id_finish(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "rules")
 async def show_rules(callback: CallbackQuery):
-    rules_text = """
-📜 Правила проекта Разряд-Арена
+    chunks = _chunk_telegram_text(get_project_rules_text())
+    if len(chunks) == 1:
+        await callback.message.edit_text(chunks[0], reply_markup=back_to_main_keyboard())
+        await callback.answer()
+        return
 
-1. Общие положения
-   - Платформа создана для организации любительских турниров и общения игроков.
-   - Участие означает автоматическое согласие с данными правилами.
-   - Администрация вправе вносить изменения в правила с уведомлением участников.
-
-2. Регистрация и аккаунт
-   - Запрещено создавать несколько аккаунтов для обхода ограничений.
-   - Запрещено использовать чужие данные или выдавать себя за другого игрока.
-   - Никнейм не должен содержать оскорблений, нецензурной лексики или провокаций.
-
-3. Создание команд
-   - Название команды должно быть уникальным и не нарушать правила приличия (запрещены оскорбления, мат, политические провокации, реклама).
-   - Команда может быть удалена администратором без предупреждения, если название признано недопустимым.
-   - Капитан несёт ответственность за состав и поведение своей команды.
-
-4. Поведение участников
-   - Запрещены оскорбления, унижения, угрозы в адрес других игроков, администраторов или организаторов.
-   - Запрещён флуд, спам, провокации в общих чатах и комментариях.
-   - Запрещены любые формы дискриминации (по национальности, религии, полу и т.д.).
-   - Участники обязаны уважать соперников и соблюдать принципы fair play.
-
-5. Участие в турнирах
-   - Запрещено использовать баги или ошибки платформы для получения преимущества.
-   - Запрещена передача аккаунта другому лицу для участия в турнире (буст).
-   - Команда обязана являться на матчи вовремя. Опоздание более 15 минут может считаться техническим поражением.
-   - Запрещено намеренно затягивать время, срывать матчи или создавать помехи.
-   - Решение администратора по спорным ситуациям является окончательным.
-
-6. Санкции за нарушения
-   - Предупреждение – за незначительные нарушения.
-   - Дисквалификация с турнира – за грубые нарушения (оскорбления, читерство).
-   - Бан аккаунта – за систематические нарушения, создание оскорбительных названий, угрозы.
-   - Администратор вправе применять санкции без предварительного предупреждения.
-
-7. Ответственность и спорные ситуации
-   - Администрация не несёт ответственности за временные сбои в работе бота.
-   - Все спорные ситуации решаются администраторами проекта. Решение администратора является окончательным.
-   - В случае неспортивного поведения команда может быть исключена из турнира без возврата взноса (если платные).
-
-8. Заключительные положения
-   - Администрация оставляет за собой право изменять правила с уведомлением участников.
-   - Игнорирование правил не освобождает от ответственности.
-"""
-    await callback.message.edit_text(rules_text, reply_markup=back_to_main_keyboard())
+    await callback.message.edit_text(chunks[0])
+    for chunk in chunks[1:-1]:
+        await callback.message.answer(chunk)
+    await callback.message.answer(chunks[-1], reply_markup=back_to_main_keyboard())
     await callback.answer()
