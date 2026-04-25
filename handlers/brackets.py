@@ -18,8 +18,9 @@ from razryad_arena_utils import (
     parse_msk_datetime_input, datetime_to_utc_storage, format_utc_to_msk,
     parse_utc_storage_datetime, mark_bracket_reminder_sent,
     clear_bracket_related_data, can_create_third_place_match, sync_tournament_match_format_rules,
+    get_tournament_main_round_count,
 )
-from utils.bracket_utils import generate_bracket, get_semifinal_losers
+from utils.bracket_utils import generate_bracket, get_round_name, get_semifinal_losers
 from database import get_connection
 from handlers.states import ManualMatchInput, BracketScheduleInput, TargetedBroadcast
 from handlers.match_manual import start_manual_input_by_match
@@ -36,6 +37,42 @@ from utils.veto_service import (
 
 router = Router()
 logger = logging.getLogger(__name__)
+
+
+def _match_value(match, key: str, default=None):
+    try:
+        value = match[key]
+    except (KeyError, IndexError, TypeError):
+        value = default
+    return default if value is None else value
+
+
+def _is_third_place_match(match) -> bool:
+    if int(_match_value(match, "is_third_place", 0) or 0) == 1:
+        return True
+    round_name = str(_match_value(match, "round_name", "") or "").strip().lower()
+    return round_name.startswith("матч за 3-е") or round_name.startswith("матч за 3е")
+
+
+def _get_total_main_rounds(matches: list[dict]) -> int:
+    main_rounds = [
+        int(_match_value(match, "round_number", 0))
+        for match in matches
+        if not _is_third_place_match(match)
+    ]
+    return max(main_rounds) if main_rounds else 0
+
+
+def _resolve_match_round_label(match: dict, total_main_rounds: int | None = None) -> str:
+    if total_main_rounds is None:
+        tournament_id = _match_value(match, "tournament_id")
+        if tournament_id:
+            total_main_rounds = get_tournament_main_round_count(int(tournament_id))
+    return get_round_name(
+        int(_match_value(match, "round_number", 0) or 0),
+        total_main_rounds,
+        is_third_place=_is_third_place_match(match),
+    )
 
 
 def _schedule_locked_by_veto(match_id: int) -> bool:
@@ -127,9 +164,7 @@ async def _prompt_schedule_datetime(target: CallbackQuery | Message, state: FSMC
     team2 = match_dict.get("team2_name") or "Команда 2"
     current_time = format_utc_to_msk(match_dict.get("scheduled_at_utc"))
     current_location = (match_dict.get("location") or "не назначено").strip()
-    round_label = match_dict.get("round_name")
-    if not round_label:
-        round_label = f"Раунд {match_dict.get('round_number') or '?'}"
+    round_label = _resolve_match_round_label(match_dict)
 
     text = (
         "📅 Назначение матча\n\n"
@@ -519,35 +554,17 @@ async def view_bracket(callback: CallbackQuery, state: FSMContext, tournament_id
                 matches_by_round[round_num] = []
             matches_by_round[round_num].append(match)
 
-        # Определяем общее количество раундов основной сетки (без матча за 3-е место).
-        main_rounds = [r for r in matches_by_round.keys() if r < 5]
-        total_rounds = max(main_rounds) if main_rounds else 0
-
-        # Динамические названия раундов в зависимости от общего количества
-        def get_round_name_dynamic(round_num, total):
-            if round_num == 5:
-                return "Матч за 3-е место"
-            if total == 1:
-                return "Финал"
-            if round_num == total:
-                return "Финал"
-            if round_num == total - 1:
-                return "Полуфинал"
-
-            steps_to_final = total - round_num
-            if steps_to_final >= 2:
-                denominator = 2 ** steps_to_final
-                return f"1/{denominator} финала"
-            return f"Раунд {round_num}"
+        total_rounds = _get_total_main_rounds(matches)
 
         for round_num in sorted(matches_by_round.keys()):
             round_matches = matches_by_round[round_num]
-            round_name = get_round_name_dynamic(round_num, total_rounds)
 
             for i, match in enumerate(round_matches, 1):
                 # Пропускаем матчи где нет команд (team1_id и team2_id не установлены)
                 if not match['team1_id'] and not match['team2_id']:
                     continue
+
+                round_name = _resolve_match_round_label(dict(match), total_rounds)
 
                 # Показываем только матчи где есть хотя бы одна команда или статус completed
                 if match['status'] == 'pending':
@@ -585,7 +602,7 @@ async def view_bracket(callback: CallbackQuery, state: FSMContext, tournament_id
                                 for m in semifinals)
             if all_completed:
                 third_place_exists = any(
-                    m['round_number'] == 5 for m in matches)
+                    _is_third_place_match(m) for m in matches)
                 if not third_place_exists:
                     builder.button(
                         text="⚔️ Создать матч за 3-е место",
@@ -692,7 +709,7 @@ async def bracket_match_menu(callback: CallbackQuery, state: FSMContext):
     schedule_missing = _schedule_missing(match)
     match_time = format_utc_to_msk(match.get("scheduled_at_utc")) if match.get("scheduled_at_utc") else "не назначено"
     location = (match.get("location") or "не указано").strip() if match.get("location") else "не указано"
-    round_name = match.get("round_name") or f"Раунд {match.get('round_number') or '?'}"
+    round_name = _resolve_match_round_label(match)
     text = (
         "⚙️ Управление матчем\n\n"
         f"🏆 {match.get('tournament_name') or 'Турнир'}\n"

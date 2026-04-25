@@ -8,8 +8,17 @@
 import math
 from PIL import Image, ImageDraw, ImageFont
 import logging
+from utils.bracket_utils import get_round_name
 
 logger = logging.getLogger(__name__)
+
+
+def _match_value(match, key: str, default=None):
+    try:
+        value = match[key]
+    except (KeyError, IndexError, TypeError):
+        value = default
+    return default if value is None else value
 
 # =============================================================================
 # НАСТРОЙКИ (все параметры вынесены для удобной настройки)
@@ -999,6 +1008,16 @@ def draw_bracket_from_db(matches: list, tournament_name: str, output_path: str =
         matches_by_round[round_num].sort(key=lambda m: m['match_number'])
 
     num_rounds = max(matches_by_round.keys())
+    third_place_rounds = {
+        round_num: any(int(_match_value(match, 'is_third_place', 0) or 0) == 1 for match in round_matches)
+        for round_num, round_matches in matches_by_round.items()
+    }
+    main_rounds = [
+        int(_match_value(match, 'round_number', 0))
+        for match in matches
+        if int(_match_value(match, 'is_third_place', 0) or 0) == 0
+    ]
+    total_main_rounds = max(main_rounds) if main_rounds else 0
 
     # Расчёт размеров
     first_round_count = len(matches_by_round.get(1, []))
@@ -1036,7 +1055,12 @@ def draw_bracket_from_db(matches: list, tournament_name: str, output_path: str =
         if not round_matches:
             continue
 
-        round_name = round_matches[0]['round_name'] if round_matches and round_matches[0]['round_name'] else get_round_name_db(round_num, num_rounds)
+        sample_match = round_matches[0]
+        round_name = get_round_name_db(
+            round_num,
+            total_main_rounds,
+            is_third_place=bool(int(_match_value(sample_match, 'is_third_place', 0) or 0)),
+        )
         round_x = START_X + (round_num - 1) * STAGE_OFFSET_X
 
         # Название раунда
@@ -1052,7 +1076,8 @@ def draw_bracket_from_db(matches: list, tournament_name: str, output_path: str =
             # Вычисляем Y-позицию
             y_top, y_bottom = calculate_match_y_db(
                 round_num, match['match_number'], base_start_y,
-                pair_height, STAGE_GAP, first_round_count
+                pair_height, STAGE_GAP, first_round_count,
+                is_third_place=bool(int(_match_value(match, 'is_third_place', 0) or 0)),
             )
 
             # Названия команд. Для BYE-матча пустой слот показываем как BYE.
@@ -1105,6 +1130,8 @@ def draw_bracket_from_db(matches: list, tournament_name: str, output_path: str =
         next_round_num = round_num + 1
         if next_round_num not in block_coords:
             continue
+        if third_place_rounds.get(round_num) or third_place_rounds.get(next_round_num):
+            continue
 
         for match_num, (start_x, y_top, y_bottom) in block_coords[round_num].items():
             next_match_num = (match_num + 1) // 2
@@ -1130,25 +1157,22 @@ def draw_bracket_from_db(matches: list, tournament_name: str, output_path: str =
     return output_path
 
 
-def get_round_name_db(round_number: int, total_rounds: int) -> str:
+def get_round_name_db(round_number: int, total_rounds: int, is_third_place: bool = False) -> str:
     """Возвращает название раунда для сетки из БД."""
-    if total_rounds == 1 and round_number == 1:
-        return "Финал"
-    elif total_rounds == 2:
-        return "Полуфинал" if round_number == 1 else "Финал"
-    elif total_rounds == 3:
-        names = {1: "1/4 финала", 2: "Полуфинал", 3: "Финал"}
-        return names.get(round_number, f"Раунд {round_number}")
-    elif total_rounds == 4:
-        names = {1: "1/8 финала", 2: "1/4 финала", 3: "Полуфинал", 4: "Финал"}
-        return names.get(round_number, f"Раунд {round_number}")
-    else:
-        return f"Раунд {round_number}"
+    return get_round_name(round_number, total_rounds, is_third_place=is_third_place)
 
 
 def calculate_match_y_db(round_num: int, match_num: int, base_start_y: int,
-                         pair_height: int, stage_gap: int, first_round_count: int) -> tuple:
+                         pair_height: int, stage_gap: int, first_round_count: int,
+                         is_third_place: bool = False) -> tuple:
     """Вычисляет Y-координаты для матча в сетке из БД."""
+    if is_third_place:
+        total_height = first_round_count * pair_height + stage_gap * max(first_round_count - 1, 0)
+        group_center_y = base_start_y + total_height / 2
+        y_top = int(group_center_y - BOX_H / 2 - PAIR_GAP / 2)
+        y_bottom = int(group_center_y + BOX_H / 2 + PAIR_GAP / 2)
+        return y_top, y_bottom
+
     if round_num == 1:
         y_offset = (match_num - 1) * (pair_height + stage_gap)
         y_top = base_start_y + y_offset

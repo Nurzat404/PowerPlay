@@ -7,11 +7,28 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def get_round_name(round_number: int) -> str:
-    """Возвращает название раунда по его номеру."""
-    if round_number == 5:
-        return "Матч за 3-е место"
+def get_main_round_name(round_number: int, total_rounds: int) -> str:
+    """Возвращает каноничное название раунда основной сетки."""
+    if total_rounds <= 0:
+        return f"Раунд {round_number}"
+    if round_number == total_rounds:
+        return "Финал"
+    if round_number == total_rounds - 1:
+        return "Полуфинал"
+    steps_to_final = total_rounds - round_number
+    if steps_to_final >= 2:
+        denominator = 2 ** steps_to_final
+        return f"1/{denominator} финала"
     return f"Раунд {round_number}"
+
+
+def get_round_name(round_number: int, total_rounds: int | None = None, *, is_third_place: bool = False) -> str:
+    """Возвращает название этапа сетки."""
+    if is_third_place:
+        return "Матч за 3-е место"
+    if total_rounds is None:
+        return f"Раунд {round_number}"
+    return get_main_round_name(round_number, total_rounds)
 
 
 def calculate_total_rounds(num_teams: int) -> int:
@@ -39,19 +56,6 @@ def _next_power_of_two(value: int) -> int:
     while size < value:
         size *= 2
     return size
-
-
-def _main_round_name(round_number: int, total_rounds: int) -> str:
-    """Человеческое название для раунда основной сетки."""
-    if round_number == total_rounds:
-        return "Финал"
-    if round_number == total_rounds - 1:
-        return "Полуфинал"
-    steps_to_final = total_rounds - round_number
-    if steps_to_final >= 2:
-        denominator = 2 ** steps_to_final
-        return f"1/{denominator} финала"
-    return f"Раунд {round_number}"
 
 
 def _select_bye_match_indexes(first_round_matches: int, bye_count: int) -> set[int]:
@@ -148,7 +152,7 @@ def _auto_advance_ready_matches(conn, tournament_id: int) -> None:
             """
             SELECT *
             FROM tournament_brackets
-            WHERE tournament_id=? AND round_number < 5
+            WHERE tournament_id=? AND COALESCE(is_third_place, 0)=0
             ORDER BY round_number, match_number
             """,
             (tournament_id,),
@@ -238,7 +242,7 @@ def generate_bracket(tournament_id: int) -> bool:
                 (
                     tournament_id,
                     1,
-                    _main_round_name(1, total_rounds),
+                    get_main_round_name(1, total_rounds),
                     match_number,
                     team1_id,
                     team2_id,
@@ -260,7 +264,7 @@ def generate_bracket(tournament_id: int) -> bool:
                     (
                         tournament_id,
                         round_number,
-                        _main_round_name(round_number, total_rounds),
+                        get_main_round_name(round_number, total_rounds),
                         match_number,
                     ),
                 )

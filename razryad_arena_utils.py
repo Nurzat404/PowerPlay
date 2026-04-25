@@ -1126,7 +1126,7 @@ def get_tournament_main_round_count(tournament_id: int) -> int:
     cur.execute("""
         SELECT MAX(round_number)
         FROM tournament_brackets
-        WHERE tournament_id=? AND round_number < 5
+        WHERE tournament_id=? AND COALESCE(is_third_place, 0)=0
     """, (tournament_id,))
     row = cur.fetchone()
     conn.close()
@@ -1199,10 +1199,6 @@ def resolve_tournament_round_format(tournament_id: int, round_number: int, total
         return fallback
 
     target_round = int(round_number or 1)
-    if target_round == 5:
-        main_rounds = int(total_main_rounds or get_tournament_main_round_count(tournament_id) or 1)
-        target_round = max(main_rounds - 1, 1)
-
     return rules.get(target_round, fallback)
 
 
@@ -1211,7 +1207,10 @@ def resolve_bracket_match_format(match_id: int) -> str:
     if not match:
         return "bo3"
     total_main_rounds = get_tournament_main_round_count(match["tournament_id"])
-    return resolve_tournament_round_format(match["tournament_id"], match["round_number"], total_main_rounds)
+    target_round = int(match["round_number"] or 1)
+    if int(match["is_third_place"] or 0) == 1:
+        target_round = max(total_main_rounds - 1, 1)
+    return resolve_tournament_round_format(match["tournament_id"], target_round, total_main_rounds)
 
 
 def add_tournament_application(tournament_id, team_id):
@@ -2692,8 +2691,9 @@ def get_semifinal_matches(tournament_id: int):
               SELECT MAX(round_number) - 1
               FROM tournament_brackets
               WHERE tournament_id=?
-                AND round_number < 5
+                AND COALESCE(is_third_place, 0)=0
           )
+          AND COALESCE(is_third_place, 0)=0
         ORDER BY match_number
     """, (tournament_id, tournament_id))
     matches = cur.fetchall()
@@ -2706,10 +2706,17 @@ def create_third_place_bracket_match(tournament_id: int, team1_id: int, team2_id
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
+        SELECT MAX(round_number)
+        FROM tournament_brackets
+        WHERE tournament_id=? AND COALESCE(is_third_place, 0)=0
+    """, (tournament_id,))
+    row = cur.fetchone()
+    round_number = (int(row[0]) if row and row[0] else 0) + 1
+    cur.execute("""
         INSERT INTO tournament_brackets 
-        (tournament_id, round_number, round_name, match_number, team1_id, team2_id, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (tournament_id, 5, "Матч за 3-е место", 1, team1_id, team2_id, 'pending'))
+        (tournament_id, round_number, round_name, match_number, team1_id, team2_id, status, is_third_place)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+    """, (tournament_id, round_number, "Матч за 3-е место", 1, team1_id, team2_id, 'pending'))
     conn.commit()
     conn.close()
 
@@ -3796,8 +3803,9 @@ def get_tournament_final_winner(tournament_id: int) -> int:
         SELECT winner_id FROM tournament_brackets
         WHERE tournament_id=? AND round_number=(
             SELECT MAX(round_number) FROM tournament_brackets 
-            WHERE tournament_id=? AND round_number < 5
+            WHERE tournament_id=? AND COALESCE(is_third_place, 0)=0
         )
+        AND COALESCE(is_third_place, 0)=0
         ORDER BY match_number DESC
         LIMIT 1
     """, (tournament_id, tournament_id))
@@ -3814,8 +3822,9 @@ def get_tournament_second_place(tournament_id: int) -> int:
         SELECT team1_id, team2_id, winner_id FROM tournament_brackets
         WHERE tournament_id=? AND round_number=(
             SELECT MAX(round_number) FROM tournament_brackets 
-            WHERE tournament_id=? AND round_number < 5
+            WHERE tournament_id=? AND COALESCE(is_third_place, 0)=0
         )
+        AND COALESCE(is_third_place, 0)=0
         AND status='completed'
         LIMIT 1
     """, (tournament_id, tournament_id))
@@ -3831,13 +3840,14 @@ def get_tournament_second_place(tournament_id: int) -> int:
 
 
 def get_third_place_match_winner(tournament_id: int) -> int:
-    """Возвращает ID победителя матча за 3-е место (round_number=5)."""
+    """Возвращает ID победителя матча за 3-е место."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
         SELECT winner_id FROM tournament_brackets
-        WHERE tournament_id=? AND round_number=5
+        WHERE tournament_id=? AND COALESCE(is_third_place, 0)=1
         AND status='completed'
+        ORDER BY round_number DESC, id DESC
         LIMIT 1
     """, (tournament_id,))
     result = cur.fetchone()
@@ -3958,7 +3968,7 @@ def allow_reapply_excluded_application(app_id: int):
 def can_create_third_place_match(tournament_id: int):
     """Проверяет, можно ли создать матч за 3-е место."""
     matches = get_bracket_matches(tournament_id)
-    if any(m['round_number'] == 5 for m in matches):
+    if any(int(m['is_third_place'] or 0) == 1 for m in matches):
         return {"ok": False, "reason": "already_exists"}
 
     semifinals = get_semifinal_matches(tournament_id)

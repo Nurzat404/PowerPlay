@@ -577,7 +577,7 @@ def _get_bracket_third_place(cur, tournament_id: int) -> int | None:
         """
         SELECT winner_id
         FROM tournament_brackets
-        WHERE tournament_id=? AND round_number=5 AND status='completed'
+        WHERE tournament_id=? AND COALESCE(is_third_place, 0)=1 AND status='completed'
         ORDER BY id DESC
         LIMIT 1
         """,

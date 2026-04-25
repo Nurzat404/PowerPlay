@@ -801,6 +801,7 @@ def init_db():
                         score2 INTEGER DEFAULT 0,
                         next_match_id INTEGER REFERENCES tournament_brackets(id),
                         is_bye INTEGER DEFAULT 0,
+                        is_third_place INTEGER DEFAULT 0,
                         status TEXT DEFAULT 'pending',
                         scheduled_at_utc TEXT,
                         location TEXT,
@@ -1095,6 +1096,19 @@ def init_db():
                 # Миграции для tournament_brackets
                 cur.execute("PRAGMA table_info(tournament_brackets)")
                 columns = [col[1] for col in cur.fetchall()]
+                if 'is_third_place' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournament_brackets ADD COLUMN is_third_place INTEGER DEFAULT 0")
+                    logger.info("Поле is_third_place добавлено в таблицу tournament_brackets")
+                cur.execute("""
+                    UPDATE tournament_brackets
+                    SET is_third_place=1
+                    WHERE COALESCE(is_third_place, 0)=0
+                      AND (
+                        LOWER(COALESCE(round_name, '')) LIKE 'матч за 3-е%'
+                        OR LOWER(COALESCE(round_name, '')) LIKE 'матч за 3е%'
+                      )
+                """)
                 if 'score1' not in columns:
                     cur.execute(
                         "ALTER TABLE tournament_brackets ADD COLUMN score1 INTEGER DEFAULT 0")
