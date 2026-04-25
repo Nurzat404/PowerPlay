@@ -67,25 +67,6 @@ ADMIN_ACTION_STATUS_ACTIVE = "active"
 ADMIN_ACTION_STATUS_RESOLVED = "resolved"
 ADMIN_ACTION_STATUS_INVALIDATED = "invalidated"
 
-FIXED_STEPS = {
-    "bo3": [
-        (1, ACTION_BAN),
-        (2, ACTION_BAN),
-        (1, ACTION_PICK),
-        (2, ACTION_PICK),
-        (1, ACTION_BAN),
-        (2, ACTION_BAN),
-    ],
-    "bo5": [
-        (1, ACTION_BAN),
-        (2, ACTION_BAN),
-        (1, ACTION_PICK),
-        (2, ACTION_PICK),
-        (1, ACTION_PICK),
-        (2, ACTION_PICK),
-    ],
-}
-
 
 @dataclass
 class SessionResolution:
@@ -138,14 +119,35 @@ def validate_veto_pool(match_format: str, map_keys: list[str]) -> tuple[bool, st
         seen.add(key)
         unique.append(key)
 
-    if normalized == "bo1":
-        if len(unique) < 3 or len(unique) % 2 == 0:
-            return False, "Для BO1 нужен нечетный пул минимум из 3 карт."
-        return True, None
+    if len(unique) < 1 or len(unique) > 10:
+        return False, "Пул карт должен содержать от 1 до 10 уникальных карт."
 
-    if len(unique) < 7:
-        return False, "Для BO3/BO5 нужен пул минимум из 7 уникальных карт."
+    minimum_by_format = {
+        "bo1": 1,
+        "bo3": 3,
+        "bo5": 5,
+    }
+    required_count = minimum_by_format[normalized]
+    if len(unique) < required_count:
+        return False, f"Для {normalized.upper()} нужен пул минимум из {required_count} уникальных карт."
     return True, None
+
+
+def _series_target_map_count(match_format: str | None) -> int:
+    normalized = _normalize_format(match_format)
+    return {
+        "bo1": 1,
+        "bo3": 3,
+        "bo5": 5,
+    }.get(normalized, 3)
+
+
+def _alternate_team_id(session: dict[str, Any], team_id: int | None) -> int | None:
+    if team_id == session.get("team1_id"):
+        return session.get("team2_id")
+    if team_id == session.get("team2_id"):
+        return session.get("team1_id")
+    return session.get("team1_id")
 
 
 def _fetch_candidate_matches(tournament_id: int | None = None) -> list[dict[str, Any]]:
@@ -572,23 +574,32 @@ def _resolve_session_state(session: dict[str, Any], pool_rows: list[dict[str, An
     if session["status"] in {STATUS_COMPLETED, STATUS_CANCELLED}:
         return SessionResolution(session["status"], None, None, None)
 
-    played = len([row for row in actions if row["action_type"] in {ACTION_BAN, ACTION_PICK}])
+    veto_actions = [row for row in actions if row["action_type"] in {ACTION_BAN, ACTION_PICK}]
+    ban_actions = [row for row in veto_actions if row["action_type"] == ACTION_BAN]
+    pick_actions = [row for row in veto_actions if row["action_type"] == ACTION_PICK]
+    played = len(veto_actions)
     remaining = _remaining_pool(pool_rows, actions)
     match_format = _normalize_format(session["match_format"])
+    target_map_count = _series_target_map_count(match_format)
+    ban_phase_actions = max(len(pool_rows) - target_map_count, 0)
 
-    if match_format == "bo1":
-        if len(remaining) <= 1:
-            return SessionResolution(STATUS_COMPLETED, None, None, None)
-        current_team_id = session["team1_id"] if played % 2 == 0 else session["team2_id"]
-        return SessionResolution(STATUS_IN_PROGRESS, played + 1, current_team_id, ACTION_BAN)
-
-    step_config = FIXED_STEPS[match_format]
-    if played >= len(step_config) or len(remaining) <= 1:
+    if len(remaining) <= 1 and target_map_count == 1:
         return SessionResolution(STATUS_COMPLETED, None, None, None)
 
-    slot, action_type = step_config[played]
-    current_team_id = session["team1_id"] if slot == 1 else session["team2_id"]
-    return SessionResolution(STATUS_IN_PROGRESS, played + 1, current_team_id, action_type)
+    if len(ban_actions) < ban_phase_actions:
+        current_team_id = session["team1_id"] if len(ban_actions) % 2 == 0 else session["team2_id"]
+        return SessionResolution(STATUS_IN_PROGRESS, played + 1, current_team_id, ACTION_BAN)
+
+    if target_map_count == 1 or len(remaining) <= 1:
+        return SessionResolution(STATUS_COMPLETED, None, None, None)
+
+    picks_required = target_map_count - 1
+    if len(pick_actions) >= picks_required:
+        return SessionResolution(STATUS_COMPLETED, None, None, None)
+
+    first_pick_team_id = session["team1_id"] if ban_phase_actions % 2 == 0 else session["team2_id"]
+    current_team_id = first_pick_team_id if len(pick_actions) % 2 == 0 else _alternate_team_id(session, first_pick_team_id)
+    return SessionResolution(STATUS_IN_PROGRESS, played + 1, current_team_id, ACTION_PICK)
 
 
 def _write_session_state(conn: sqlite3.Connection, session_id: int, resolution: SessionResolution):
@@ -813,35 +824,6 @@ def start_veto_session(
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        UPDATE match_veto_sessions
-        SET status=?,
-            ready_at=COALESCE(ready_at, CURRENT_TIMESTAMP),
-            started_at=CURRENT_TIMESTAMP,
-            completed_at=NULL,
-            cancelled_at=NULL,
-            started_by_user_id=?,
-            started_by_kind=?,
-            start_source=?,
-            current_step_index=?,
-            current_team_id=?,
-            current_action_type=?,
-            current_turn_started_at=CURRENT_TIMESTAMP,
-            timeout_notified_step_index=NULL,
-            timeout_notified_at=NULL,
-            auto_start_consumed=1,
-            updated_at=CURRENT_TIMESTAMP
-        WHERE bracket_match_id=?
-    """, (
-        STATUS_IN_PROGRESS,
-        actor["id"] if actor else None,
-        started_by_kind,
-        start_source,
-        resolution.current_step_index,
-        resolution.current_team_id,
-        resolution.current_action_type,
-        bracket_match_id,
-    ))
-    cur.execute("""
         INSERT INTO match_veto_actions (
             session_id, step_index, action_type, actor_user_id, actor_role,
             team_id, map_key, map_name
@@ -852,6 +834,64 @@ def start_veto_session(
         actor["id"] if actor else None,
         "system" if started_by_kind == START_KIND_SYSTEM else "admin",
     ))
+    if resolution.status == STATUS_COMPLETED:
+        _store_series_maps(conn, session, actions, pool_rows)
+        cur.execute("""
+            UPDATE match_veto_sessions
+            SET status=?,
+                ready_at=COALESCE(ready_at, CURRENT_TIMESTAMP),
+                started_at=CURRENT_TIMESTAMP,
+                completed_at=CURRENT_TIMESTAMP,
+                cancelled_at=NULL,
+                started_by_user_id=?,
+                started_by_kind=?,
+                start_source=?,
+                current_step_index=NULL,
+                current_team_id=NULL,
+                current_action_type=NULL,
+                current_turn_started_at=NULL,
+                timeout_notified_step_index=NULL,
+                timeout_notified_at=NULL,
+                auto_start_consumed=1,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE bracket_match_id=?
+        """, (
+            STATUS_COMPLETED,
+            actor["id"] if actor else None,
+            started_by_kind,
+            start_source,
+            bracket_match_id,
+        ))
+    else:
+        cur.execute("""
+            UPDATE match_veto_sessions
+            SET status=?,
+                ready_at=COALESCE(ready_at, CURRENT_TIMESTAMP),
+                started_at=CURRENT_TIMESTAMP,
+                completed_at=NULL,
+                cancelled_at=NULL,
+                started_by_user_id=?,
+                started_by_kind=?,
+                start_source=?,
+                current_step_index=?,
+                current_team_id=?,
+                current_action_type=?,
+                current_turn_started_at=CURRENT_TIMESTAMP,
+                timeout_notified_step_index=NULL,
+                timeout_notified_at=NULL,
+                auto_start_consumed=1,
+                updated_at=CURRENT_TIMESTAMP
+            WHERE bracket_match_id=?
+        """, (
+            STATUS_IN_PROGRESS,
+            actor["id"] if actor else None,
+            started_by_kind,
+            start_source,
+            resolution.current_step_index,
+            resolution.current_team_id,
+            resolution.current_action_type,
+            bracket_match_id,
+        ))
     conn.commit()
     conn.close()
     return True, None

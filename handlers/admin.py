@@ -236,7 +236,9 @@ def _validate_veto_pool_for_stage_formats(stage_formats: dict, map_keys: list[st
         (stage_formats.get("semifinal_format") or "bo3").lower(),
         (stage_formats.get("final_format") or "bo3").lower(),
     }
-    if any(fmt in {"bo3", "bo5"} for fmt in formats):
+    if "bo5" in formats:
+        return validate_veto_pool("bo5", map_keys)
+    if "bo3" in formats:
         return validate_veto_pool("bo3", map_keys)
     return validate_veto_pool("bo1", map_keys)
 
@@ -306,7 +308,8 @@ def _map_pool_prompt_text(raw_entries) -> str:
     entries = _normalize_map_pool_entries(raw_entries)
     return (
         "Выберите карты турнирного пула.\n"
-        "Можно нажимать кнопки или отправить список карт сообщением: по одной на строку, через запятую или через ;.\n\n"
+        "Можно нажимать кнопки или отправить список карт сообщением: по одной на строку, через запятую или через ;.\n"
+        "Допустимо от 1 до 10 уникальных карт.\n\n"
         f"Текущий пул: {_map_pool_label(entries)}"
     )
 
