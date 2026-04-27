@@ -46,6 +46,7 @@ from utils.notifications import notify_bracket_match_result
 from utils.rating_rules import SOURCE_BRACKET_MATCH
 from utils.rating_channel_posts import refresh_rating_channel_posts
 from utils.rating_service import replace_match_team_rating
+from utils.referral_service import process_referral_match_participation
 from utils.site_sync import request_site_sync
 from utils.veto_service import close_veto_for_technical_result, get_completed_series_maps_for_match, get_match_veto_details, refresh_veto_messages
 
@@ -78,6 +79,20 @@ def _score_preview(team1_wins: int, team2_wins: int, map_winner_id: int, team1_i
     if map_winner_id == team1_id:
         return team1_wins + 1, team2_wins
     return team1_wins, team2_wins + 1
+
+
+async def _refresh_rating_posts_after_match(callback: CallbackQuery, tournament: dict | None, match_id: int) -> None:
+    if not tournament:
+        return
+    try:
+        referral_result = process_referral_match_participation(match_id)
+    except Exception as exc:
+        logger.warning("Не удалось обработать реферальные бонусы для матча %s: %s", match_id, exc)
+        referral_result = {"ok": False, "awards": 0}
+    if referral_result.get("awards"):
+        await refresh_rating_channel_posts(callback.bot, sport_key=tournament["sport"])
+    else:
+        await refresh_rating_channel_posts(callback.bot, sport_key=tournament["sport"], entity_type="team")
 
 
 def _map_keyboard(tournament_id: int):
@@ -1970,8 +1985,7 @@ async def _finalize_non_cs2_match(callback: CallbackQuery, state: FSMContext):
     png_path = os.path.join(temp_dir, f"bracket_{tournament_id}.png")
     png_result = generate_bracket_png(tournament_id, png_path)
     request_site_sync(f"match_result_saved:{tournament_id}:{match_id}")
-    if tournament:
-        await refresh_rating_channel_posts(callback.bot, sport_key=tournament["sport"], entity_type="team")
+    await _refresh_rating_posts_after_match(callback, tournament, match_id)
 
     third_place_note = "\n🥉 Матч за 3-е место создан автоматически." if third_place_result.get("created") else ""
 
@@ -2053,8 +2067,7 @@ async def _finalize_series(callback: CallbackQuery, state: FSMContext):
     png_path = os.path.join(temp_dir, f"bracket_{tournament_id}.png")
     png_result = generate_bracket_png(tournament_id, png_path)
     request_site_sync(f"match_series_saved:{tournament_id}:{match_id}")
-    if tournament:
-        await refresh_rating_channel_posts(callback.bot, sport_key=tournament["sport"], entity_type="team")
+    await _refresh_rating_posts_after_match(callback, tournament, match_id)
 
     third_place_note = "\n🥉 Матч за 3-е место создан автоматически." if third_place_result.get("created") else ""
 

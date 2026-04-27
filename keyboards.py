@@ -9,6 +9,7 @@ def main_menu_keyboard():
         [InlineKeyboardButton(text="👥 Команды", callback_data="teams_menu")],
         [InlineKeyboardButton(text="🏆 Турниры", callback_data="tournaments")],
         [InlineKeyboardButton(text="📊 Рейтинги", callback_data="ratings")],
+        [InlineKeyboardButton(text="🎁 Реферальная система", callback_data="referrals")],
         [InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
         [InlineKeyboardButton(text="📜 Правила проекта", callback_data="rules")]
     ]
@@ -540,3 +541,37 @@ def subscription_required_keyboard(channel_username: str):
         [InlineKeyboardButton(text="✅ Проверить подписку", callback_data="check_subscription")]
     ]
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+def referral_menu_keyboard(links):
+    builder = InlineKeyboardBuilder()
+    builder.button(text="➕ Создать ссылку", callback_data="referral_create")
+    for link in links:
+        sport_label = get_sport_display_name(link["sport_key"])
+        status = "🟢" if link["status"] == "active" else "⚫"
+        title = (link["title"] or "Без названия").strip()
+        builder.button(
+            text=f"{status} {sport_label} · {title}"[:64],
+            callback_data=f"referral_link_{link['id']}",
+        )
+    builder.button(text="🔙 Назад", callback_data="main_menu")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def referral_sport_picker_keyboard(sports_list):
+    builder = InlineKeyboardBuilder()
+    for name, display in sports_list:
+        builder.button(text=display, callback_data=f"referral_pick_sport_{name}")
+    builder.button(text="❌ Отмена", callback_data="referrals")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+def referral_link_card_keyboard(link_id: int, is_active: bool):
+    builder = InlineKeyboardBuilder()
+    if is_active:
+        builder.button(text="🚫 Отключить", callback_data=f"referral_disable_{link_id}")
+    builder.button(text="🔙 Назад", callback_data="referrals")
+    builder.adjust(1)
+    return builder.as_markup()

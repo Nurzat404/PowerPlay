@@ -14,6 +14,7 @@ from utils.rating_rules import (
     SOURCE_BRACKET_MATCH,
     SOURCE_LEGACY_MATCH,
     SOURCE_MANUAL,
+    SOURCE_REFERRAL,
     SOURCE_TOURNAMENT,
     TEAM_RATING_RULES,
     get_format_options_for_sport,
@@ -384,6 +385,41 @@ def apply_manual_rating_adjustment(
         "new_value": current_value + applied_delta,
         "season_id": season_id,
     }
+
+
+def apply_referral_rating_bonus(
+    *,
+    entity_id: int,
+    sport_key: str,
+    delta: int,
+    reason: str,
+    source_id: int,
+    actor_user_id: int | None = None,
+    conn: sqlite3.Connection | None = None,
+    rebuild: bool = True,
+) -> None:
+    owns_connection = conn is None
+    if owns_connection:
+        conn = get_connection()
+    normalized_sport = normalize_sport_key(sport_key)
+    rows = _build_targeted_adjustment_rows(
+        entity_type=ENTITY_PLAYER,
+        entity_id=int(entity_id),
+        sport_key=normalized_sport,
+        format_key=None,
+        delta=int(delta),
+        reason=(reason or "Реферальный бонус").strip(),
+        source_type=SOURCE_REFERRAL,
+        source_id=int(source_id),
+        actor_user_id=actor_user_id,
+        event_key_base=f"referral:{source_id}:player:{entity_id}",
+    )
+    _insert_adjustment_rows(conn, rows)
+    if rebuild:
+        rebuild_entity_ratings(conn)
+    if owns_connection:
+        conn.commit()
+        conn.close()
 
 
 def _build_manual_rollup_targets(
@@ -1192,6 +1228,7 @@ def build_site_rating_payload() -> dict[str, Any]:
 __all__ = [
     "advance_to_next_rating_season",
     "apply_manual_rating_adjustment",
+    "apply_referral_rating_bonus",
     "build_site_rating_payload",
     "clear_rating_bucket",
     "ensure_rating_defaults",

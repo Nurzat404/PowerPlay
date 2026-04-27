@@ -260,6 +260,7 @@ def init_db():
                         email TEXT,
                         city TEXT,
                         favorite_sports TEXT,
+                        pending_start_payload TEXT,
                         role TEXT DEFAULT 'player',
                         is_banned INTEGER DEFAULT 0,
                         registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -669,6 +670,9 @@ def init_db():
                 if 'age' not in columns:
                     cur.execute("ALTER TABLE users ADD COLUMN age INTEGER")
                     logger.info("Поле age добавлено в таблицу users")
+                if 'pending_start_payload' not in columns:
+                    cur.execute("ALTER TABLE users ADD COLUMN pending_start_payload TEXT")
+                    logger.info("Поле pending_start_payload добавлено в таблицу users")
                 cur.execute("PRAGMA table_info(tournaments)")
                 columns = [col[1] for col in cur.fetchall()]
                 if 'min_age' not in columns:
@@ -945,6 +949,66 @@ def init_db():
                     )
                 """)
                 logger.info("Таблица admin_action_message_targets проверена")
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS referral_links (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        owner_user_id INTEGER NOT NULL REFERENCES users(id),
+                        sport_key TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        token TEXT NOT NULL UNIQUE,
+                        status TEXT NOT NULL DEFAULT 'active',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        disabled_at TIMESTAMP
+                    )
+                """)
+                logger.info("Таблица referral_links проверена")
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS referral_attributions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        referred_user_id INTEGER NOT NULL UNIQUE REFERENCES users(id),
+                        referral_link_id INTEGER NOT NULL REFERENCES referral_links(id),
+                        owner_user_id INTEGER NOT NULL REFERENCES users(id),
+                        sport_key TEXT NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                logger.info("Таблица referral_attributions проверена")
+
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS referral_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        event_type TEXT NOT NULL,
+                        referred_user_id INTEGER NOT NULL REFERENCES users(id),
+                        owner_user_id INTEGER NOT NULL REFERENCES users(id),
+                        sport_key TEXT NOT NULL,
+                        tournament_id INTEGER REFERENCES tournaments(id),
+                        match_id INTEGER REFERENCES tournament_brackets(id),
+                        referral_link_id INTEGER NOT NULL REFERENCES referral_links(id),
+                        owner_points INTEGER DEFAULT 0,
+                        referred_points INTEGER DEFAULT 0,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                logger.info("Таблица referral_events проверена")
+
+                cur.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_referral_events_unique_type_user
+                    ON referral_events(event_type, referred_user_id)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_referral_links_owner
+                    ON referral_links(owner_user_id, sport_key, status, created_at)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_referral_attributions_link
+                    ON referral_attributions(referral_link_id, created_at)
+                """)
+                cur.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_referral_events_link
+                    ON referral_events(referral_link_id, event_type, created_at)
+                """)
 
                 cur.execute("PRAGMA table_info(match_veto_sessions)")
                 columns = [col[1] for col in cur.fetchall()]

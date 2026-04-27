@@ -12,6 +12,7 @@ from razryad_arena_utils import (
     get_user_by_id, get_sport_display_name, build_tournament_date_lines
 )
 from keyboards import main_menu_keyboard, sports_choice_keyboard, subscription_required_keyboard
+from utils.referral_service import attach_user_to_referral
 
 router = Router()
 
@@ -20,6 +21,16 @@ REQUIRED_CHANNEL_USERNAME = os.getenv("REQUIRED_CHANNEL_USERNAME", "razryadarena
 
 def _display_optional_text(value: str | None, fallback: str = "не указан") -> str:
     return (value or "").strip() or fallback
+
+
+def _row_value(row, key: str, default=None):
+    if row is None:
+        return default
+    try:
+        value = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if value is None else value
 
 
 class Registration(StatesGroup):
@@ -114,7 +125,56 @@ async def _handle_start_payload(message: Message, payload: str) -> bool:
         await message.answer("Некорректная ссылка приглашения в турнир.")
         return True
 
+    if payload.startswith("ref_"):
+        token = payload[len("ref_"):].strip()
+        user = get_user(message.from_user.id)
+        if not token:
+            await message.answer("Некорректная реферальная ссылка.")
+            return True
+        if not user:
+            await message.answer("Не удалось обработать реферальную ссылку.")
+            return True
+        if _row_value(user, "email"):
+            await message.answer("Реферальная ссылка работает только для новых пользователей.")
+            return True
+        result = attach_user_to_referral(
+            referred_user_id=int(user["id"]),
+            referral_token=token,
+            allow_for_unfinished_profile=True,
+        )
+        if result.get("ok"):
+            link = result["link"]
+            await message.answer(
+                f"Вы пришли по приглашению в систему рефералов по {get_sport_display_name(link['sport_key'])}.\n"
+                "После регистрации и участия в турнирах по этому спорту будут начисляться бонусы."
+            )
+            return True
+        reason = result.get("reason")
+        if reason == "self_referral":
+            await message.answer("Нельзя использовать собственную реферальную ссылку.")
+            return True
+        if reason in {"already_attributed", "existing_registered_user"}:
+            await message.answer("Реферальная привязка уже зафиксирована и не будет изменена.")
+            return True
+        if reason == "disabled":
+            await message.answer("Эта реферальная ссылка отключена.")
+            return True
+        await message.answer("Реферальная ссылка недействительна.")
+        return True
+
     return False
+
+
+async def _consume_pending_start_payload(target_message: Message, telegram_id: int) -> bool:
+    user = get_user(telegram_id)
+    if not user:
+        return False
+    payload = str(_row_value(user, "pending_start_payload", "") or "").strip()
+    if not payload:
+        return False
+    handled = await _handle_start_payload(target_message, payload)
+    update_user(telegram_id, pending_start_payload=None)
+    return handled
 
 
 @router.message(Command("start"))
@@ -125,20 +185,28 @@ async def cmd_start(message: Message, state: FSMContext, command: CommandObject)
     username = message.from_user.username or ""
 
     payload = (command.args or "").strip() if command else ""
+    existing_user = get_user(telegram_id)
     user = get_or_create_user(telegram_id, first_name, last_name, username)
 
-    if user and user['email'] and payload:
+    if payload and payload.startswith("ref_"):
+        await _handle_start_payload(message, payload)
+        update_user(telegram_id, pending_start_payload=None)
+
+    if user and user['email'] and payload and not payload.startswith("ref_"):
         handled = await _handle_start_payload(message, payload)
         if handled:
+            update_user(telegram_id, pending_start_payload=None)
             return
 
     if not user['email']:
         await state.set_state(Registration.name)
-        if payload:
+        if payload and not payload.startswith("ref_"):
             await message.answer(
                 "Для перехода по ссылке сначала завершите регистрацию. "
                 "После регистрации снова откройте ссылку."
             )
+        elif payload.startswith("ref_") and existing_user and _row_value(existing_user, "email"):
+            await message.answer("Реферальная ссылка работает только для новых пользователей.")
         await message.answer("Добро пожаловать в Разряд-Арена! Давай зарегистрируемся.\nКак тебя зовут?")
     else:
         await message.answer("Главное меню:", reply_markup=main_menu_keyboard())
@@ -165,6 +233,7 @@ async def check_subscription(callback: CallbackQuery, state: FSMContext):
             await state.set_state(Registration.name)
             await callback.message.answer("Добро пожаловать в Разряд-Арена! Давай зарегистрируемся.\nКак тебя зовут?")
         else:
+            await _consume_pending_start_payload(callback.message, telegram_id)
             await callback.message.answer("Главное меню:", reply_markup=main_menu_keyboard())
         return
 
@@ -253,5 +322,6 @@ async def reg_sports_done(callback: CallbackQuery, state: FSMContext):
 
     await state.clear()
     await callback.message.edit_text("Регистрация завершена! Добро пожаловать в Разряд-Арена.")
+    await _consume_pending_start_payload(callback.message, callback.from_user.id)
     await callback.message.answer("Главное меню:", reply_markup=main_menu_keyboard())
     await callback.answer()

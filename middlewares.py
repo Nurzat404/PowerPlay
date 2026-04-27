@@ -2,7 +2,7 @@ from aiogram import BaseMiddleware
 from aiogram.types import Message, CallbackQuery
 from typing import Callable, Dict, Any, Awaitable
 
-from razryad_arena_utils import get_user
+from razryad_arena_utils import get_user, get_or_create_user, update_user
 from keyboards import subscription_required_keyboard
 
 
@@ -40,6 +40,29 @@ class RequiredSubscriptionMiddleware(BaseMiddleware):
         except Exception:
             return False
 
+    def _extract_start_payload(self, event: Message | CallbackQuery) -> str:
+        if not isinstance(event, Message):
+            return ""
+        text = (event.text or "").strip()
+        if not text.startswith("/start"):
+            return ""
+        parts = text.split(maxsplit=1)
+        return parts[1].strip() if len(parts) > 1 else ""
+
+    def _persist_pending_start_payload(self, event: Message | CallbackQuery) -> None:
+        payload = self._extract_start_payload(event)
+        if not payload:
+            return
+        first_name = event.from_user.first_name or ""
+        last_name = event.from_user.last_name or ""
+        username = event.from_user.username or ""
+        user = get_or_create_user(event.from_user.id, first_name, last_name, username)
+        if not user or user["email"]:
+            return
+        if user["pending_start_payload"] == payload:
+            return
+        update_user(event.from_user.id, pending_start_payload=payload)
+
     async def __call__(
         self,
         handler: Callable[[Message | CallbackQuery, Dict[str, Any]], Awaitable[Any]],
@@ -58,6 +81,7 @@ class RequiredSubscriptionMiddleware(BaseMiddleware):
         if is_subscribed:
             return await handler(event, data)
 
+        self._persist_pending_start_payload(event)
         kb = subscription_required_keyboard(self.channel_username)
         text = (
             '🔒 Для использования бота нужно подписаться на канал @' + self.channel_username + '\n\n'

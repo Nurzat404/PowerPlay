@@ -14,6 +14,7 @@ SOURCE_MANUAL = "manual"
 SOURCE_TOURNAMENT = "tournament"
 SOURCE_BRACKET_MATCH = "bracket_match"
 SOURCE_LEGACY_MATCH = "legacy_match"
+SOURCE_REFERRAL = "referral"
 
 STATUS_SEASON_ACTIVE = "active"
 STATUS_SEASON_COMPLETED = "completed"

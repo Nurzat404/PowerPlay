@@ -3057,6 +3057,8 @@ async def approve_app(callback: CallbackQuery):
     result = approve_application(app_id)
     if result.get("ok"):
         request_site_sync(f"application_approved:{app_id}")
+        if result.get("referral_sport_key"):
+            await refresh_rating_channel_posts(callback.bot, sport_key=result["referral_sport_key"])
         if app:
             await _notify_tournament_application_status(
                 callback.bot,
@@ -3064,7 +3066,10 @@ async def approve_app(callback: CallbackQuery):
                 app['team_id'],
                 "approved",
             )
-        await callback.answer("Заявка одобрена!")
+        referral_note = ""
+        if result.get("referral_awards"):
+            referral_note = f"\nРеферальных начислений: {result['referral_awards']}"
+        await callback.answer(f"Заявка одобрена!{referral_note}")
     else:
         await callback.answer(_build_approve_error_text(result), show_alert=True)
 

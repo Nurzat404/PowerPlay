@@ -12,6 +12,7 @@ import handlers.menu as menu
 import handlers.teams as teams
 import handlers.tournaments as tournaments
 import handlers.ratings as ratings
+import handlers.referrals as referrals
 import handlers.admin as admin
 import handlers.brackets as brackets
 import handlers.stats as stats
@@ -63,6 +64,7 @@ async def main():
     dp.include_router(teams.router)
     dp.include_router(tournaments.router)
     dp.include_router(ratings.router)
+    dp.include_router(referrals.router)
     dp.include_router(admin.router)
     dp.include_router(brackets.router)
     dp.include_router(stats.router)

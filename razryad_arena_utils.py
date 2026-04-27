@@ -14,6 +14,7 @@ from utils.rating_service import (
     replace_match_team_rating,
     replace_tournament_rating_awards,
 )
+from utils.referral_service import process_referral_application_approval
 
 logger = logging.getLogger(__name__)
 
@@ -1406,7 +1407,16 @@ def approve_application(app_id):
             return {"ok": False, "reason": "already_processed", "tournament_id": tournament_id}
 
         conn.commit()
-        return {"ok": True, "tournament_id": tournament_id}
+        try:
+            referral_result = process_referral_application_approval(app_id)
+        except Exception as exc:
+            logger.warning("Не удалось обработать реферальный бонус для заявки %s: %s", app_id, exc)
+            referral_result = {"ok": False, "reason": "referral_failed"}
+        result = {"ok": True, "tournament_id": tournament_id}
+        if referral_result.get("ok") and referral_result.get("awards"):
+            result["referral_awards"] = int(referral_result["awards"])
+            result["referral_sport_key"] = referral_result.get("sport_key")
+        return result
     except sqlite3.Error:
         conn.rollback()
         return {"ok": False, "reason": "db_error"}
