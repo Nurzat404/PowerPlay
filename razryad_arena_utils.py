@@ -544,6 +544,18 @@ def _find_user_active_tournament_team(tournament_id: int, user_id: int, exclude_
     return None
 
 
+def _validate_tournament_user_requirements(tournament_id: int, user_id: int):
+    tournament = get_tournament_by_id(tournament_id)
+    user = get_user_by_id(user_id)
+    if not tournament or not user:
+        return True, None
+    if normalize_sport_name(tournament["sport"]) == "CS2":
+        steam_id = (user["steam_id"] or "").strip() if "steam_id" in user.keys() else ""
+        if not steam_id:
+            return False, "Для CS2-турнира у игрока должен быть указан Steam в профиле."
+    return True, None
+
+
 def _validate_tournament_replacement(tournament_id: int, team_id: int, old_user_id: int, new_user_id: int):
     ensure_tournament_team_roster(tournament_id, team_id)
     user = get_user_by_id(new_user_id)
@@ -560,6 +572,9 @@ def _validate_tournament_replacement(tournament_id: int, team_id: int, old_user_
         return False, "Игрок для замены не найден в активном составе."
     if new_user_id in member_ids:
         return False, "Этот пользователь уже находится в составе команды на турнире."
+    ok, error = _validate_tournament_user_requirements(tournament_id, new_user_id)
+    if not ok:
+        return False, error
     return True, None
 
 
@@ -688,6 +703,9 @@ def add_tournament_team_member(tournament_id: int, team_id: int, user_id: int, a
     user = get_user_by_id(user_id)
     if not user:
         return False, "Пользователь не найден."
+    ok, error = _validate_tournament_user_requirements(tournament_id, user_id)
+    if not ok:
+        return False, error
     if _find_user_active_tournament_team(tournament_id, user_id, exclude_team_id=team_id):
         return False, "Этот пользователь уже состоит в другой команде этого турнира."
 
