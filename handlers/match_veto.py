@@ -4,7 +4,11 @@ from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery
 
-from razryad_arena_utils import apply_bracket_technical_result, can_manage_tournament, get_user
+from razryad_arena_utils import apply_bracket_technical_result, can_manage_tournament, get_tournament_by_id, get_user
+from utils.rating_channel_posts import refresh_rating_channel_posts
+from utils.rating_rules import SOURCE_BRACKET_MATCH
+from utils.rating_service import replace_match_team_rating
+from utils.site_sync import request_site_sync
 from utils.veto_service import (
     ADMIN_ACTION_SCOPE_VETO_READY,
     ADMIN_ACTION_SCOPE_VETO_TIMEOUT_TECH,
@@ -229,6 +233,23 @@ async def veto_timeout_tech_confirm(callback: CallbackQuery):
         )
         await callback.answer("Не удалось выдать тех.поражение.", show_alert=True)
         return
+
+    match_payload = details["match"]
+    tournament = get_tournament_by_id(match_payload["tournament_id"])
+    if tournament:
+        replace_match_team_rating(
+            source_type=SOURCE_BRACKET_MATCH,
+            match_id=match_id,
+            sport_key=tournament["sport"],
+            tournament_id=match_payload["tournament_id"],
+            team1_id=match_payload["team1_id"],
+            team2_id=match_payload["team2_id"],
+            score1=result["score1"],
+            score2=result["score2"],
+            actor_user_id=actor["id"] if actor else None,
+        )
+        request_site_sync(f"match_technical_result_saved:{match_payload['tournament_id']}:{match_id}")
+        await refresh_rating_channel_posts(callback.bot, sport_key=tournament["sport"], entity_type="team")
 
     close_veto_for_technical_result(match_id, actor_telegram_id=callback.from_user.id)
     await refresh_veto_messages(callback.bot, match_id)

@@ -659,7 +659,7 @@ def _get_tournament_player_summaries(cur, tournament_id: int, sport_key: str) ->
     if normalized_sport == "CS2":
         cur.execute(
             """
-            WITH match_player_totals AS (
+            WITH regular_match_player_totals AS (
                 SELECT
                     p.match_id,
                     p.user_id,
@@ -671,6 +671,27 @@ def _get_tournament_player_summaries(cur, tournament_id: int, sport_key: str) ->
                 FROM player_match_stats p
                 WHERE COALESCE(p.match_source, 'bracket')='bracket'
                 GROUP BY p.match_id, p.user_id, p.team_id
+            ),
+            technical_match_players AS (
+                SELECT DISTINCT
+                    tp.match_id,
+                    tp.user_id,
+                    tp.team_id,
+                    0 AS kills_total,
+                    0 AS deaths_total,
+                    0 AS adr_avg,
+                    0 AS rating_avg
+                FROM bracket_match_technical_participants tp
+                JOIN tournament_brackets b ON b.id = tp.match_id
+                WHERE b.tournament_id=?
+                  AND b.status='completed'
+                  AND COALESCE(b.result_type, 'regular')='technical'
+                  AND tp.team_id = b.winner_id
+            ),
+            match_player_totals AS (
+                SELECT * FROM regular_match_player_totals
+                UNION ALL
+                SELECT * FROM technical_match_players
             )
             SELECT
                 mpt.user_id,
@@ -687,7 +708,7 @@ def _get_tournament_player_summaries(cur, tournament_id: int, sport_key: str) ->
             GROUP BY mpt.user_id, mpt.team_id
             ORDER BY matches_played DESC, kills_total DESC, user_id
             """,
-            (tournament_id,),
+            (tournament_id, tournament_id),
         )
         return _dict_rows(cur.fetchall())
 
@@ -696,6 +717,33 @@ def _get_tournament_player_summaries(cur, tournament_id: int, sport_key: str) ->
         return []
     cur.execute(
         f"""
+        WITH regular_match_players AS (
+            SELECT
+                s.match_id,
+                s.user_id,
+                s.team_id
+            FROM {table_name} s
+            JOIN tournament_brackets b ON b.id = s.match_id
+            WHERE COALESCE(s.match_source, 'bracket')='bracket'
+              AND b.tournament_id=? AND b.status='completed'
+        ),
+        technical_match_players AS (
+            SELECT DISTINCT
+                tp.match_id,
+                tp.user_id,
+                tp.team_id
+            FROM bracket_match_technical_participants tp
+            JOIN tournament_brackets b ON b.id = tp.match_id
+            WHERE b.tournament_id=?
+              AND b.status='completed'
+              AND COALESCE(b.result_type, 'regular')='technical'
+              AND tp.team_id = b.winner_id
+        ),
+        all_match_players AS (
+            SELECT * FROM regular_match_players
+            UNION ALL
+            SELECT * FROM technical_match_players
+        )
         SELECT
             s.user_id,
             s.team_id,
@@ -705,14 +753,12 @@ def _get_tournament_player_summaries(cur, tournament_id: int, sport_key: str) ->
             0 AS deaths_total,
             0 AS adr_avg,
             0 AS rating_avg
-        FROM {table_name} s
+        FROM all_match_players s
         JOIN tournament_brackets b ON b.id = s.match_id
-        WHERE COALESCE(s.match_source, 'bracket')='bracket'
-          AND b.tournament_id=? AND b.status='completed'
         GROUP BY s.user_id, s.team_id
         ORDER BY matches_played DESC, user_id
         """,
-        (tournament_id,),
+        (tournament_id, tournament_id),
     )
     return _dict_rows(cur.fetchall())
 
