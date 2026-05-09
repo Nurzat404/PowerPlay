@@ -7,5 +7,4 @@ venv/
 config.py
 temp/
 README_FOR_AI.md
-scripts/
 .editorconfig
