@@ -568,10 +568,11 @@ def _get_bracket_final_winner(cur, tournament_id: int) -> int | None:
         SELECT winner_id
         FROM tournament_brackets
         WHERE tournament_id=?
+          AND COALESCE(is_third_place, 0)=0
           AND round_number = (
               SELECT MAX(round_number)
               FROM tournament_brackets
-              WHERE tournament_id=? AND round_number <> 5
+              WHERE tournament_id=? AND COALESCE(is_third_place, 0)=0
           )
           AND status='completed'
         ORDER BY match_number DESC, id DESC
@@ -589,10 +590,11 @@ def _get_bracket_second_place(cur, tournament_id: int) -> int | None:
         SELECT team1_id, team2_id, winner_id
         FROM tournament_brackets
         WHERE tournament_id=?
+          AND COALESCE(is_third_place, 0)=0
           AND round_number = (
               SELECT MAX(round_number)
               FROM tournament_brackets
-              WHERE tournament_id=? AND round_number <> 5
+              WHERE tournament_id=? AND COALESCE(is_third_place, 0)=0
           )
           AND status='completed'
         ORDER BY match_number DESC, id DESC
@@ -679,8 +681,8 @@ def _get_tournament_player_summaries(cur, tournament_id: int, sport_key: str) ->
                     tp.team_id,
                     0 AS kills_total,
                     0 AS deaths_total,
-                    0 AS adr_avg,
-                    0 AS rating_avg
+                    NULL AS adr_avg,
+                    NULL AS rating_avg
                 FROM bracket_match_technical_participants tp
                 JOIN tournament_brackets b ON b.id = tp.match_id
                 WHERE b.tournament_id=?
@@ -700,8 +702,8 @@ def _get_tournament_player_summaries(cur, tournament_id: int, sport_key: str) ->
                 SUM(CASE WHEN b.winner_id = mpt.team_id THEN 1 ELSE 0 END) AS matches_won,
                 SUM(COALESCE(mpt.kills_total, 0)) AS kills_total,
                 SUM(COALESCE(mpt.deaths_total, 0)) AS deaths_total,
-                AVG(COALESCE(mpt.adr_avg, 0)) AS adr_avg,
-                AVG(COALESCE(mpt.rating_avg, 0)) AS rating_avg
+                AVG(mpt.adr_avg) AS adr_avg,
+                AVG(mpt.rating_avg) AS rating_avg
             FROM match_player_totals mpt
             JOIN tournament_brackets b ON b.id = mpt.match_id
             WHERE b.tournament_id=? AND b.status='completed'

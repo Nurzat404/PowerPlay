@@ -93,6 +93,8 @@ from utils.rating_service import (
     get_active_rating_season,
     list_rating_seasons,
     get_match_mvp_candidates,
+    get_effective_match_mvp,
+    get_effective_tournament_mvp,
     get_rating_leaderboard,
     get_rating_row,
     get_rating_season_by_id,
@@ -2459,13 +2461,25 @@ async def _show_tournament_mvp_panel(message, tournament_id: int):
     if not tournament:
         await message.edit_text("Турнир не найден.", reply_markup=back_to_main_keyboard())
         return
+    current_tournament_mvp_id = get_effective_tournament_mvp(tournament_id, tournament["sport"])
+    current_tournament_mvp_text = "не определён"
+    if current_tournament_mvp_id:
+        current_user = get_user_by_id(current_tournament_mvp_id)
+        if current_user:
+            username = current_user["username"] if "username" in current_user.keys() else None
+            handle = f" (@{username})" if username else ""
+            current_tournament_mvp_text = f"{current_user.get('first_name') or 'Игрок'}{handle}"
     builder = InlineKeyboardBuilder()
     builder.button(text="⭐ MVP матчей", callback_data=f"admin_tournament_mvp_matches_{tournament_id}")
     builder.button(text="🏆 MVP турнира", callback_data=f"admin_tournament_mvp_tournament_{tournament_id}")
     builder.button(text="🔙 К турниру", callback_data=f"admin_tournament_manage_{tournament_id}")
     builder.adjust(1)
     await message.edit_text(
-        f"🏅 MVP-панель\n\nТурнир: {tournament['name']}\nСпорт: {get_sport_display_name(tournament['sport'])}\n\nЗдесь можно вручную переопределить MVP матча и MVP турнира.",
+        f"🏅 MVP-панель\n\n"
+        f"Турнир: {tournament['name']}\n"
+        f"Спорт: {get_sport_display_name(tournament['sport'])}\n"
+        f"Текущий MVP турнира: {current_tournament_mvp_text}\n\n"
+        "Здесь можно вручную переопределить MVP матча и MVP турнира.",
         reply_markup=builder.as_markup(),
     )
 
@@ -2507,7 +2521,16 @@ async def admin_tournament_mvp_matches(callback: CallbackQuery):
     conn.close()
     builder = InlineKeyboardBuilder()
     for match in matches:
-        label = f"Раунд {match['round_number']} / матч {match['match_number']}: {match['team1_name'] or 'TBD'} vs {match['team2_name'] or 'TBD'}"
+        current_mvp_id = get_effective_match_mvp(int(match["id"]), "CS2")
+        current_mvp_mark = ""
+        if current_mvp_id:
+            current_user = get_user_by_id(int(current_mvp_id))
+            if current_user:
+                current_mvp_mark = f" | MVP: {current_user.get('first_name') or 'Игрок'}"
+        label = (
+            f"Раунд {match['round_number']} / матч {match['match_number']}: "
+            f"{match['team1_name'] or 'TBD'} vs {match['team2_name'] or 'TBD'}{current_mvp_mark}"
+        )
         builder.button(text=label[:64], callback_data=f"admin_tournament_mvp_match_{tournament_id}_{match['id']}")
     builder.button(text="🔙 Назад", callback_data=f"admin_tournament_mvp_{tournament_id}")
     builder.adjust(1)
@@ -2525,11 +2548,19 @@ async def admin_tournament_mvp_match(callback: CallbackQuery):
         return
     candidates = get_match_mvp_candidates(match_id)
     builder = InlineKeyboardBuilder()
+    current_mvp_id = get_effective_match_mvp(match_id, "CS2")
+    current_mvp_text = "не определён"
+    if current_mvp_id:
+        current_user = get_user_by_id(int(current_mvp_id))
+        if current_user:
+            username = current_user["username"] if "username" in current_user.keys() else None
+            handle = f" (@{username})" if username else ""
+            current_mvp_text = f"{current_user.get('first_name') or 'Игрок'}{handle}"
     for candidate in candidates:
         username = candidate.get("username") or "без_username"
         text = (
             f"{candidate.get('first_name') or 'Игрок'} (@{username}) | "
-            f"K {candidate.get('kills', 0)} / D {candidate.get('deaths', 0)} / ADR {candidate.get('adr', 0)}"
+            f"K {candidate.get('kills_total', 0)} / D {candidate.get('deaths_total', 0)} / ADR {round(float(candidate.get('adr_avg') or 0), 1)}"
         )
         builder.button(
             text=text[:64],
@@ -2537,7 +2568,10 @@ async def admin_tournament_mvp_match(callback: CallbackQuery):
         )
     builder.button(text="🔙 Назад", callback_data=f"admin_tournament_mvp_matches_{tournament_id}")
     builder.adjust(1)
-    await callback.message.edit_text("⭐ Выберите MVP матча:", reply_markup=builder.as_markup())
+    await callback.message.edit_text(
+        f"⭐ Выберите MVP матча:\n\nТекущий MVP: {current_mvp_text}",
+        reply_markup=builder.as_markup(),
+    )
     await callback.answer()
 
 
@@ -2567,11 +2601,19 @@ async def admin_tournament_mvp_tournament(callback: CallbackQuery):
         return
     candidates = get_tournament_mvp_candidates(tournament_id)
     builder = InlineKeyboardBuilder()
+    current_mvp_id = get_effective_tournament_mvp(tournament_id, "CS2")
+    current_mvp_text = "не определён"
+    if current_mvp_id:
+        current_user = get_user_by_id(int(current_mvp_id))
+        if current_user:
+            username = current_user["username"] if "username" in current_user.keys() else None
+            handle = f" (@{username})" if username else ""
+            current_mvp_text = f"{current_user.get('first_name') or 'Игрок'}{handle}"
     for candidate in candidates:
         username = candidate.get("username") or "без_username"
         text = (
             f"{candidate.get('first_name') or 'Игрок'} (@{username}) | "
-            f"MVP матчей {candidate.get('match_mvp_count', 0)} | K {candidate.get('kills', 0)}"
+            f"MVP матчей {candidate.get('match_mvp_count', 0)} | K {candidate.get('kills_total', 0)} | ADR {round(float(candidate.get('adr_avg') or 0), 1)}"
         )
         builder.button(
             text=text[:64],
@@ -2579,7 +2621,10 @@ async def admin_tournament_mvp_tournament(callback: CallbackQuery):
         )
     builder.button(text="🔙 Назад", callback_data=f"admin_tournament_mvp_{tournament_id}")
     builder.adjust(1)
-    await callback.message.edit_text("🏆 Выберите MVP турнира:", reply_markup=builder.as_markup())
+    await callback.message.edit_text(
+        f"🏆 Выберите MVP турнира:\n\nТекущий MVP: {current_mvp_text}",
+        reply_markup=builder.as_markup(),
+    )
     await callback.answer()
 
 
