@@ -2468,7 +2468,7 @@ async def _show_tournament_mvp_panel(message, tournament_id: int):
         if current_user:
             username = current_user["username"] if "username" in current_user.keys() else None
             handle = f" (@{username})" if username else ""
-            current_tournament_mvp_text = f"{current_user.get('first_name') or 'Игрок'}{handle}"
+            current_tournament_mvp_text = f"{_row_value(current_user, 'first_name', 'Игрок') or 'Игрок'}{handle}"
     builder = InlineKeyboardBuilder()
     builder.button(text="⭐ MVP матчей", callback_data=f"admin_tournament_mvp_matches_{tournament_id}")
     builder.button(text="🏆 MVP турнира", callback_data=f"admin_tournament_mvp_tournament_{tournament_id}")
@@ -2526,7 +2526,7 @@ async def admin_tournament_mvp_matches(callback: CallbackQuery):
         if current_mvp_id:
             current_user = get_user_by_id(int(current_mvp_id))
             if current_user:
-                current_mvp_mark = f" | MVP: {current_user.get('first_name') or 'Игрок'}"
+                current_mvp_mark = f" | MVP: {_row_value(current_user, 'first_name', 'Игрок') or 'Игрок'}"
         label = (
             f"Раунд {match['round_number']} / матч {match['match_number']}: "
             f"{match['team1_name'] or 'TBD'} vs {match['team2_name'] or 'TBD'}{current_mvp_mark}"
@@ -2555,7 +2555,7 @@ async def admin_tournament_mvp_match(callback: CallbackQuery):
         if current_user:
             username = current_user["username"] if "username" in current_user.keys() else None
             handle = f" (@{username})" if username else ""
-            current_mvp_text = f"{current_user.get('first_name') or 'Игрок'}{handle}"
+            current_mvp_text = f"{_row_value(current_user, 'first_name', 'Игрок') or 'Игрок'}{handle}"
     for candidate in candidates:
         username = candidate.get("username") or "без_username"
         text = (
@@ -2608,7 +2608,7 @@ async def admin_tournament_mvp_tournament(callback: CallbackQuery):
         if current_user:
             username = current_user["username"] if "username" in current_user.keys() else None
             handle = f" (@{username})" if username else ""
-            current_mvp_text = f"{current_user.get('first_name') or 'Игрок'}{handle}"
+            current_mvp_text = f"{_row_value(current_user, 'first_name', 'Игрок') or 'Игрок'}{handle}"
     for candidate in candidates:
         username = candidate.get("username") or "без_username"
         text = (
