@@ -45,14 +45,37 @@ async def _show_veto(callback: CallbackQuery, match_id: int):
         return
     text = format_veto_text(summary)
     markup = build_veto_keyboard_for_user(callback.from_user.id, summary)
+    chat_id = callback.message.chat.id if callback.message and callback.message.chat else None
+
+    async def _send_fresh():
+        if not chat_id:
+            return
+        try:
+            sent = await callback.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+            store_veto_message_target(match_id, chat_id, sent.message_id)
+        except Exception:
+            pass
+
     try:
         await callback.message.edit_text(text, reply_markup=markup)
-        if callback.message.chat and callback.message.message_id:
-            store_veto_message_target(match_id, callback.message.chat.id, callback.message.message_id)
+        if chat_id and callback.message.message_id:
+            store_veto_message_target(match_id, chat_id, callback.message.message_id)
         await callback.answer()
+        return
     except TelegramBadRequest as exc:
-        if "message is not modified" in str(exc).lower():
+        msg = str(exc).lower()
+        if "message is not modified" in msg:
             await callback.answer("Без изменений.")
+            return
+        if (
+            "there is no text in the message to edit" in msg
+            or "message can't be edited" in msg
+            or "message to edit not found" in msg
+        ):
+            # Сообщение оказалось не текстовым (например, фото с caption) или
+            # пропало — присылаем новое.
+            await _send_fresh()
+            await callback.answer()
             return
         raise
 
@@ -89,7 +112,9 @@ async def veto_admin_start(callback: CallbackQuery):
     if not ok:
         await callback.answer(error or "Не удалось запустить pick/ban.", show_alert=True)
         return
-    await notify_captains_veto_started(callback.bot, match_id)
+    actor_chat_id = callback.message.chat.id if callback.message and callback.message.chat else None
+    exclude_chat_ids = {int(actor_chat_id)} if actor_chat_id else None
+    await notify_captains_veto_started(callback.bot, match_id, exclude_chat_ids=exclude_chat_ids)
     await resolve_admin_action_messages(
         callback.bot,
         text="✅ Pick/ban уже запущен другим администратором.",
@@ -253,6 +278,15 @@ async def veto_timeout_tech_confirm(callback: CallbackQuery):
 
     close_veto_for_technical_result(match_id, actor_telegram_id=callback.from_user.id)
     await refresh_veto_messages(callback.bot, match_id)
+    try:
+        from utils.sequential_tournament import (
+            advance_after_match_completed as _seq_advance,
+            is_sequential_tournament as _is_sequential,
+        )
+        if _is_sequential(match_payload["tournament_id"]):
+            await _seq_advance(callback.bot, match_payload["tournament_id"], match_id)
+    except Exception:
+        pass
     await resolve_admin_action_messages(
         callback.bot,
         text="🚫 Тех.поражение уже присуждено. Это уведомление больше неактуально.",

@@ -8,6 +8,15 @@ from razryad_arena_utils import (
     get_approved_teams_count, get_tournament_teams, can_manage_tournament, is_admin, get_team_members_count, can_retry_tournament_application, get_team_by_id, get_team_members, is_captain,
     get_sport_display_name, normalize_sport_name, ensure_tournament_invite_token, build_tournament_date_lines,
     get_tournament_member_application_conflicts, get_user_tournament_captain_teams,
+    format_utc_to_msk,
+)
+from utils.sequential_tournament import (
+    is_sequential as _seq_is_sequential,
+    format_queue_text_for_team,
+    get_active_match,
+    get_team_next_pending_match,
+    get_remaining_queue,
+    count_pending_before_round,
 )
 from keyboards import (
     tournaments_main_keyboard, tournaments_list_keyboard,
@@ -136,6 +145,16 @@ async def view_tournament(callback: CallbackQuery):
 Статус: {status_display}
 Ссылка-приглашение: {invite_url}
 """
+    if _seq_is_sequential(tournament):
+        text += "\n🚀 Режим: последовательный (живая очередь)"
+        start_at_value = tournament["start_at_utc"] if "start_at_utc" in tournament.keys() else None
+        start_at = format_utc_to_msk(start_at_value)
+        if start_at and start_at != "не назначено":
+            text += f"\n🕒 Старт: {start_at} (МСК)"
+        loc_value = tournament["default_location"] if "default_location" in tournament.keys() else None
+        loc = (loc_value or "").strip()
+        if loc:
+            text += f"\n📌 Локация: {loc}"
     if tournament['description']:
         text += f"\n📝 Описание: {tournament['description']}"
 
@@ -150,6 +169,9 @@ async def view_tournament(callback: CallbackQuery):
     if tournament['bracket_generated']:
         builder.button(text="📊 Турнирная сетка",
                        callback_data=f"view_bracket_{tournament_id}")
+        if _seq_is_sequential(tournament):
+            builder.button(text="📋 Очередь матчей",
+                           callback_data=f"tournament_queue_{tournament_id}")
 
     # Кнопка управления турниром (только админ)
     if user and can_manage_tournament(user['telegram_id'], tournament_id):
@@ -173,6 +195,65 @@ async def view_tournament(callback: CallbackQuery):
             await callback.message.answer(text, reply_markup=builder.as_markup())
         else:
             raise
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("tournament_queue_"))
+async def show_tournament_queue(callback: CallbackQuery):
+    tournament_id = int(callback.data.split("_")[-1])
+    tournament = get_tournament_by_id(tournament_id)
+    if not tournament or not _seq_is_sequential(tournament):
+        await callback.answer("Этот турнир не использует режим очереди.", show_alert=True)
+        return
+
+    user = get_user(callback.from_user.id)
+    # Найдём команду пользователя в этом турнире (среди approved).
+    user_team_id: int | None = None
+    if user:
+        user_teams = get_user_teams(user['id']) or []
+        approved = get_tournament_teams(tournament_id, status="approved") or []
+        approved_ids = {int(team['id']) for team in approved}
+        for team in user_teams:
+            if int(team['id']) in approved_ids:
+                user_team_id = int(team['id'])
+                break
+
+    if user_team_id is not None:
+        text, _sig = format_queue_text_for_team(tournament_id, user_team_id)
+    else:
+        # Зритель / не в команде: показываем общую очередь
+        active = get_active_match(tournament_id)
+        remaining = get_remaining_queue(tournament_id)
+        lines = ["📋 Очередь матчей турнира", ""]
+        if active:
+            t1 = (active.get("team1_name") or "Команда 1").strip() or "Команда 1"
+            t2 = (active.get("team2_name") or "Команда 2").strip() or "Команда 2"
+            lines.append(f"🎯 Сейчас играют: {t1} vs {t2}")
+            lines.append("")
+        else:
+            lines.append("⏳ Активный матч пока не выбран.")
+            lines.append("")
+        if remaining:
+            lines.append(f"📅 Осталось матчей в очереди: {len(remaining)}")
+            lines.append("")
+            lines.append("Ближайшие пары:")
+            for m in remaining[:8]:
+                t1 = (m.get("team1_name") or "?").strip() or "?"
+                t2 = (m.get("team2_name") or "?").strip() or "?"
+                rn = (m.get("round_name") or f"Раунд {m.get('round_number')}").strip()
+                lines.append(f"• {t1} vs {t2} ({rn})")
+        else:
+            lines.append("🏁 Все матчи турнира уже сыграны.")
+        text = "\n".join(lines)
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔄 Обновить", callback_data=f"tournament_queue_{tournament_id}")
+    builder.button(text="🔙 Назад", callback_data=f"tournament_{tournament_id}")
+    builder.adjust(1)
+    try:
+        await callback.message.edit_text(text, reply_markup=builder.as_markup())
+    except Exception:
+        await callback.message.answer(text, reply_markup=builder.as_markup())
     await callback.answer()
 
 

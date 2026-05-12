@@ -160,6 +160,7 @@ def _fetch_candidate_matches(tournament_id: int | None = None) -> list[dict[str,
             t.sport AS tournament_sport,
             t.map_veto_enabled,
             t.veto_launch_mode,
+            t.schedule_mode AS schedule_mode,
             tm1.name AS team1_name,
             tm2.name AS team2_name
         FROM tournament_brackets b
@@ -784,7 +785,53 @@ def list_tournament_veto_sessions(tournament_id: int, statuses: list[str] | None
     return rows
 
 
+def _resolve_schedule_mode(match: dict[str, Any]) -> tuple[str, str | None, bool]:
+    """Возвращает (schedule_mode, queue_state, sequential_started) для матча."""
+    schedule_mode = (match.get("schedule_mode") or "").strip() if isinstance(match.get("schedule_mode"), str) else None
+    queue_state = (match.get("queue_state") or "").strip() if isinstance(match.get("queue_state"), str) else None
+    sequential_started = bool(match.get("sequential_started_at"))
+
+    tournament_id = match.get("tournament_id")
+    bracket_match_id = match.get("bracket_match_id") or match.get("id")
+
+    need_db_lookup = (
+        schedule_mode is None
+        or queue_state is None
+        or ("sequential_started_at" not in match)
+    )
+    if need_db_lookup and (tournament_id or bracket_match_id):
+        conn = get_connection()
+        try:
+            cur = conn.cursor()
+            if tournament_id and (schedule_mode is None or "sequential_started_at" not in match):
+                cur.execute(
+                    "SELECT schedule_mode, sequential_started_at FROM tournaments WHERE id=?",
+                    (tournament_id,),
+                )
+                row = cur.fetchone()
+                if row:
+                    if schedule_mode is None and row[0]:
+                        schedule_mode = (row[0] or "").strip() or "fixed"
+                    if "sequential_started_at" not in match:
+                        sequential_started = bool(row[1])
+            if bracket_match_id and queue_state is None:
+                cur.execute("SELECT queue_state FROM tournament_brackets WHERE id=?", (bracket_match_id,))
+                row = cur.fetchone()
+                if row and row[0]:
+                    queue_state = (row[0] or "").strip() or None
+        finally:
+            conn.close()
+
+    return (schedule_mode or "fixed"), queue_state, sequential_started
+
+
 def _match_due(match: dict[str, Any]) -> bool:
+    schedule_mode, queue_state, sequential_started = _resolve_schedule_mode(match)
+    if schedule_mode == "sequential":
+        # В sequential-режиме матч "due", только если турнир запущен и матч — голова очереди.
+        if not sequential_started:
+            return False
+        return (queue_state or "") == "active"
     if not match.get("scheduled_at_utc") or not match.get("location"):
         return False
     scheduled_dt = parse_utc_storage_datetime(match.get("scheduled_at_utc"))
@@ -1166,8 +1213,10 @@ def list_due_sessions_for_dispatch() -> list[dict[str, Any]]:
             b.round_number,
             b.round_name,
             b.match_number,
+            b.queue_state AS queue_state,
             t.name AS tournament_name,
             t.veto_launch_mode,
+            t.schedule_mode AS schedule_mode,
             t1.name AS team1_name,
             t2.name AS team2_name
         FROM match_veto_sessions s
@@ -1558,7 +1607,12 @@ async def _notify_veto_timeout(bot: Bot, session: dict[str, Any]) -> None:
     conn.close()
 
 
-async def notify_captains_veto_started(bot: Bot, bracket_match_id: int):
+async def notify_captains_veto_started(
+    bot: Bot,
+    bracket_match_id: int,
+    *,
+    exclude_chat_ids: set[int] | None = None,
+):
     details = get_match_veto_details(bracket_match_id)
     if not details or not details.get("session"):
         return
@@ -1566,7 +1620,13 @@ async def notify_captains_veto_started(bot: Bot, bracket_match_id: int):
     chat_ids = _captain_chat_ids(session["tournament_id"], session["team1_id"], session["team2_id"])
     if not chat_ids:
         return
+    excluded = {int(c) for c in (exclude_chat_ids or set())}
     for chat_id in chat_ids:
+        if int(chat_id) in excluded:
+            # Этот чат сам инициировал старт (например, админ-капитан) — у него
+            # уже есть сообщение, которое будет превращено в pick/ban-панель
+            # через _show_veto. Дублирующее сообщение тут не нужно.
+            continue
         await _send_and_track_veto_message(bot, bracket_match_id, chat_id)
 
     conn = get_connection()

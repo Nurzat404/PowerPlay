@@ -182,9 +182,20 @@ async def _prompt_schedule_datetime(target: CallbackQuery | Message, state: FSMC
     await _send_text(target, text, reply_markup=_schedule_cancel_keyboard(tournament_id))
 
 
+def _safe_view_bracket_callback(tournament_id) -> str:
+    """Возвращает рабочий callback для возврата к сетке, либо к меню турниров."""
+    try:
+        tid = int(tournament_id) if tournament_id not in (None, "", "None") else None
+    except (TypeError, ValueError):
+        tid = None
+    return f"view_bracket_{tid}" if tid else "tournaments"
+
+
 async def _finish_schedule_queue(target: CallbackQuery | Message, state: FSMContext):
     data = await state.get_data()
-    return_callback = data.get("schedule_return_callback") or f"view_bracket_{data.get('schedule_tournament_id')}"
+    return_callback = data.get("schedule_return_callback") or _safe_view_bracket_callback(
+        data.get("schedule_tournament_id")
+    )
     await state.clear()
     await _send_text(
         target,
@@ -203,7 +214,12 @@ async def start_schedule_wizard_for_tournament(
     """
     Публичный helper для запуска мастера назначения матчей.
     Возвращает True, если мастер запущен.
+    Для sequential-турниров мастер не нужен (время не задаётся).
     """
+    from utils.sequential_tournament import is_sequential_tournament as _is_seq
+    if _is_seq(tournament_id):
+        return False
+
     if match_ids is None:
         match_rows = get_unscheduled_ready_bracket_matches(tournament_id)
         match_ids = [row["id"] for row in match_rows]
@@ -231,7 +247,7 @@ async def bracket_schedule_cancel(callback: CallbackQuery, state: FSMContext):
     if not tournament_id or not can_manage_tournament(callback.from_user.id, tournament_id):
         await callback.answer("Нет прав", show_alert=True)
         return
-    return_callback = data.get("schedule_return_callback") or callback.data.replace("bracket_schedule_cancel_", "view_bracket_")
+    return_callback = data.get("schedule_return_callback") or _safe_view_bracket_callback(tournament_id)
     await state.clear()
     await callback.message.answer(
         "❌ Назначение матчей прервано.",
@@ -245,7 +261,9 @@ async def bracket_schedule_datetime_input(message: Message, state: FSMContext):
     text = (message.text or "").strip()
     if text.lower() in {"отмена", "cancel", "/cancel"}:
         data = await state.get_data()
-        return_callback = data.get("schedule_return_callback") or f"view_bracket_{data.get('schedule_tournament_id')}"
+        return_callback = data.get("schedule_return_callback") or _safe_view_bracket_callback(
+            data.get("schedule_tournament_id")
+        )
         await state.clear()
         await message.answer(
             "❌ Назначение матчей прервано.",
@@ -273,7 +291,9 @@ async def bracket_schedule_location_input(message: Message, state: FSMContext):
     data = await state.get_data()
 
     if text.lower() in {"отмена", "cancel", "/cancel"}:
-        return_callback = data.get("schedule_return_callback") or f"view_bracket_{data.get('schedule_tournament_id')}"
+        return_callback = data.get("schedule_return_callback") or _safe_view_bracket_callback(
+            data.get("schedule_tournament_id")
+        )
         await state.clear()
         await message.answer(
             "❌ Назначение матчей прервано.",
@@ -380,19 +400,38 @@ async def confirm_generate_bracket(callback: CallbackQuery, state: FSMContext):
 
         await state.clear()
         await callback.answer("✅ Сетка сгенерирована! Статус турнира изменён на 'Идёт'.", show_alert=True)
-        await callback.message.answer("Теперь обязательно назначьте время и место для новых пар.")
-        started = await start_schedule_wizard_for_tournament(
-            callback,
-            state,
-            tournament_id=tournament_id,
-            return_callback=f"admin_tournament_manage_{tournament_id}",
-        )
-        if not started:
+
+        from utils.sequential_tournament import is_sequential_tournament as _is_seq, handle_bracket_generated as _seq_after_gen
+        if _is_seq(tournament_id):
+            try:
+                await _seq_after_gen(callback.bot, tournament_id)
+            except Exception:
+                pass
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="⚙️ Управление турниром",
-                                      callback_data=f"admin_tournament_manage_{tournament_id}")]
+                                      callback_data=f"admin_tournament_manage_{tournament_id}")],
+                [InlineKeyboardButton(text="📋 Очередь матчей",
+                                      callback_data=f"admin_seq_queue_{tournament_id}")],
             ])
-            await callback.message.answer("Нажмите кнопку ниже для управления:", reply_markup=kb)
+            await callback.message.answer(
+                "✅ Сетка сгенерирована. Командам разослано уведомление о соперниках.\n"
+                "Турнир запустится автоматически в указанное время или вручную через «🚀 Запустить турнир».",
+                reply_markup=kb,
+            )
+        else:
+            await callback.message.answer("Теперь обязательно назначьте время и место для новых пар.")
+            started = await start_schedule_wizard_for_tournament(
+                callback,
+                state,
+                tournament_id=tournament_id,
+                return_callback=f"admin_tournament_manage_{tournament_id}",
+            )
+            if not started:
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="⚙️ Управление турниром",
+                                          callback_data=f"admin_tournament_manage_{tournament_id}")]
+                ])
+                await callback.message.answer("Нажмите кнопку ниже для управления:", reply_markup=kb)
     else:
         await callback.answer("❌ Ошибка при генерации сетки", show_alert=True)
         await state.clear()
@@ -466,6 +505,27 @@ async def confirm_regenerate_bracket(callback: CallbackQuery, state: FSMContext)
     sync_tournament_match_format_rules(tournament_id)
     request_site_sync(f"bracket_regenerated:{tournament_id}")
     await callback.answer("✅ Сетка перегенерирована.", show_alert=True)
+
+    from utils.sequential_tournament import is_sequential_tournament as _is_seq, handle_bracket_generated as _seq_after_gen
+    if _is_seq(tournament_id):
+        try:
+            await _seq_after_gen(callback.bot, tournament_id)
+        except Exception:
+            pass
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚙️ Управление турниром",
+                                  callback_data=f"admin_tournament_manage_{tournament_id}")],
+            [InlineKeyboardButton(text="📋 Очередь матчей",
+                                  callback_data=f"admin_seq_queue_{tournament_id}")],
+            [InlineKeyboardButton(text="📊 Открыть сетку",
+                                  callback_data=f"view_bracket_{tournament_id}")],
+        ])
+        await callback.message.edit_text(
+            "✅ Сетка перегенерирована. Командам разослано уведомление о новых соперниках.",
+            reply_markup=kb,
+        )
+        return
+
     await callback.message.answer("Назначьте время и место для новых пар после перегенерации.")
     started = await start_schedule_wizard_for_tournament(
         callback,
@@ -509,8 +569,12 @@ async def view_bracket(callback: CallbackQuery, state: FSMContext, tournament_id
         await state.clear()
 
     if tournament_id is None:
-        tournament_id = int(callback.data.split("_")[2]) if len(
-            callback.data.split("_")) > 2 else None
+        parts = callback.data.split("_")
+        raw = parts[2] if len(parts) > 2 else None
+        try:
+            tournament_id = int(raw) if raw and raw != "None" else None
+        except (TypeError, ValueError):
+            tournament_id = None
 
     if not tournament_id:
         await callback.answer("❌ Ошибка: неверный ID турнира", show_alert=True)
@@ -706,6 +770,8 @@ async def bracket_match_menu(callback: CallbackQuery, state: FSMContext):
     if match.get("status") == "completed":
         await callback.answer("Этот матч уже завершён.", show_alert=True)
         return
+    from utils.sequential_tournament import is_sequential_tournament as _is_seq_t
+    is_seq = _is_seq_t(tournament_id)
     schedule_missing = _schedule_missing(match)
     match_time = format_utc_to_msk(match.get("scheduled_at_utc")) if match.get("scheduled_at_utc") else "не назначено"
     location = (match.get("location") or "не указано").strip() if match.get("location") else "не указано"
@@ -718,13 +784,15 @@ async def bracket_match_menu(callback: CallbackQuery, state: FSMContext):
         f"🕒 Время: {match_time} (МСК)\n"
         f"📌 Место: {location}"
     )
-    if schedule_missing:
+    if schedule_missing and not is_seq:
         text += "\n\nℹ️ Для обычного ввода результата сначала укажите время и место матча."
+    if is_seq:
+        text += "\n\n🚀 Режим: последовательный (живая очередь)."
     schedule_locked = _schedule_locked_by_veto(match_id)
     if schedule_locked:
         text += "\n\n🔒 Время и место зафиксированы: pick/ban уже начался или завершен."
     builder = InlineKeyboardBuilder()
-    if not schedule_missing:
+    if (not schedule_missing) or is_seq:
         builder.button(text="✏️ Ввести результат", callback_data=f"manual_match_result_{match_id}_{tournament_id}")
     if _has_saved_bracket_map_results(match_id):
         builder.button(text="🧹 Очистить результаты", callback_data=f"manual_clear_saved_maps_{match_id}_{tournament_id}")

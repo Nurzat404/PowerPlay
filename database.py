@@ -697,6 +697,30 @@ def init_db():
                     cur.execute(
                         "ALTER TABLE tournaments ADD COLUMN replacements_enabled INTEGER DEFAULT 1")
                     logger.info("Поле replacements_enabled добавлено в таблицу tournaments")
+                if 'schedule_mode' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournaments ADD COLUMN schedule_mode TEXT DEFAULT 'fixed'")
+                    logger.info("Поле schedule_mode добавлено в таблицу tournaments")
+                if 'start_at_utc' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournaments ADD COLUMN start_at_utc TEXT")
+                    logger.info("Поле start_at_utc добавлено в таблицу tournaments")
+                if 'default_location' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournaments ADD COLUMN default_location TEXT")
+                    logger.info("Поле default_location добавлено в таблицу tournaments")
+                if 'kickoff_notified_at' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournaments ADD COLUMN kickoff_notified_at TIMESTAMP")
+                    logger.info("Поле kickoff_notified_at добавлено в таблицу tournaments")
+                if 'sequential_started_at' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournaments ADD COLUMN sequential_started_at TIMESTAMP")
+                    logger.info("Поле sequential_started_at добавлено в таблицу tournaments")
+                if 'bracket_missing_overdue_notified_at' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournaments ADD COLUMN bracket_missing_overdue_notified_at TIMESTAMP")
+                    logger.info("Поле bracket_missing_overdue_notified_at добавлено в таблицу tournaments")
 
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS tournament_match_format_rules (
@@ -1225,8 +1249,41 @@ def init_db():
                     cur.execute(
                         "ALTER TABLE tournament_brackets ADD COLUMN technical_assigned_at TIMESTAMP")
                     logger.info("Поле technical_assigned_at добавлено в таблицу tournament_brackets")
+                if 'queue_position' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournament_brackets ADD COLUMN queue_position INTEGER")
+                    logger.info("Поле queue_position добавлено в таблицу tournament_brackets")
+                if 'queue_state' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournament_brackets ADD COLUMN queue_state TEXT DEFAULT 'waiting'")
+                    logger.info("Поле queue_state добавлено в таблицу tournament_brackets")
+                if 'opponents_resolved_notified_at' not in columns:
+                    cur.execute(
+                        "ALTER TABLE tournament_brackets ADD COLUMN opponents_resolved_notified_at TIMESTAMP")
+                    logger.info("Поле opponents_resolved_notified_at добавлено в таблицу tournament_brackets")
+
+                # Таблица авто-обновляемых queue-сообщений (для sequential турниров)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS tournament_queue_messages (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        tournament_id INTEGER NOT NULL REFERENCES tournaments(id),
+                        team_id INTEGER NOT NULL REFERENCES teams(id),
+                        user_id INTEGER NOT NULL REFERENCES users(id),
+                        chat_id INTEGER NOT NULL,
+                        message_id INTEGER NOT NULL,
+                        last_signature TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(tournament_id, user_id)
+                    )
+                """)
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tournament_queue_messages_team ON tournament_queue_messages(tournament_id, team_id)")
+
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_bracket_reminder_lookup ON tournament_brackets(status, scheduled_at_utc, reminder_sent_at)")
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_bracket_queue_lookup ON tournament_brackets(tournament_id, queue_state, queue_position)")
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_bracket_tournament_round_match ON tournament_brackets(tournament_id, round_number, match_number)")
                 cur.execute(

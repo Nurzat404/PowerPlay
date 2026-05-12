@@ -47,12 +47,37 @@ from utils.rating_rules import SOURCE_BRACKET_MATCH
 from utils.rating_channel_posts import refresh_rating_channel_posts
 from utils.rating_service import replace_match_team_rating
 from utils.referral_service import process_referral_match_participation
+from utils.sequential_tournament import (
+    advance_after_match_completed as sequential_advance_after_match_completed,
+    is_sequential_tournament,
+)
 from utils.site_sync import request_site_sync
 from utils.veto_service import close_veto_for_technical_result, get_completed_series_maps_for_match, get_match_veto_details, refresh_veto_messages
 
 router = Router()
 logger = logging.getLogger(__name__)
 DEMO_IMPORT_TOTAL_TIMEOUT_SECONDS = 180
+
+
+async def _post_result_followup(callback: CallbackQuery, state: FSMContext, *, tournament_id: int, match_id: int) -> None:
+    """
+    Что делать после успешного сохранения результата матча сетки.
+    Для sequential-турниров — двинуть очередь и обновить queue-сообщения.
+    Для обычных — открыть мастер назначения времени для следующих матчей.
+    """
+    if is_sequential_tournament(tournament_id):
+        try:
+            await sequential_advance_after_match_completed(callback.bot, tournament_id, match_id)
+        except Exception:
+            logger.exception("sequential_advance_after_match_completed failed")
+        return
+    from handlers.brackets import start_schedule_wizard_for_tournament
+    await start_schedule_wizard_for_tournament(
+        callback,
+        state,
+        tournament_id=tournament_id,
+        return_callback=f"view_bracket_{tournament_id}",
+    )
 
 CS2_MAP_OPTIONS = [(row["key"], row["name"]) for row in CS2_MAPS]
 CUSTOM_CS2_MAP_TOKEN = "custom"
@@ -645,6 +670,11 @@ def _build_demo_preview_text(data: dict[str, Any], payload: dict[str, Any]) -> s
         )
     if data.get("demo_overwrite_required"):
         lines.extend(["", "⚠️ Для этой карты уже есть сохраненные данные. Они будут перезаписаны."])
+    if data.get("demo_map_was_overridden"):
+        lines.extend([
+            "",
+            "ℹ️ Название карты в демке отличается от ожидаемого — статистика будет сохранена под названием ожидаемой карты.",
+        ])
     return "\n".join(lines)
 
 
@@ -675,19 +705,34 @@ async def _show_demo_preview(target: Message | CallbackQuery, state: FSMContext)
 
     expected_maps = data.get("predefined_maps") or []
     map_number = int(data.get("current_map_number") or 1)
+    map_mismatch = False
     if expected_maps and 1 <= map_number <= len(expected_maps):
         expected_name = expected_maps[map_number - 1]["map_name"]
         if _normalize_map_compare(payload["map_name"]) != _normalize_map_compare(expected_name):
-            text = (
-                "❌ Карта из демки не совпадает с ожидаемой картой серии.\n\n"
-                f"Ожидается: {expected_name}\n"
-                f"В демке: {payload['map_name']}"
-            )
-            if isinstance(target, CallbackQuery):
-                await target.message.answer(text, reply_markup=_cancel_keyboard(data.get("tournament_id")))
-            else:
-                await target.answer(text, reply_markup=_cancel_keyboard(data.get("tournament_id")))
-            return
+            map_mismatch = True
+            # Если админ ещё не подтвердил «всё равно продолжить» — показываем предупреждение.
+            if not data.get("demo_map_mismatch_acknowledged"):
+                text = (
+                    "⚠️ Карта из демки не совпадает с ожидаемой картой серии.\n\n"
+                    f"Ожидается: {expected_name}\n"
+                    f"В демке: {payload['map_name']}\n\n"
+                    "Можно всё равно продолжить — статистика будет сохранена под "
+                    f"названием «{expected_name}»."
+                )
+                builder = InlineKeyboardBuilder()
+                builder.button(text="✅ Всё равно продолжить", callback_data="manual_demo_mapmiss_continue")
+                _tid = data.get("tournament_id")
+                _cancel_cb = f"view_bracket_{int(_tid)}" if _tid else "tournaments"
+                builder.button(text="❌ Отмена", callback_data=_cancel_cb)
+                builder.adjust(1)
+                kb = builder.as_markup()
+                if isinstance(target, CallbackQuery):
+                    await target.message.answer(text, reply_markup=kb)
+                else:
+                    await target.answer(text, reply_markup=kb)
+                return
+            # Подменяем название карты в payload на ожидаемое.
+            payload["map_name"] = expected_name
 
     overwrite_required = map_number in set(data.get("existing_map_numbers") or [])
     await state.update_data(
@@ -697,6 +742,7 @@ async def _show_demo_preview(target: Message | CallbackQuery, state: FSMContext)
         player_stats_list=payload["player_stats"],
         demo_ready_payload=payload,
         demo_overwrite_required=overwrite_required,
+        demo_map_was_overridden=map_mismatch,
     )
     await state.set_state(ManualMatchInput.demo_confirm)
     if isinstance(target, CallbackQuery):
@@ -1074,7 +1120,9 @@ async def start_manual_input_by_match(callback: CallbackQuery, state: FSMContext
     if match["status"] == "completed":
         await callback.answer("Этот матч уже завершен.", show_alert=True)
         return
-    if not match.get("scheduled_at_utc") or not match.get("location"):
+    if not is_sequential_tournament(match["tournament_id"]) and (
+        not match.get("scheduled_at_utc") or not match.get("location")
+    ):
         await callback.answer("Сначала укажите время и место матча.", show_alert=True)
         from handlers.brackets import start_schedule_wizard_for_tournament
         await start_schedule_wizard_for_tournament(
@@ -1452,13 +1500,7 @@ async def confirm_technical_result(callback: CallbackQuery, state: FSMContext):
     await notify_bracket_match_result(callback.bot, match_id, sport_mode)
     await callback.message.answer("Выберите действие:", reply_markup=_summary_keyboard(tournament_id))
     await state.clear()
-    from handlers.brackets import start_schedule_wizard_for_tournament
-    await start_schedule_wizard_for_tournament(
-        callback,
-        state,
-        tournament_id=tournament_id,
-        return_callback=f"view_bracket_{tournament_id}",
-    )
+    await _post_result_followup(callback, state, tournament_id=tournament_id, match_id=match_id)
     await callback.answer()
 
 
@@ -1634,6 +1676,22 @@ async def map_demo_player(callback: CallbackQuery, state: FSMContext):
         logger.exception("Unexpected error while continuing demo mapping")
         await callback.message.answer(
             "❌ Произошла ошибка при сопоставлении игроков из демки.",
+            reply_markup=_cancel_keyboard(data.get("tournament_id")),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "manual_demo_mapmiss_continue")
+async def confirm_demo_map_mismatch(callback: CallbackQuery, state: FSMContext):
+    """Админ согласился импортировать демку с другой картой — продолжаем под ожидаемым названием."""
+    await state.update_data(demo_map_mismatch_acknowledged=True)
+    try:
+        await _show_demo_preview(callback, state)
+    except Exception:
+        logger.exception("Unexpected error while continuing demo import after map mismatch")
+        data = await state.get_data()
+        await callback.message.answer(
+            "❌ Произошла ошибка при подготовке предпросмотра демки.",
             reply_markup=_cancel_keyboard(data.get("tournament_id")),
         )
     await callback.answer()
@@ -2008,13 +2066,7 @@ async def _finalize_non_cs2_match(callback: CallbackQuery, state: FSMContext):
     await notify_bracket_match_result(callback.bot, match_id, sport_mode)
     await callback.message.answer("Выберите действие:", reply_markup=_summary_keyboard(tournament_id))
     await state.clear()
-    from handlers.brackets import start_schedule_wizard_for_tournament
-    await start_schedule_wizard_for_tournament(
-        callback,
-        state,
-        tournament_id=tournament_id,
-        return_callback=f"view_bracket_{tournament_id}",
-    )
+    await _post_result_followup(callback, state, tournament_id=tournament_id, match_id=match_id)
     await callback.answer()
 
 
@@ -2091,11 +2143,5 @@ async def _finalize_series(callback: CallbackQuery, state: FSMContext):
     await notify_bracket_match_result(callback.bot, match_id, sport_mode)
     await callback.message.answer("Выберите действие:", reply_markup=_summary_keyboard(tournament_id))
     await state.clear()
-    from handlers.brackets import start_schedule_wizard_for_tournament
-    await start_schedule_wizard_for_tournament(
-        callback,
-        state,
-        tournament_id=tournament_id,
-        return_callback=f"view_bracket_{tournament_id}",
-    )
+    await _post_result_followup(callback, state, tournament_id=tournament_id, match_id=match_id)
     await callback.answer()

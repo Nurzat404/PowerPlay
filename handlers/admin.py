@@ -39,6 +39,7 @@ from razryad_arena_utils import (
     get_admin_tournament_notifications_enabled, get_tournament_notification_override,
     set_admin_tournament_notifications_enabled, set_tournament_notification_override,
     build_tournament_date_lines,
+    parse_msk_datetime_input, datetime_to_utc_storage, format_utc_to_msk, MSK_TZ,
 )
 from keyboards import (
     admin_menu_keyboard, back_to_main_keyboard,
@@ -1090,7 +1091,56 @@ class CreateTournament(StatesGroup):
     map_veto_enabled = State()
     veto_launch_mode = State()
     map_pool = State()
+    schedule_mode = State()
+    schedule_start_at = State()
+    schedule_default_location = State()
     description = State()
+
+
+SCHEDULE_MODE_FIXED = "fixed"
+SCHEDULE_MODE_SEQUENTIAL = "sequential"
+
+
+def _build_schedule_mode_keyboard(callback_prefix: str, current: str | None = None) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(
+        text=("✅ " if current == SCHEDULE_MODE_FIXED else "") + "📅 Обычный (с расписанием)",
+        callback_data=f"{callback_prefix}_{SCHEDULE_MODE_FIXED}",
+    )
+    builder.button(
+        text=("✅ " if current == SCHEDULE_MODE_SEQUENTIAL else "") + "🚀 Последовательный (живая очередь)",
+        callback_data=f"{callback_prefix}_{SCHEDULE_MODE_SEQUENTIAL}",
+    )
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+SCHEDULE_MODE_DESCRIPTION = (
+    "Выберите режим расписания турнира:\n\n"
+    "📅 Обычный — у каждого матча своё время и место. Время указывается администратором.\n\n"
+    "🚀 Последовательный — у турнира одно время старта. Матчи играют подряд, "
+    "время каждого не указывается. Команды получают уведомления, когда подходит их очередь."
+)
+
+
+async def _prompt_schedule_mode_create(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(CreateTournament.schedule_mode)
+    data = await state.get_data()
+    current = data.get("schedule_mode")
+    await callback.message.edit_text(
+        SCHEDULE_MODE_DESCRIPTION,
+        reply_markup=_build_schedule_mode_keyboard("create_tournament_schedule_mode", current),
+    )
+
+
+async def _go_to_description_or_schedule_mode(callback: CallbackQuery, state: FSMContext):
+    """Маршрутизация после выбора форматов: сначала режим расписания, потом описание."""
+    data = await state.get_data()
+    if data.get("schedule_mode"):
+        await state.set_state(CreateTournament.description)
+        await callback.message.edit_text("Введите описание турнира (можно отправить 'нет', чтобы пропустить):")
+        return
+    await _prompt_schedule_mode_create(callback, state)
 
 @router.callback_query(F.data == "admin_create_tournament")
 async def admin_create_tournament_start(callback: CallbackQuery, state: FSMContext):
@@ -1299,8 +1349,7 @@ async def create_tournament_final_format(callback: CallbackQuery, state: FSMCont
 
     if not _is_cs2_sport(data.get("sport")):
         await state.update_data(map_veto_enabled=0, veto_launch_mode=LAUNCH_ADMIN, map_pool_entries=[])
-        await state.set_state(CreateTournament.description)
-        await callback.message.edit_text("Введите описание турнира (можно отправить 'нет', чтобы пропустить):")
+        await _prompt_schedule_mode_create(callback, state)
         return
 
     await state.set_state(CreateTournament.map_veto_enabled)
@@ -1318,8 +1367,7 @@ async def create_tournament_map_veto(callback: CallbackQuery, state: FSMContext)
 
     if not enabled:
         await state.update_data(veto_launch_mode=LAUNCH_ADMIN, map_pool_entries=[])
-        await state.set_state(CreateTournament.description)
-        await callback.message.edit_text("Введите описание турнира (можно отправить 'нет', чтобы пропустить):")
+        await _prompt_schedule_mode_create(callback, state)
         return
 
     selected = _default_map_pool_entries()
@@ -1427,8 +1475,64 @@ async def create_tournament_launch_mode(callback: CallbackQuery, state: FSMConte
     await callback.answer()
     launch_mode = callback.data.replace("create_tournament_launch_mode_", "")
     await state.update_data(veto_launch_mode=launch_mode)
+    await _prompt_schedule_mode_create(callback, state)
+
+
+@router.callback_query(CreateTournament.schedule_mode, F.data.startswith("create_tournament_schedule_mode_"))
+async def create_tournament_schedule_mode(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    mode = callback.data.replace("create_tournament_schedule_mode_", "")
+    if mode not in (SCHEDULE_MODE_FIXED, SCHEDULE_MODE_SEQUENTIAL):
+        await callback.answer("Неизвестный режим", show_alert=True)
+        return
+    await state.update_data(schedule_mode=mode)
+    if mode == SCHEDULE_MODE_FIXED:
+        await state.set_state(CreateTournament.description)
+        await callback.message.edit_text("Введите описание турнира (можно отправить 'нет', чтобы пропустить):")
+        return
+    await state.set_state(CreateTournament.schedule_start_at)
+    await callback.message.edit_text(
+        "🚀 Последовательный режим\n\n"
+        "Введите дату и время старта турнира (МСК).\n"
+        "Формат: ДД.ММ.ГГГГ ЧЧ:ММ\n"
+        "Пример: 15.06.2025 18:00\n\n"
+        "За 1 час до этого времени всем командам придёт уведомление, а в момент старта "
+        "первая пара получит сигнал начать матч."
+    )
+
+
+@router.message(CreateTournament.schedule_start_at)
+async def create_tournament_schedule_start_at(message: Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    dt_msk = parse_msk_datetime_input(raw)
+    if not dt_msk:
+        await message.answer(
+            "❌ Неверный формат. Введите дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ\n"
+            "Пример: 15.06.2025 18:00"
+        )
+        return
+    if dt_msk <= datetime.now(MSK_TZ):
+        await message.answer("❌ Время старта должно быть в будущем.")
+        return
+    start_at_utc = datetime_to_utc_storage(dt_msk)
+    await state.update_data(start_at_utc=start_at_utc)
+    await state.set_state(CreateTournament.schedule_default_location)
+    await message.answer(
+        "📌 Введите общую локацию турнира (например: онлайн / адрес зала).\n"
+        "Если локация общая для всего турнира не нужна, отправьте `-` или `нет`."
+    )
+
+
+@router.message(CreateTournament.schedule_default_location)
+async def create_tournament_schedule_default_location(message: Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    if raw.lower() in {"-", "нет", "no", "none", "skip", "пропустить"}:
+        location = ""
+    else:
+        location = raw
+    await state.update_data(default_location=location)
     await state.set_state(CreateTournament.description)
-    await callback.message.edit_text("Введите описание турнира (можно отправить 'нет', чтобы пропустить):")
+    await message.answer("Введите описание турнира (можно отправить 'нет', чтобы пропустить):")
 
 @router.message(CreateTournament.description)
 async def create_tournament_description(message: Message, state: FSMContext):
@@ -1440,16 +1544,20 @@ async def create_tournament_description(message: Message, state: FSMContext):
     INSERT INTO tournaments (
         name, sport, city, registration_start_date, registration_end_date, start_date, end_date, max_teams, required_team_size,
         min_age, max_age, description, created_by, status, match_format,
-        map_veto_enabled, veto_launch_mode
+        map_veto_enabled, veto_launch_mode,
+        schedule_mode, start_at_utc, default_location
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'registration', ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'registration', ?, ?, ?, ?, ?, ?)
     """, (
         data['name'], data['sport'], data['city'],
         data['registration_start_date'], data['registration_end_date'],
         data.get('start_date'), data.get('end_date'),
         data['max_teams'], data['required_team_size'], data['min_age'], data['max_age'],
         description, message.from_user.id, data.get('match_format', 'bo3'),
-        int(data.get('map_veto_enabled') or 0), data.get('veto_launch_mode', LAUNCH_ADMIN)
+        int(data.get('map_veto_enabled') or 0), data.get('veto_launch_mode', LAUNCH_ADMIN),
+        data.get('schedule_mode', SCHEDULE_MODE_FIXED),
+        data.get('start_at_utc'),
+        (data.get('default_location') or '').strip() or None,
     ))
     tournament_id = cur.lastrowid
     conn.commit()
@@ -1496,6 +1604,7 @@ class EditTournament(StatesGroup):
     launch_mode_choice = State()
     map_pool_choice = State()
     manager_add_input = State()
+    schedule_mode_choice = State()
 
 class AdminBroadcast(StatesGroup):
     text = State()
@@ -1583,6 +1692,37 @@ async def _open_tournament_field_editor(
     elif field == "managers":
         await state.clear()
         await show_tournament_managers_panel(callback.message, tournament_id, callback.from_user.id)
+    elif field == "schedule_mode":
+        if not _can_change_schedule_mode(tournament):
+            await callback.answer("Режим расписания можно менять только до старта турнира.", show_alert=True)
+            return
+        current = (_t_get(tournament, "schedule_mode") if tournament else None) or SCHEDULE_MODE_FIXED
+        await state.set_state(EditTournament.schedule_mode_choice)
+        await callback.message.edit_text(
+            SCHEDULE_MODE_DESCRIPTION,
+            reply_markup=_build_schedule_mode_keyboard("edit_tournament_schedule_mode", current),
+        )
+    elif field == "start_at_utc":
+        if not tournament or (_t_get(tournament, "schedule_mode") or SCHEDULE_MODE_FIXED) != SCHEDULE_MODE_SEQUENTIAL:
+            await callback.answer("Это поле доступно только для последовательного режима.", show_alert=True)
+            return
+        await state.set_state(EditTournament.value)
+        current = format_utc_to_msk(_t_get(tournament, "start_at_utc"))
+        await callback.message.edit_text(
+            "🕒 Введите новое время старта турнира (МСК).\n"
+            "Формат: ДД.ММ.ГГГГ ЧЧ:ММ\n"
+            f"Текущее: {current}"
+        )
+    elif field == "default_location":
+        if not tournament or (_t_get(tournament, "schedule_mode") or SCHEDULE_MODE_FIXED) != SCHEDULE_MODE_SEQUENTIAL:
+            await callback.answer("Это поле доступно только для последовательного режима.", show_alert=True)
+            return
+        await state.set_state(EditTournament.value)
+        current = (_t_get(tournament, "default_location") or "").strip() or "не указана"
+        await callback.message.edit_text(
+            "📌 Введите общую локацию турнира (или `-` чтобы очистить).\n"
+            f"Текущая: {current}"
+        )
     else:
         await state.set_state(EditTournament.value)
         field_titles = {
@@ -1635,6 +1775,9 @@ async def edit_tournament_start(callback: CallbackQuery, state: FSMContext):
         ("required_team_size", "Размер команды"),
         ("min_age", "Мин. возраст"),
         ("max_age", "Макс. возраст"),
+        ("schedule_mode", "🗓 Режим расписания"),
+        ("start_at_utc", "🕒 Время старта (sequential)"),
+        ("default_location", "📌 Общая локация (sequential)"),
         ("description", "Описание"),
     ]
     for field_key, field_label in fields:
@@ -1706,6 +1849,19 @@ async def edit_tournament_value(message: Message, state: FSMContext):
             if current_min_age is not None and current_min_age > new_value:
                 await message.answer("❌ Минимальный возраст не может быть больше максимального.")
                 return
+    elif field == "start_at_utc":
+        dt_msk = parse_msk_datetime_input(raw_value)
+        if not dt_msk:
+            await message.answer(
+                "❌ Неверный формат. Введите дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ"
+            )
+            return
+        new_value = datetime_to_utc_storage(dt_msk)
+    elif field == "default_location":
+        if raw_value.lower() in {"-", "нет", "no", "none"}:
+            new_value = None
+        else:
+            new_value = raw_value
     elif field in {"registration_start_date", "registration_end_date", "start_date", "end_date"}:
         tournament = get_tournament_by_id(tournament_id)
         if not tournament:
@@ -1776,6 +1932,74 @@ async def edit_tournament_value(message: Message, state: FSMContext):
                               callback_data=f"admin_tournament_manage_{tournament_id}")]
     ])
     await message.answer("Нажмите кнопку ниже для управления:", reply_markup=kb)
+
+def _t_get(row, key, default=None):
+    """Безопасное чтение поля из sqlite3.Row или dict."""
+    if row is None:
+        return default
+    if isinstance(row, dict):
+        return row.get(key, default)
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return default
+
+
+def _can_change_schedule_mode(tournament) -> bool:
+    if not tournament:
+        return False
+    if int(_t_get(tournament, "bracket_generated") or 0) == 1:
+        return False
+    if _t_get(tournament, "sequential_started_at"):
+        return False
+    if (_t_get(tournament, "status") or "") not in ("registration",):
+        return False
+    return True
+
+
+@router.callback_query(EditTournament.schedule_mode_choice, F.data.startswith("edit_tournament_schedule_mode_"))
+async def edit_tournament_schedule_mode_chosen(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    mode = callback.data.replace("edit_tournament_schedule_mode_", "")
+    if mode not in (SCHEDULE_MODE_FIXED, SCHEDULE_MODE_SEQUENTIAL):
+        await callback.answer("Неизвестный режим", show_alert=True)
+        return
+    data = await state.get_data()
+    tournament_id = int(data.get("tournament_id") or 0)
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    tournament = get_tournament_by_id(tournament_id)
+    if not _can_change_schedule_mode(tournament):
+        await callback.answer("Режим расписания можно менять только до старта турнира.", show_alert=True)
+        return
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE tournaments SET schedule_mode=? WHERE id=?", (mode, tournament_id))
+    if mode == SCHEDULE_MODE_FIXED:
+        # Сбрасываем sequential-only поля.
+        cur.execute(
+            "UPDATE tournaments SET start_at_utc=NULL, default_location=NULL, kickoff_notified_at=NULL WHERE id=?",
+            (tournament_id,),
+        )
+    conn.commit()
+    conn.close()
+    request_site_sync(f"tournament_updated:{tournament_id}:schedule_mode")
+    await state.clear()
+    if mode == SCHEDULE_MODE_SEQUENTIAL:
+        await callback.message.edit_text(
+            "✅ Режим изменён на «🚀 Последовательный».\n\n"
+            "Не забудьте указать время старта турнира и общую локацию в редактировании."
+        )
+    else:
+        await callback.message.edit_text("✅ Режим изменён на «📅 Обычный».")
+    from aiogram.types import InlineKeyboardButton
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚙️ Управление турниром",
+                              callback_data=f"admin_tournament_manage_{tournament_id}")]
+    ])
+    await callback.message.answer("Перейти к управлению:", reply_markup=kb)
+
 
 @router.callback_query(EditTournament.sport_choice, F.data.startswith("admin_tourn_sport_"))
 async def edit_tournament_sport_chosen(callback: CallbackQuery, state: FSMContext):
@@ -2296,6 +2520,17 @@ async def admin_tournament_manage(callback: CallbackQuery, tournament_id: int | 
             ]
         )
     lines.append(f"Замены состава: {'разрешены' if int(tournament['replacements_enabled'] or 0) == 1 else 'запрещены'}")
+    schedule_mode_value = (tournament["schedule_mode"] or SCHEDULE_MODE_FIXED) if "schedule_mode" in tournament.keys() else SCHEDULE_MODE_FIXED
+    if schedule_mode_value == SCHEDULE_MODE_SEQUENTIAL:
+        lines.append("🚀 Режим расписания: последовательный (живая очередь)")
+        start_at_text = format_utc_to_msk(tournament["start_at_utc"]) if "start_at_utc" in tournament.keys() else "не задано"
+        lines.append(f"🕒 Старт турнира: {start_at_text} (МСК)")
+        loc = (tournament["default_location"] or "").strip() if "default_location" in tournament.keys() and tournament["default_location"] else ""
+        lines.append(f"📌 Общая локация: {loc or 'не указана'}")
+        if "sequential_started_at" in tournament.keys() and tournament["sequential_started_at"]:
+            lines.append(f"▶️ Запущен: {tournament['sequential_started_at']}")
+    else:
+        lines.append("📅 Режим расписания: обычный (с расписанием матчей)")
     text = "\n".join(lines)
     if tournament['description'] and tournament['description'] != 'нет':
         text += f"\n📝 Описание: {tournament['description']}"
@@ -2324,6 +2559,15 @@ async def admin_tournament_manage(callback: CallbackQuery, tournament_id: int | 
     if tournament['bracket_generated'] and tournament['status'] != 'finished':
         builder.button(text="🏆 Завершить турнир",
                        callback_data=f"admin_finish_tournament_{tournament_id}")
+
+    # Sequential-кнопки
+    if schedule_mode_value == SCHEDULE_MODE_SEQUENTIAL and tournament['bracket_generated'] and tournament['status'] != 'finished':
+        already_started = bool("sequential_started_at" in tournament.keys() and tournament["sequential_started_at"])
+        if not already_started:
+            builder.button(text="🚀 Запустить турнир сейчас",
+                           callback_data=f"admin_seq_start_{tournament_id}")
+        builder.button(text="📋 Очередь матчей",
+                       callback_data=f"admin_seq_queue_{tournament_id}")
 
     # Команды и заявки открываются через отдельный хаб со статусами.
     builder.button(text="👥 Команды и заявки",
@@ -2365,6 +2609,78 @@ async def admin_tournament_manage(callback: CallbackQuery, tournament_id: int | 
             await callback.message.answer(text, reply_markup=builder.as_markup())
         else:
             raise
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("admin_seq_start_"))
+async def admin_seq_start(callback: CallbackQuery):
+    tournament_id = int(callback.data.split("_")[3])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    tournament = get_tournament_by_id(tournament_id)
+    if not tournament:
+        await callback.answer("Турнир не найден", show_alert=True)
+        return
+    if (_t_get(tournament, "schedule_mode") or SCHEDULE_MODE_FIXED) != SCHEDULE_MODE_SEQUENTIAL:
+        await callback.answer("Этот турнир не в последовательном режиме.", show_alert=True)
+        return
+    if not int(_t_get(tournament, "bracket_generated") or 0):
+        await callback.answer("Сначала сгенерируйте сетку.", show_alert=True)
+        return
+    from utils.sequential_tournament import start_sequential_tournament as _seq_start
+    ok = await _seq_start(callback.bot, tournament_id)
+    if ok:
+        await callback.answer("✅ Турнир запущен.", show_alert=True)
+    else:
+        await callback.answer("Не удалось запустить турнир.", show_alert=True)
+    await admin_tournament_manage(callback, tournament_id=tournament_id)
+
+
+@router.callback_query(F.data.startswith("admin_seq_queue_"))
+async def admin_seq_queue(callback: CallbackQuery):
+    tournament_id = int(callback.data.split("_")[3])
+    if not can_manage_tournament(callback.from_user.id, tournament_id):
+        await callback.answer("Нет прав", show_alert=True)
+        return
+    tournament = get_tournament_by_id(tournament_id)
+    if not tournament or (_t_get(tournament, "schedule_mode") or SCHEDULE_MODE_FIXED) != SCHEDULE_MODE_SEQUENTIAL:
+        await callback.answer("Турнир не использует режим очереди.", show_alert=True)
+        return
+    from utils.sequential_tournament import get_active_match as _seq_active, get_remaining_queue as _seq_remaining
+    active = _seq_active(tournament_id)
+    remaining = _seq_remaining(tournament_id)
+
+    lines = ["📋 Очередь матчей турнира", ""]
+    if active:
+        t1 = (active.get("team1_name") or "Команда 1").strip() or "Команда 1"
+        t2 = (active.get("team2_name") or "Команда 2").strip() or "Команда 2"
+        rn = (active.get("round_name") or f"Раунд {active.get('round_number')}").strip()
+        lines.append(f"🎯 Сейчас играют: {t1} vs {t2}  ({rn})")
+        lines.append("")
+    else:
+        lines.append("⏳ Активный матч не выбран.")
+        lines.append("")
+    if remaining:
+        lines.append(f"Всего в очереди: {len(remaining)}")
+        lines.append("")
+        for idx, m in enumerate(remaining, start=1):
+            t1 = (m.get("team1_name") or "?").strip() or "?"
+            t2 = (m.get("team2_name") or "?").strip() or "?"
+            rn = (m.get("round_name") or f"Раунд {m.get('round_number')}").strip()
+            marker = "🎯" if (active and m.get("id") == active.get("id")) else f"{idx}."
+            lines.append(f"{marker} {t1} vs {t2}  ({rn})")
+    else:
+        lines.append("🏁 Все матчи турнира уже сыграны.")
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔄 Обновить", callback_data=f"admin_seq_queue_{tournament_id}")
+    builder.button(text="🔙 К турниру", callback_data=f"admin_tournament_manage_{tournament_id}")
+    builder.adjust(1)
+    try:
+        await callback.message.edit_text("\n".join(lines), reply_markup=builder.as_markup())
+    except Exception:
+        await callback.message.answer("\n".join(lines), reply_markup=builder.as_markup())
     await callback.answer()
 
 
@@ -3001,12 +3317,58 @@ async def confirm_finish_tournament(callback: CallbackQuery):
     if tournament:
         await refresh_rating_channel_posts(callback.bot, sport_key=tournament["sport"])
 
-    await callback.message.answer(
+    summary_text = (
         f"🏆 Турнир завершён!\n\n"
         f"🥇 1 место: {first_name} (+20 очков)\n"
         f"🥈 2 место: {second_name} (+15 очков)\n"
         f"🥉 3 место: {third_name} (+10 очков)"
     )
+    await callback.message.answer(summary_text)
+
+    # Рассылка итогов всем участникам approved-команд + менеджерам.
+    try:
+        await _broadcast_tournament_results(
+            callback.bot,
+            tournament_id,
+            tournament_name=(tournament["name"] if tournament else "Турнир"),
+            first_name=first_name,
+            second_name=second_name,
+            third_name=third_name,
+        )
+    except Exception:
+        logger.exception("broadcast tournament results failed for tournament_id=%s", tournament_id)
+
+
+async def _broadcast_tournament_results(
+    bot,
+    tournament_id: int,
+    *,
+    tournament_name: str,
+    first_name: str,
+    second_name: str,
+    third_name: str,
+) -> None:
+    text = (
+        f"🏁 Турнир «{tournament_name}» завершён!\n\n"
+        f"🥇 1 место: {first_name}\n"
+        f"🥈 2 место: {second_name}\n"
+        f"🥉 3 место: {third_name}\n\n"
+        "Спасибо всем за участие!"
+    )
+    chat_ids: set[int] = set()
+    for team in get_tournament_teams(tournament_id, status="approved") or []:
+        team_id = team["id"] if isinstance(team, dict) else team["id"]
+        for member in get_tournament_team_members(tournament_id, team_id) or []:
+            telegram_id = member.get("telegram_id") if isinstance(member, dict) else (
+                member["telegram_id"] if "telegram_id" in member.keys() else None
+            )
+            if telegram_id:
+                chat_ids.add(int(telegram_id))
+    for chat_id in chat_ids:
+        try:
+            await bot.send_message(chat_id=chat_id, text=text)
+        except Exception as exc:
+            logger.warning("Не удалось отправить итоги турнира chat_id=%s: %s", chat_id, exc)
 
 # ---------- Заявки на турниры (общие) ----------
 

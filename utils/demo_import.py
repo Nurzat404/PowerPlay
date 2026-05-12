@@ -132,12 +132,23 @@ async def parse_demo_source_message(bot: Bot, message: Message, temp_root: str |
             "Попробуйте прямой файл/ссылку побыстрее или демку меньшего размера."
         ) from exc
     except Exception as exc:
-        if "UnknownFile" in str(exc):
+        exc_text = str(exc)
+        if "UnknownFile" in exc_text:
             raise DemoImportError(
                 "Не удалось распознать демку. "
                 "Скорее всего ссылка отдала не сам .dem/.zip файл, а промежуточную страницу загрузки."
             ) from exc
-        raise DemoImportError(str(exc)) from exc
+        if "EntityNotFound" in exc_text or "Entity not found" in exc_text:
+            raise DemoImportError(
+                "Не удалось разобрать демку: парсер не нашёл сущность игрока "
+                "(EntityNotFound). Обычно это бывает, если демка повреждена, "
+                "обрезана, или версия CS2/HLTV несовместима с парсером.\n\n"
+                "Что попробовать:\n"
+                "• обновить парсер (demoparser2 в зависимостях)\n"
+                "• использовать полную, не обрезанную демку\n"
+                "• перекачать файл напрямую (.dem или .zip без оболочки)"
+            ) from exc
+        raise DemoImportError(exc_text) from exc
     finally:
         shutil.rmtree(work_path, ignore_errors=True)
 

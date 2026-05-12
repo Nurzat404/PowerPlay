@@ -2511,19 +2511,33 @@ def apply_bracket_technical_result(
         _propagate_winner(conn, match, winner_id)
         _auto_advance_ready_matches(conn, match["tournament_id"])
         conn.commit()
-        return {
-            "ok": True,
-            "winner_id": winner_id,
-            "loser_id": loser_team_id,
-            "score1": score1,
-            "score2": score2,
-            "tournament_id": match["tournament_id"],
-        }
+        tournament_id_for_return = match["tournament_id"]
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+
+    # Если этот матч был полуфиналом и второй полуфинал тоже завершён — создаём
+    # матч за 3-е место. Делаем это вне основной транзакции, чтобы избежать
+    # вложенных подключений к sqlite. Безопасно: auto_create_third_place_if_ready
+    # сам проверяет состояние сетки и не создаст дубликат.
+    try:
+        auto_create_third_place_if_ready(tournament_id_for_return)
+    except Exception:
+        logger.exception(
+            "auto_create_third_place_if_ready failed after technical result for match_id=%s",
+            match_id,
+        )
+
+    return {
+        "ok": True,
+        "winner_id": winner_id,
+        "loser_id": loser_team_id,
+        "score1": score1,
+        "score2": score2,
+        "tournament_id": tournament_id_for_return,
+    }
 
 
 def get_unscheduled_ready_bracket_matches(tournament_id: int):

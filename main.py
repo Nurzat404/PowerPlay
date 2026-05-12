@@ -20,6 +20,7 @@ import handlers.match_manual as match_manual
 import handlers.match_veto as match_veto
 from middlewares import BanCheckMiddleware, RequiredSubscriptionMiddleware
 from utils.notifications import dispatch_due_match_reminders, dispatch_due_tournament_registration_deadlines
+from utils.sequential_tournament import dispatch_sequential_lifecycle
 from utils.veto_service import dispatch_due_veto_sessions
 from utils.site_sync import site_sync_enabled, site_sync_worker
 
@@ -44,6 +45,7 @@ async def reminder_worker(bot: Bot, interval_seconds: int = 60):
         try:
             await dispatch_due_match_reminders(bot)
             await dispatch_due_tournament_registration_deadlines(bot)
+            await dispatch_sequential_lifecycle(bot)
             await dispatch_due_veto_sessions(bot)
         except asyncio.CancelledError:
             raise
